@@ -30,7 +30,34 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 管理员密码使用随机盐和 Argon2id 哈希，不保存明文，不在日志、API 或页面回显。登录通过 HttpOnly / SameSite=Strict Cookie，数据库仅保存会话令牌的 SHA-256 摘要；会话到期、退出及改密后的旧令牌均无法写入。连续 5 次密码错误后限制登录一分钟，限制状态保存到 SQLite。没有内置默认密码或无密码重置接口，请妥善保管管理员密码。
 
-只有数据库文件位置需要在打开数据库前确定，可通过 `rtk proxy sh scripts/cargo.sh run --locked -- --db data/trader.sqlite` 指定；其余运行配置由页面保存。服务固定监听本机回环地址。
+数据库文件位置和监听地址需要在启动时确定，可通过 `rtk proxy sh scripts/cargo.sh run --locked -- --db data/trader.sqlite --bind 127.0.0.1` 指定；其余运行配置由页面保存。默认监听本机回环地址。
+
+## GitHub Packages 容器
+
+镜像：`ghcr.io/zuoban/geniustrader:0.1.0`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像与仓库保持私有访问。私有镜像需先使用具备 `read:packages` 权限的 GitHub classic PAT，通过 `docker login ghcr.io --username YOUR_GITHUB_USER --password-stdin` 登录；令牌只用于本机登录，不写入代码或配置。
+
+```sh
+rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.0
+rtk proxy docker run -d --name genius-trader \
+  --publish 127.0.0.1:8787:8787 \
+  --mount type=volume,source=genius-trader-data,target=/app/data \
+  ghcr.io/zuoban/geniustrader:0.1.0
+```
+
+打开 http://127.0.0.1:8787，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
+
+容器内通过 `--bind 0.0.0.0` 接收映射流量，宿主机仅映射到回环地址；API 继续校验 localhost / 127.0.0.1 Host、来源及管理员会话。`docker stop genius-trader` 会发送 SIGINT 并正常停止服务。
+
+本地构建与验证：
+
+```sh
+rtk proxy docker build --tag genius-trader:local .
+rtk proxy python3 scripts/smoke-container.py genius-trader:local
+```
+
+构建上下文只包含源码、嵌入式网页和 Cargo 清单，不包含本机数据库、密钥或构建产物。构建阶段执行锁定依赖的 Rust 测试；容器验证使用独立临时数据卷，检查界面、API、非 root 数据库权限、正常停止及重启持久化。
+
+GitHub Actions 的「Publish GitHub Package」可手动执行，也会在推送 `v*` 标签时触发（标签版本须与 Cargo.toml 一致）。两个架构分别构建、测试并验证容器，再发布版本、`latest` 和提交 SHA 标签；发布使用仓库自带的 `GITHUB_TOKEN`，无需保存额外发布密钥。
 
 ## 已实现
 
@@ -123,7 +150,7 @@ Jev 密钥配置提供「测试连接」：填写时测试当前输入，留空�
 
 ## API
 
-写请求需要 `X-Genius-Request: 1`，拒绝浏览器跨源写请求及非 localhost / 127.0.0.1 的 Host。服务只绑定本机回环地址。
+写请求需要 `X-Genius-Request: 1`，拒绝浏览器跨源写请求及非 localhost / 127.0.0.1 的 Host。服务默认绑定本机回环地址；容器的宿主机端口也仅映射到回环地址。
 所有业务写请求还需要有效的管理员会话 Cookie；未登录返回 401。仅初始化、登录和退出端点不要求已有会话。初始化仅在管理员记录不存在时成功，并以数据库唯一约束防止重复初始化。
 
 | 方法 | 路径 | 内容 |

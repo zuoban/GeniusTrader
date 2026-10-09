@@ -1,0 +1,9 @@
+# Allow only build inputs; databases and saved credentials never enter the context.
+**
+!Cargo.toml
+!Cargo.lock
+!Dockerfile
+!src/
+!src/**
+!web/
+!web/**
