@@ -59,6 +59,8 @@ rtk proxy python3 scripts/smoke-container.py genius-trader:local
 
 GitHub Actions 的「Publish GitHub Package」可手动执行，也会在推送 `v*` 标签时触发（标签版本须与 Cargo.toml 一致）。两个架构分别构建、测试并验证容器，再发布版本、`latest` 和提交 SHA 标签；发布使用仓库自带的 `GITHUB_TOKEN`，无需保存额外发布密钥。
 
+工作流验证镜像清单中的两个架构、仓库来源及包的私有权限。GitHub 若未自动关联仓库，会在发布摘要中提示；可登录[包页面](https://github.com/users/zuoban/packages/container/package/geniustrader)，点击「Connect repository」并选择 `zuoban/GeniusTrader`，以展示仓库链接和 README。
+
 ## 已实现
 
 - 合约成交额排序、手动输入、批量添加、启用/停用、删除币种。
