@@ -472,12 +472,7 @@ impl Engine {
                 let e = self.clone();
                 async move {
                     if let Err(err) = e.evaluate_coin(coin.clone(), revision).await {
-                        e.event(
-                            "warn",
-                            Some(&coin.symbol),
-                            "本轮等待",
-                            json!({"error": err.to_string()}),
-                        );
+                        e.event("warn", Some(&coin.symbol), "本轮等待", waiting_detail(&err));
                     }
                 }
             })
@@ -528,10 +523,7 @@ impl Engine {
                 return Ok(());
             }
             let quote = i.quotes.get(&coin.symbol).context("无盘口")?.clone();
-            ensure!(
-                now_ms() - quote.time < 15_000 && quote.spread_bps() <= c.max_spread_bps,
-                "盘口过期或点差过大"
-            );
+            ensure_entry_quote(&quote, c.max_spread_bps, now_ms())?;
             i.book.last_bar.insert(coin.symbol.clone(), bar);
             self.save(&i)?;
             quote
@@ -599,7 +591,7 @@ impl Engine {
                 "已有敞口缺少盘口，暂停新增仓位"
             );
             let q = i.quotes.get(&coin.symbol).context("无盘口")?;
-            ensure!(q.spread_bps() <= c.max_spread_bps, "点差扩大");
+            ensure_entry_quote(q, c.max_spread_bps, now_ms())?;
             let price = if decision.action == Action::Long {
                 q.ask
             } else {
@@ -1328,6 +1320,63 @@ impl Engine {
         Ok(())
     }
 }
+#[derive(Debug, Serialize)]
+struct EntryQuoteError {
+    reason: &'static str,
+    quote: Quote,
+    quote_age_ms: i64,
+    max_quote_age_ms: i64,
+    spread_bps: Decimal,
+    max_spread_bps: Decimal,
+}
+impl std::fmt::Display for EntryQuoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.reason == "stale_quote" {
+            write!(
+                f,
+                "盘口过期（距上次更新 {} 毫秒，必须小于 {} 毫秒）",
+                self.quote_age_ms, self.max_quote_age_ms
+            )
+        } else {
+            write!(
+                f,
+                "点差过大（约 {} bps，上限 {} bps；买价 {}，卖价 {}）",
+                self.spread_bps.round_dp(2).normalize(),
+                self.max_spread_bps.normalize(),
+                self.quote.bid.normalize(),
+                self.quote.ask.normalize()
+            )
+        }
+    }
+}
+impl std::error::Error for EntryQuoteError {}
+fn ensure_entry_quote(quote: &Quote, max_spread_bps: Decimal, now: i64) -> Result<()> {
+    let quote_age_ms = now - quote.time;
+    let spread_bps = quote.spread_bps();
+    let reason = if quote_age_ms >= 15_000 {
+        "stale_quote"
+    } else if spread_bps > max_spread_bps {
+        "spread_exceeded"
+    } else {
+        return Ok(());
+    };
+    Err(EntryQuoteError {
+        reason,
+        quote: quote.clone(),
+        quote_age_ms,
+        max_quote_age_ms: 15_000,
+        spread_bps,
+        max_spread_bps,
+    }
+    .into())
+}
+fn waiting_detail(error: &anyhow::Error) -> Value {
+    let mut detail = json!({"error":error.to_string()});
+    if let Some(check) = error.downcast_ref::<EntryQuoteError>() {
+        detail["quote_check"] = json!(check);
+    }
+    detail
+}
 fn paper_available(i: &Inner) -> Decimal {
     let floating: Decimal = i
         .book
@@ -1387,6 +1436,58 @@ mod tests {
     }
     fn config() -> Config {
         Config::default()
+    }
+    #[test]
+    fn entry_quote_checks_preserve_age_and_spread_boundaries() {
+        let now = 100_000;
+        let mut quote = Quote {
+            bid: d("9995"),
+            ask: d("10005"),
+            bid_qty: Decimal::ONE,
+            ask_qty: Decimal::ONE,
+            time: now - 14_999,
+        };
+        assert_eq!(quote.spread_bps(), d("10"));
+        ensure_entry_quote(&quote, d("10"), now).unwrap();
+        quote.time = now - 15_000;
+        let error = ensure_entry_quote(&quote, d("10"), now).unwrap_err();
+        let detail = waiting_detail(&error);
+        assert!(detail["error"].as_str().unwrap().contains("盘口过期"));
+        assert_eq!(detail["quote_check"]["reason"], "stale_quote");
+        assert_eq!(detail["quote_check"]["quote_age_ms"], 15_000);
+        assert_eq!(detail["quote_check"]["max_quote_age_ms"], 15_000);
+        quote.time = now;
+        quote.ask = d("10006");
+        let error = ensure_entry_quote(&quote, d("10"), now).unwrap_err();
+        let detail = waiting_detail(&error);
+        assert!(detail["error"].as_str().unwrap().contains("点差过大"));
+        assert_eq!(detail["quote_check"]["reason"], "spread_exceeded");
+        assert_eq!(detail["quote_check"]["quote_age_ms"], 0);
+        assert_eq!(detail["quote_check"]["max_spread_bps"], "10");
+    }
+    #[test]
+    fn fresh_fxs_quote_with_wide_spread_records_prices_and_waits() {
+        let now = 100_000;
+        let quote = Quote {
+            bid: d("0.303500"),
+            ask: d("0.335200"),
+            bid_qty: d("796509.4"),
+            ask_qty: d("28418200.1"),
+            time: now - 483,
+        };
+        let error = ensure_entry_quote(&quote, d("10"), now).unwrap_err();
+        let detail = waiting_detail(&error);
+        assert!(detail["error"].as_str().unwrap().contains("992.64 bps"));
+        assert_eq!(detail["quote_check"]["quote_age_ms"], 483);
+        assert_eq!(detail["quote_check"]["quote"]["bid"], "0.303500");
+        assert_eq!(detail["quote_check"]["quote"]["ask"], "0.335200");
+        assert_eq!(
+            detail["quote_check"]["spread_bps"],
+            quote.spread_bps().to_string()
+        );
+        assert_eq!(detail["quote_check"]["max_spread_bps"], "10");
+        let ordinary = waiting_detail(&anyhow::anyhow!("其他等待原因"));
+        assert_eq!(ordinary, json!({"error":"其他等待原因"}));
     }
     fn paper() -> Arc<Engine> {
         Engine::new(

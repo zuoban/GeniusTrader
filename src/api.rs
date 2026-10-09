@@ -5,7 +5,8 @@ use crate::{
     domain::{Event, PoolCoin, SymbolInfo},
     engine::Snapshot,
     settings::{
-        CredentialTestRequest, CredentialTestResult, ServerSettings, SettingsPatch, SettingsView,
+        CredentialTestRequest, CredentialTestResult, JevCredentialTestRequest,
+        JevCredentialTestResult, ServerSettings, SettingsPatch, SettingsView,
     },
 };
 use axum::{
@@ -72,6 +73,7 @@ pub fn router(app: Arc<Application>) -> Router {
         .route("/api/settings", get(settings).put(connections))
         .route("/api/settings/check", post(check_connection))
         .route("/api/settings/test", post(test_credentials))
+        .route("/api/settings/jev/test", post(test_jev_credentials))
         .route("/api/pool", post(pool))
         .route("/api/pool/:symbol", axum::routing::delete(remove))
         .route("/api/control", post(control))
@@ -310,6 +312,12 @@ async fn test_credentials(
 ) -> Result<Json<CredentialTestResult>, ApiError> {
     Ok(Json(app.test_credentials(request).await?))
 }
+async fn test_jev_credentials(
+    State(app): State<Arc<Application>>,
+    Json(request): Json<JevCredentialTestRequest>,
+) -> Result<Json<JevCredentialTestResult>, ApiError> {
+    Ok(Json(app.test_jev_credentials(request).await?))
+}
 
 #[cfg(test)]
 mod tests {
@@ -348,6 +356,37 @@ mod tests {
         let cookie = response.headers()["set-cookie"].to_str().unwrap();
         assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
         cookie.split(';').next().unwrap().to_string()
+    }
+    #[tokio::test]
+    async fn jev_test_route_rejects_missing_invalid_and_clear_keys_without_echoing_secrets() {
+        let store = crate::store::Store::open(":memory:", crate::config::Mode::Paper).unwrap();
+        let application = Application::new(store.clone()).unwrap();
+        let router = router(application);
+        let cookie = admin_cookie(&router).await;
+        for body in [
+            "{}",
+            r#"{"jev_key":"local-jev-test-key invalid"}"#,
+            r#"{"clear_jev":true,"jev_key":"local-jev-test-key"}"#,
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    "/api/settings/jev/test",
+                    body,
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), 10_000)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains("local-jev-test-key"));
+            assert!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"].is_string());
+        }
+        assert!(store.settings().unwrap().jev_key.is_empty());
     }
     #[tokio::test]
     async fn cross_origin_mutation_is_rejected() {
@@ -482,6 +521,7 @@ mod tests {
             ("PUT", "/api/server"),
             ("POST", "/api/settings/check"),
             ("POST", "/api/settings/test"),
+            ("POST", "/api/settings/jev/test"),
             ("POST", "/api/pool"),
             ("DELETE", "/api/pool/BTCUSDT"),
             ("POST", "/api/control"),

@@ -102,7 +102,7 @@ impl Default for Config {
                 lookback_bars: 120,
                 forecast_bars: 6,
                 min_confidence: 0.7,
-                timeout_seconds: 5,
+                timeout_seconds: 15,
             },
         }
     }

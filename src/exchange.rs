@@ -19,17 +19,86 @@ pub struct ExchangeError {
     pub code: i64,
     pub status: u16,
     pub uncertain: bool,
+    path: &'static str,
+    kind: ExchangeErrorKind,
 }
-impl std::fmt::Display for ExchangeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Binance error code={}, HTTP={}, uncertain={}",
-            self.code, self.status, self.uncertain
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeErrorKind {
+    RequestTimeout,
+    Network,
+    ResponseTimeout,
+    ResponseRead,
+    EmptyResponse,
+    IncompleteJson,
+    InvalidJson,
+    Api,
+}
+impl ExchangeErrorKind {
+    fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::RequestTimeout
+                | Self::Network
+                | Self::ResponseTimeout
+                | Self::ResponseRead
+                | Self::EmptyResponse
+                | Self::IncompleteJson
         )
     }
 }
+impl std::fmt::Display for ExchangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self.kind {
+            ExchangeErrorKind::RequestTimeout => "请求超时，请检查网络或代理",
+            ExchangeErrorKind::Network => "网络连接失败，请检查网络或代理",
+            ExchangeErrorKind::ResponseTimeout => "响应读取超时，请检查网络或代理",
+            ExchangeErrorKind::ResponseRead => "响应读取中断，请检查网络或代理",
+            ExchangeErrorKind::EmptyResponse => "返回空响应，未收到有效 JSON",
+            ExchangeErrorKind::IncompleteJson => "返回不完整 JSON，数据可能被截断",
+            ExchangeErrorKind::InvalidJson => "返回无效 JSON，请检查网络或代理是否返回了其他内容",
+            ExchangeErrorKind::Api => match self.code {
+                -1021 => "请求时间校验失败，请检查系统时间或网络延迟",
+                -1003 | -1015 => "请求频率受限，请稍后重试",
+                _ => match self.status {
+                    401 | 403 => "访问被拒绝，请检查权限、IP 白名单或网络限制",
+                    418 | 429 => "请求频率受限，请稍后重试",
+                    451 => "当前地区访问受限",
+                    500..=599 => "服务暂时不可用",
+                    _ => "接口请求失败",
+                },
+            },
+        };
+        write!(f, "币安 {} {reason}", self.path)?;
+        if self.status == 0 {
+            write!(f, "（未收到 HTTP 响应）")?;
+        } else {
+            write!(f, "（HTTP {}，code={}）", self.status, self.code)?;
+        }
+        if self.uncertain {
+            write!(f, "；请求结果尚未确认，需查询状态")?;
+        }
+        Ok(())
+    }
+}
 impl std::error::Error for ExchangeError {}
+impl ExchangeError {
+    fn transport(error: reqwest::Error, method: &Method, path: &'static str, status: u16) -> Self {
+        let kind = match (status == 0, error.is_timeout()) {
+            (true, true) => ExchangeErrorKind::RequestTimeout,
+            (true, false) => ExchangeErrorKind::Network,
+            (false, true) => ExchangeErrorKind::ResponseTimeout,
+            (false, false) => ExchangeErrorKind::ResponseRead,
+        };
+        // Never retain the reqwest error: its URL can contain a signed query.
+        Self {
+            code: 0,
+            status,
+            uncertain: method == Method::POST || method == Method::DELETE,
+            path,
+            kind,
+        }
+    }
+}
 pub fn decimal(v: &Value) -> Result<Decimal> {
     Decimal::from_str(v.as_str().context("expected decimal string")?).context("invalid decimal")
 }
@@ -209,7 +278,34 @@ impl Binance {
     async fn request(
         &self,
         method: Method,
-        path: &str,
+        path: &'static str,
+        params: Vec<(String, String)>,
+        signed: bool,
+    ) -> Result<Value> {
+        // Only public GETs may be repeated. Mutations and signed requests retain
+        // their original execution-uncertainty semantics and are never replayed.
+        // Clock synchronization measures one request's round trip; including a
+        // failed attempt would skew its offset and expire subsequent signatures.
+        let retry_public_get = method == Method::GET && !signed && path != "/fapi/v1/time";
+        let mut result = self
+            .request_once(method.clone(), path, params.clone(), signed)
+            .await;
+        if retry_public_get
+            && result.as_ref().is_err_and(|error| {
+                error
+                    .downcast_ref::<ExchangeError>()
+                    .is_some_and(|e| e.kind.retryable())
+            })
+        {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            result = self.request_once(method, path, params, signed).await;
+        }
+        result
+    }
+    async fn request_once(
+        &self,
+        method: Method,
+        path: &'static str,
         mut params: Vec<(String, String)>,
         signed: bool,
     ) -> Result<Value> {
@@ -258,28 +354,51 @@ impl Binance {
         } else {
             req.query(&url::form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>())
         };
-        let response = req.send().await.map_err(|_| ExchangeError {
-            code: 0,
-            status: 0,
-            uncertain: method == Method::POST || method == Method::DELETE,
-        })?;
+        let response = req
+            .send()
+            .await
+            .map_err(|error| ExchangeError::transport(error, &method, path, 0))?;
         let status = response.status();
-        let value: Value = response.json().await.map_err(|_| ExchangeError {
-            code: 0,
-            status: status.as_u16(),
-            uncertain: method == Method::POST || method == Method::DELETE,
-        })?;
-        if !status.is_success() {
-            let code = value["code"].as_i64().unwrap_or(0);
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| ExchangeError::transport(error, &method, path, status.as_u16()))?;
+        let value = serde_json::from_slice::<Value>(&body);
+        let code = value
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("code"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        // Preserve HTTP failures even when a gateway returns HTML instead of JSON.
+        // A Binance error code must also be rejected if it arrives with HTTP 200.
+        if !status.is_success() || code < 0 {
             return Err(ExchangeError {
                 code,
                 status: status.as_u16(),
                 uncertain: (status.is_server_error() || matches!(code, -1006 | -1007))
                     && (method == Method::POST || method == Method::DELETE),
+                path,
+                kind: ExchangeErrorKind::Api,
             }
             .into());
         }
-        Ok(value)
+        value.map_err(|error| {
+            ExchangeError {
+                code: 0,
+                status: status.as_u16(),
+                uncertain: method == Method::POST || method == Method::DELETE,
+                path,
+                kind: if body.iter().all(u8::is_ascii_whitespace) {
+                    ExchangeErrorKind::EmptyResponse
+                } else if error.is_eof() {
+                    ExchangeErrorKind::IncompleteJson
+                } else {
+                    ExchangeErrorKind::InvalidJson
+                },
+            }
+            .into()
+        })
     }
     pub async fn sync_time(&self) -> Result<()> {
         let start = now_ms();
@@ -699,6 +818,218 @@ mod tests {
                 {"asset": "BTC", "walletBalance": "0.001", "unrealizedProfit": "0", "marginBalance": "0.001"}
             ]
         })
+    }
+    #[tokio::test]
+    async fn response_failures_report_the_stage_and_only_retry_transient_public_gets() {
+        use axum::{body::Body, response::IntoResponse};
+        for (status, body, kind, attempts, reason) in [
+            (200, "", ExchangeErrorKind::EmptyResponse, 2, "空响应"),
+            (
+                200,
+                "{\"bidPrice\":",
+                ExchangeErrorKind::IncompleteJson,
+                2,
+                "不完整 JSON",
+            ),
+            (
+                200,
+                "<html>local-test-key local-test-secret</html>",
+                ExchangeErrorKind::InvalidJson,
+                1,
+                "无效 JSON",
+            ),
+            (
+                200,
+                "{\"code\":-1021,\"msg\":\"local-test-secret\"}",
+                ExchangeErrorKind::Api,
+                1,
+                "时间校验失败",
+            ),
+            (
+                403,
+                "<html>local-test-secret</html>",
+                ExchangeErrorKind::Api,
+                1,
+                "访问被拒绝",
+            ),
+            (
+                429,
+                "<html>local-test-secret</html>",
+                ExchangeErrorKind::Api,
+                1,
+                "频率受限",
+            ),
+            (
+                503,
+                "<html>local-test-secret</html>",
+                ExchangeErrorKind::Api,
+                1,
+                "服务暂时不可用",
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let app = Router::new().fallback(move || {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::from_u16(status).unwrap(), Body::from(body)).into_response()
+                }
+            });
+            let (base, server) = crate::test_support::mock_server(app).await;
+            let client = Binance::mock(base);
+            let error = client.quotes().await.unwrap_err();
+            let exchange = error.downcast_ref::<ExchangeError>().unwrap();
+            assert_eq!(exchange.kind, kind);
+            assert_eq!(exchange.status, status);
+            assert!(!exchange.uncertain);
+            let message = format!("{error:#}");
+            assert!(message.contains("/fapi/v1/ticker/bookTicker"));
+            assert!(message.contains(reason), "{message}");
+            assert!(!message.contains("local-test-key") && !message.contains("local-test-secret"));
+            assert_eq!(calls.load(Ordering::SeqCst), attempts);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn public_quotes_recover_once_and_keep_the_received_market_values() {
+        use axum::body::Body;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/fapi/v1/ticker/bookTicker",
+            get(move |headers: HeaderMap, RawQuery(query): RawQuery| {
+                let observed = observed.clone();
+                async move {
+                    assert!(!headers.contains_key("X-MBX-APIKEY"));
+                    assert!(query.is_none());
+                    let first = observed.fetch_add(1, Ordering::SeqCst) == 0;
+                    Body::from(if first {
+                        "[{\"symbol\":"
+                    } else {
+                        "[{\"symbol\":\"BTCUSDT\",\"bidPrice\":\"100\",\"askPrice\":\"101\",\"bidQty\":\"2\",\"askQty\":\"3\"}]"
+                    })
+                }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let client = Binance::mock(base);
+        let quotes = client.quotes().await.unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes["BTCUSDT"].bid, Decimal::from(100));
+        assert_eq!(quotes["BTCUSDT"].ask, Decimal::from(101));
+        assert_eq!(quotes["BTCUSDT"].bid_qty, Decimal::from(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn header_and_body_timeouts_preserve_uncertainty_and_never_replay_signed_or_clock_requests()
+     {
+        use axum::{body::Body, response::IntoResponse};
+        use std::convert::Infallible;
+        for body_timeout in [false, true] {
+            for (method, signed, path, attempts, uncertain) in [
+                (Method::GET, false, "/fapi/v1/ticker/bookTicker", 2, false),
+                (Method::GET, false, "/fapi/v1/time", 1, false),
+                (Method::GET, true, "/fapi/v1/order", 1, false),
+                (Method::POST, true, "/fapi/v1/order", 1, true),
+                (Method::DELETE, true, "/fapi/v1/order", 1, true),
+            ] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = calls.clone();
+                let app = Router::new().fallback(move || {
+                    let observed = observed.clone();
+                    async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        if !body_timeout {
+                            tokio::time::sleep(Duration::from_millis(600)).await;
+                        }
+                        let stream = futures_util::stream::once(async move {
+                            if body_timeout {
+                                tokio::time::sleep(Duration::from_millis(600)).await;
+                            }
+                            Ok::<_, Infallible>("{\"secret\":\"local-test-secret\"}")
+                        });
+                        (
+                            [("content-type", "application/json")],
+                            Body::from_stream(stream),
+                        )
+                            .into_response()
+                    }
+                });
+                let (base, server) = crate::test_support::mock_server(app).await;
+                let mut client = Binance::mock(base);
+                client.client = Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_millis(200))
+                    .build()
+                    .unwrap();
+                let error = client
+                    .request(method, path, vec![], signed)
+                    .await
+                    .unwrap_err();
+                let exchange = error.downcast_ref::<ExchangeError>().unwrap();
+                assert_eq!(exchange.uncertain, uncertain);
+                assert_eq!(exchange.status, if body_timeout { 200 } else { 0 });
+                assert_eq!(
+                    exchange.kind,
+                    if body_timeout {
+                        ExchangeErrorKind::ResponseTimeout
+                    } else {
+                        ExchangeErrorKind::RequestTimeout
+                    }
+                );
+                let message = format!("{error:#}");
+                assert!(message.contains(if body_timeout {
+                    "响应读取超时"
+                } else {
+                    "请求超时"
+                }));
+                assert!(
+                    !message.contains("signature=")
+                        && !message.contains("local-test-secret")
+                        && !message.contains("local-test-key")
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), attempts);
+                server.abort();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn mutation_errors_preserve_definite_rejection_and_unknown_execution_without_retries() {
+        use axum::body::Body;
+        for method in [Method::POST, Method::DELETE] {
+            for (status, body, code, uncertain) in [
+                (200, "<html>local-test-secret</html>", 0, true),
+                (200, "{\"code\":-1007}", -1007, true),
+                (400, "{\"code\":-1021}", -1021, false),
+                (403, "<html>local-test-secret</html>", 0, false),
+                (503, "<html>local-test-secret</html>", 0, true),
+            ] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = calls.clone();
+                let app = Router::new().fallback(move || {
+                    let observed = observed.clone();
+                    async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::from_u16(status).unwrap(), Body::from(body))
+                    }
+                });
+                let (base, server) = crate::test_support::mock_server(app).await;
+                let client = Binance::mock(base);
+                let error = client
+                    .request(method.clone(), "/fapi/v1/order", vec![], true)
+                    .await
+                    .unwrap_err();
+                let exchange = error.downcast_ref::<ExchangeError>().unwrap();
+                assert_eq!(exchange.code, code);
+                assert_eq!(exchange.status, status);
+                assert_eq!(exchange.uncertain, uncertain);
+                assert!(!format!("{error:#}").contains("local-test-secret"));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                server.abort();
+            }
+        }
     }
     async fn credential_server(
         status: StatusCode,

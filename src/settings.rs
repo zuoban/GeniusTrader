@@ -66,6 +66,17 @@ pub struct CredentialTestResult {
 }
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct JevCredentialTestRequest {
+    pub jev_key: Option<String>,
+    pub clear_jev: bool,
+}
+#[derive(Serialize)]
+pub struct JevCredentialTestResult {
+    pub ok: bool,
+    pub message: &'static str,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SettingsPatch {
     pub mode: Option<Mode>,
     pub live_enabled: Option<bool>,
@@ -149,6 +160,13 @@ impl Credentials {
     }
 }
 impl AppSettings {
+    pub fn jev_key_for_test(&self, request: JevCredentialTestRequest) -> Result<String> {
+        ensure!(!request.clear_jev, "请先取消清除 Jev 密钥，再测试连接");
+        let mut key = self.jev_key.clone();
+        update_secret(&mut key, request.jev_key)?;
+        ensure!(!key.is_empty(), "请填写 Jev API Key 后再测试连接");
+        Ok(key)
+    }
     pub fn credentials(&self) -> &Credentials {
         if self.mode == Mode::Testnet {
             &self.testnet
@@ -219,6 +237,47 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn jev_tests_use_current_or_saved_key_without_modifying_settings() {
+        let saved = AppSettings {
+            jev_key: "saved-jev-key".into(),
+            ..AppSettings::default()
+        };
+        for (input, expected) in [
+            (serde_json::json!({}), "saved-jev-key"),
+            (serde_json::json!({"jev_key":"  "}), "saved-jev-key"),
+            (
+                serde_json::json!({"jev_key":" new-jev-key "}),
+                "new-jev-key",
+            ),
+        ] {
+            assert_eq!(
+                saved
+                    .jev_key_for_test(serde_json::from_value(input).unwrap())
+                    .unwrap(),
+                expected
+            );
+        }
+        for input in [
+            serde_json::json!({"clear_jev":true}),
+            serde_json::json!({"clear_jev":true,"jev_key":"new-key"}),
+            serde_json::json!({"jev_key":"invalid key"}),
+            serde_json::json!({"jev_key":"密钥"}),
+            serde_json::json!({"jev_key":"k".repeat(513)}),
+        ] {
+            assert!(
+                saved
+                    .jev_key_for_test(serde_json::from_value(input).unwrap())
+                    .is_err()
+            );
+        }
+        assert_eq!(saved.jev_key, "saved-jev-key");
+        assert!(
+            AppSettings::default()
+                .jev_key_for_test(JevCredentialTestRequest::default())
+                .is_err()
+        );
+    }
     #[test]
     fn blank_preserves_clear_removes_and_view_never_contains_secrets() {
         let s = AppSettings::default().patched(serde_json::from_value(serde_json::json!({"testnet":{"key":"testnet-key-abcdef","secret":"testnet-secret-abcdef"},"jev_key":"jev-secret-abcdef"})).unwrap()).unwrap();

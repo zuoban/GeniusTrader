@@ -5,7 +5,7 @@ const modeNames={builtin:'内置策略',jev:'Jev',hybrid:'组合确认'};
 let state=null,markets=[],selected=new Set(),editing=null,closing=null,busy=false;
 let auth={initialized:false,authenticated:false},pendingAdmin=null,setupPrompted=false;
 let assetsHidden=false;
-const credentialTestRevision={testnet:0,live:0};
+const credentialTestRevision={testnet:0,live:0,jev:0};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=(v,d=2)=>Number(v||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const price=v=>v==null?'—':Number(v).toLocaleString('en-US',{maximumFractionDigits:8});
@@ -146,7 +146,7 @@ function showSettings(){
       input('model','模型',j.model,'required'),numeric('min_confidence','最低置信度',j.min_confidence,0,1,'.01'),
       numeric('lookback_bars','行情回看 / 根',j.lookback_bars,100,500),numeric('forecast_bars','判断窗口 / 根',j.forecast_bars,1,288),
       numeric('timeout_seconds','请求超时 / 秒',j.timeout_seconds,1,30)
-    ],(state.jev_available?'Jev 密钥已配置。':'请在「账户与连接」中配置 Jev API Key。')+' 置信度不是交易胜率；判断窗口不触发自动平仓。')+
+    ],(state.jev_available?'Jev 密钥已配置。':'请在「账户与连接」中配置 Jev API Key。')+' 测试连接只验证模型列表，决策请求还包括行情上传与模型处理。请求超时包含连接、上传和结果读取，建议 15 秒，网络较慢时可调整至 30 秒。置信度不是交易胜率；判断窗口不触发自动平仓。')+
     section('模拟费用',[
       numeric('maker_fee','Maker 费率 / 小数',c.maker_fee,0,.1,'.00001'),numeric('taker_fee','Taker 费率 / 小数',c.taker_fee,0,.1,'.00001'),
       numeric('paper_balance_usdt','初始模拟余额 / USDT',c.paper_balance_usdt,1,10000000,'.01')
@@ -168,11 +168,11 @@ function renderSystem(){
 }
 const secretInput=(name,label,configured,mask)=>input(name,label,'','type="password" autocomplete="new-password" maxlength="512" placeholder="'+esc(configured?'已保存'+(mask?' '+mask:'')+' · 留空保留':'尚未配置')+'"');
 const checkInput=(name,label,checked=false)=>'<label class="check-line"><input type="checkbox" name="'+name+'" '+(checked?'checked':'')+'><span>'+label+'</span></label>';
-const credentialTestControls=mode=>'<div class="credential-test-actions"><span>留空测试已保存值 · 填写后测试当前值</span><button class="quiet" type="button" data-credential-test="'+mode+'" aria-label="测试'+(mode==='testnet'?'测试网':'实盘')+'账户密钥">测试连接 ↗</button></div><p class="credential-test-result" id="'+mode+'-test-result" role="status" aria-live="polite" aria-atomic="true" hidden></p>';
+const credentialTestControls=mode=>'<div class="credential-test-actions"><span>留空测试已保存值 · 填写后测试当前值</span><button class="quiet" type="button" data-credential-test="'+mode+'" aria-label="测试'+(mode==='jev'?'Jev 密钥':(mode==='testnet'?'测试网':'实盘')+'账户密钥')+'">测试连接 ↗</button></div><p class="credential-test-result" id="'+mode+'-test-result" role="status" aria-live="polite" aria-atomic="true" hidden></p>';
 const credentialPatch=(form,mode)=>({key:form.elements[mode+'_key'].value,secret:form.elements[mode+'_secret'].value,clear:form.elements['clear_'+mode].checked});
 function renderConnections(){
   const s=state.settings;if(!s)return;
-  for(const mode of ['testnet','live'])credentialTestRevision[mode]++;
+  for(const mode of ['testnet','live','jev'])credentialTestRevision[mode]++;
   $('connections-fields').innerHTML=
     section('执行模式',[
       select('execution_mode','交易模式',s.mode,{paper:'模拟交易 · Paper',testnet:'币安测试网 · Testnet',live:'币安实盘 · Live'}),
@@ -191,7 +191,7 @@ function renderConnections(){
     section('TypeSafe AI · Jev 密钥',[
       secretInput('jev_key','Jev API Key',s.jev_configured,s.jev_key_masked),
       checkInput('clear_jev','清除已保存的 Jev 密钥')
-    ],'密钥写入本机 SQLite，页面不回填原文。留空保留已保存值，勾选清除才删除。Jev 密钥可在持仓期间修改，保存后暂停新增开仓，已有仓位继续管理。连接检查仅验证币安；Jev 在决策时验证，不在此触发模型计费。');
+    ],'密钥写入本机 SQLite，页面不回填原文。留空保留已保存值，勾选清除才删除。Jev 密钥可在持仓期间修改，保存后暂停新增开仓，已有仓位继续管理。测试仅验证密钥并读取可用模型，不保存输入或触发模型推理计费。',credentialTestControls('jev'));
   $('connection-result').hidden=true;
 }
 function showCoin(coin){
@@ -273,6 +273,7 @@ $('connections-form').addEventListener('submit',e=>{
   });
 });
 $('connections-fields').addEventListener('input',e=>{
+  if(['jev_key','clear_jev'].includes(e.target.name)){credentialTestRevision.jev++;$('jev-test-result').hidden=true;return;}
   const mode=e.target.name?.match(/^(testnet|live)_(key|secret)$|^clear_(testnet|live)$/);
   if(!mode)return;const account=mode[1]||mode[3];credentialTestRevision[account]++;$(account+'-test-result').hidden=true;
 });
@@ -280,15 +281,15 @@ $('connections-fields').addEventListener('click',e=>{
   const b=e.target.closest('button[data-credential-test]');if(!b||b.disabled)return;
   act(async()=>{
     const mode=b.dataset.credentialTest,f=$('connections-form'),r=$(mode+'-test-result');
-    const credentials=credentialPatch(f,mode),revision=++credentialTestRevision[mode];
-    const label=mode==='testnet'?'测试网':'实盘',edited=Boolean(credentials.key.trim()||credentials.secret.trim());
+    const jev=mode==='jev',credentials=jev?{key:f.elements.jev_key.value,clear:f.elements.clear_jev.checked}:credentialPatch(f,mode),revision=++credentialTestRevision[mode];
+    const label=jev?'Jev':mode==='testnet'?'测试网':'实盘',edited=Boolean(credentials.key.trim()||credentials.secret?.trim());
     const show=(status,message)=>{if(revision!==credentialTestRevision[mode])return;r.hidden=false;r.dataset.state=status;r.textContent=message;};
     b.disabled=true;b.textContent='正在测试…';b.setAttribute('aria-busy','true');
     try{
-      if(credentials.clear)throw new Error('请先取消清除账户，再测试密钥');
+      if(credentials.clear)throw new Error(jev?'请先取消清除 Jev 密钥，再测试连接':'请先取消清除账户，再测试密钥');
       show('pending','正在验证'+label+(edited?'当前填写的密钥':'已保存的密钥')+'…');
-      const result=await api('/api/settings/test','POST',{mode,credentials});
-      show(result.can_trade?'success':'warning',result.message+(edited?' 当前填写的密钥尚未保存，请保存后生效。':''));
+      const result=await api(jev?'/api/settings/jev/test':'/api/settings/test','POST',jev?{jev_key:credentials.key,clear_jev:credentials.clear}:{mode,credentials});
+      show(jev||result.can_trade?'success':'warning',result.message+(edited?' 当前填写的密钥尚未保存，请保存后生效。':''));
     }catch(err){show('error',err.message);if(err.status===401)throw err;}
     finally{b.disabled=false;b.textContent='测试连接 ↗';b.removeAttribute('aria-busy');}
   });

@@ -5,8 +5,8 @@ use crate::{
     exchange::Binance,
     jev::Jev,
     settings::{
-        AppSettings, CredentialTestRequest, CredentialTestResult, Credentials, SettingsPatch,
-        SettingsView,
+        AppSettings, CredentialTestRequest, CredentialTestResult, Credentials,
+        JevCredentialTestRequest, JevCredentialTestResult, SettingsPatch, SettingsView,
     },
     store::Store,
 };
@@ -185,6 +185,18 @@ impl Application {
             },
         })
     }
+    pub async fn test_jev_credentials(
+        &self,
+        request: JevCredentialTestRequest,
+    ) -> Result<JevCredentialTestResult> {
+        let key = self.settings.lock().await.jev_key_for_test(request)?;
+        let client = Jev::with_key(&key)?;
+        client.verify_credentials().await?;
+        Ok(JevCredentialTestResult {
+            ok: true,
+            message: "Jev 连接正常，密钥验证成功，已读取可用模型；未调用决策模型。",
+        })
+    }
     pub async fn shutdown(&self) {
         let engine = self.engine.read().await;
         let _ = engine.set_running(false).await;
@@ -197,6 +209,27 @@ mod tests {
     use crate::domain::*;
     fn patch(value: serde_json::Value) -> SettingsPatch {
         serde_json::from_value(value).unwrap()
+    }
+    #[tokio::test]
+    async fn jev_tests_reject_invalid_input_without_saving_or_pausing_trading() {
+        let app = Application::new(Store::open(":memory:", Mode::Paper).unwrap()).unwrap();
+        let active = app.engine.read().await.clone();
+        active.inner.lock().await.paused = false;
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"clear_jev":true}),
+            serde_json::json!({"jev_key":"invalid key"}),
+        ] {
+            assert!(
+                app.test_jev_credentials(serde_json::from_value(input).unwrap())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(app.store.settings().unwrap() == AppSettings::default());
+        assert!(app.settings.lock().await.clone() == AppSettings::default());
+        assert!(Arc::ptr_eq(&active, &*app.engine.read().await));
+        assert!(!active.snapshot().await.paused);
     }
     #[tokio::test]
     async fn credential_tests_merge_only_the_selected_account_without_saving_or_switching() {
