@@ -1,7 +1,7 @@
 use crate::{
     config::*,
     domain::*,
-    exchange::{Binance, ExchangeError, ExchangeOrder},
+    exchange::{AccountInfo, Binance, ExchangeError, ExchangeOrder},
     jev::Jev,
     store::Store,
     strategy::{self, Decision},
@@ -39,6 +39,9 @@ pub struct Inner {
     pub market_at: i64,
     pub account_at: i64,
     pub available: Decimal,
+    pub account_assets: Option<AccountInfo>,
+    pub account_assets_at: i64,
+    pub account_assets_error: Option<String>,
     pub external_positions: BTreeMap<String, Decimal>,
     pub external_orders: Vec<String>,
     pub decisions: BTreeMap<String, Decision>,
@@ -53,6 +56,9 @@ pub struct Snapshot {
     pub market_at: i64,
     pub account_at: i64,
     pub available_usdt: Decimal,
+    pub account_assets: Option<AccountInfo>,
+    pub account_assets_at: i64,
+    pub account_assets_error: Option<String>,
     pub config: Config,
     pub pool: Vec<PoolCoin>,
     pub positions: Vec<Position>,
@@ -167,6 +173,9 @@ impl Engine {
                 market_at: 0,
                 account_at: 0,
                 available,
+                account_assets: None,
+                account_assets_at: 0,
+                account_assets_error: None,
                 external_positions: BTreeMap::new(),
                 external_orders: vec![],
                 decisions: BTreeMap::new(),
@@ -192,6 +201,19 @@ impl Engine {
     }
     pub async fn snapshot(&self) -> Snapshot {
         let i = self.inner.lock().await;
+        let unrealized = i
+            .book
+            .positions
+            .values()
+            .map(|p| {
+                p.unrealized(
+                    i.quotes
+                        .get(&p.symbol)
+                        .map(|q| q.mid())
+                        .unwrap_or(p.entry_price),
+                )
+            })
+            .sum();
         Snapshot {
             mode: self.mode,
             paused: i.paused,
@@ -199,6 +221,21 @@ impl Engine {
             market_at: i.market_at,
             account_at: i.account_at,
             available_usdt: i.available,
+            account_assets: if self.mode == Mode::Paper {
+                Some(AccountInfo::paper(
+                    i.book.paper_cash,
+                    unrealized,
+                    paper_available(&i),
+                ))
+            } else {
+                i.account_assets.clone()
+            },
+            account_assets_at: if self.mode == Mode::Paper {
+                now_ms()
+            } else {
+                i.account_assets_at
+            },
+            account_assets_error: i.account_assets_error.clone(),
             config: i.config.clone(),
             pool: i.book.pool.values().cloned().collect(),
             positions: i.book.positions.values().cloned().collect(),
@@ -216,19 +253,7 @@ impl Engine {
             external_positions: i.external_positions.clone(),
             external_orders: i.external_orders.clone(),
             realized_net: i.book.closed_trades.iter().map(|t| t.net_profit).sum(),
-            unrealized: i
-                .book
-                .positions
-                .values()
-                .map(|p| {
-                    p.unrealized(
-                        i.quotes
-                            .get(&p.symbol)
-                            .map(|q| q.mid())
-                            .unwrap_or(p.entry_price),
-                    )
-                })
-                .sum(),
+            unrealized,
             exposure_usdt: i.exposure(),
             jev_available: self.jev.read().await.available(),
         }
@@ -324,6 +349,15 @@ impl Engine {
         let mut tasks = Vec::new();
         let e = self.clone();
         tasks.push(tokio::spawn(async move {
+            let mut t = tokio::time::interval(Duration::from_secs(10));
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                t.tick().await;
+                e.refresh_account_assets().await;
+            }
+        }));
+        let e = self.clone();
+        tasks.push(tokio::spawn(async move {
             let mut t = tokio::time::interval(Duration::from_secs(2));
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -369,6 +403,23 @@ impl Engine {
             }
         }));
         EngineTasks(tasks)
+    }
+    pub(crate) async fn refresh_account_assets(&self) {
+        if self.mode == Mode::Paper || !self.exchange.configured() {
+            return;
+        }
+        let result = self.exchange.account_info().await;
+        let mut i = self.inner.lock().await;
+        match result {
+            Ok(account) => {
+                i.account_assets = Some(account);
+                i.account_assets_at = now_ms();
+                i.account_assets_error = None;
+            }
+            Err(error) => {
+                i.account_assets_error = Some(error.to_string());
+            }
+        }
     }
     async fn fault(&self, message: &str, error: anyhow::Error) {
         self.event("error", None, message, json!({"error": error.to_string()}));
@@ -1550,6 +1601,26 @@ mod tests {
         let i = e.inner.lock().await;
         assert_eq!(i.book.paper_cash, d("999.95"));
         assert_eq!(i.available, d("947.95"));
+    }
+    #[tokio::test]
+    async fn paper_asset_summary_includes_floating_loss_and_initial_margin() {
+        let e = paper();
+        seed(&e).await;
+        e.paper_entry(entry(Action::Long)).await.unwrap();
+        {
+            let mut i = e.inner.lock().await;
+            let q = i.quotes.get_mut("XUSDT").unwrap();
+            q.bid = d("98");
+            q.ask = d("98");
+        }
+        let snapshot = e.snapshot().await;
+        let account = snapshot.account_assets.unwrap();
+        assert_eq!(account.total_wallet_balance, d("4999.95"));
+        assert_eq!(account.total_unrealized_profit, d("-2"));
+        assert_eq!(account.total_margin_balance, d("4997.95"));
+        assert_eq!(account.available_balance, d("4947.95"));
+        assert_eq!(account.total_initial_margin, d("50"));
+        assert_eq!(account.assets[0].asset, "USDT");
     }
     #[tokio::test]
     async fn unknown_entry_survives_restart_and_reconciles_without_resubmission() {

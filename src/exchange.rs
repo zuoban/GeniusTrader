@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::{
@@ -55,6 +55,7 @@ pub struct Binance {
     secret: Option<String>,
     offset: AtomicI64,
     throttle: Mutex<Instant>,
+    position_mode_lock: Mutex<()>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,6 +99,66 @@ pub struct Fill {
     pub side: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all(deserialize = "camelCase"))]
+pub struct AccountInfo {
+    pub multi_assets_margin: bool,
+    pub total_wallet_balance: Decimal,
+    pub total_unrealized_profit: Decimal,
+    pub total_margin_balance: Decimal,
+    pub available_balance: Decimal,
+    pub total_initial_margin: Decimal,
+    pub assets: Vec<AccountAsset>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all(deserialize = "camelCase"))]
+pub struct AccountAsset {
+    pub asset: String,
+    pub wallet_balance: Decimal,
+    pub unrealized_profit: Decimal,
+    pub margin_balance: Decimal,
+    #[serde(skip_deserializing)]
+    pub wallet_value_usd: Option<Decimal>,
+}
+#[derive(Deserialize)]
+struct AssetIndex {
+    symbol: String,
+    index: Decimal,
+    time: i64,
+}
+impl AccountInfo {
+    pub fn paper(wallet: Decimal, unrealized: Decimal, available: Decimal) -> Self {
+        let margin = wallet + unrealized;
+        Self {
+            multi_assets_margin: false,
+            total_wallet_balance: wallet,
+            total_unrealized_profit: unrealized,
+            total_margin_balance: margin,
+            available_balance: available,
+            total_initial_margin: (margin - available).max(Decimal::ZERO),
+            assets: vec![AccountAsset {
+                asset: "USDT".into(),
+                wallet_balance: wallet,
+                unrealized_profit: unrealized,
+                margin_balance: margin,
+                wallet_value_usd: Some(wallet),
+            }],
+        }
+    }
+    fn value_assets(&mut self, indexes: Vec<AssetIndex>, now: i64) {
+        let prices: BTreeMap<_, _> = indexes
+            .into_iter()
+            .filter(|p| p.index > Decimal::ZERO && (now - 60_000..=now + 5_000).contains(&p.time))
+            .map(|p| (p.symbol, p.index))
+            .collect();
+        for asset in &mut self.assets {
+            asset.wallet_value_usd = prices
+                .get(&format!("{}USD", asset.asset))
+                .and_then(|price| asset.wallet_balance.checked_mul(*price));
+        }
+    }
+}
+
 impl Binance {
     #[cfg(test)]
     pub(crate) fn mock(base: String) -> Self {
@@ -112,6 +173,7 @@ impl Binance {
             secret: Some("local-test-secret".into()),
             offset: AtomicI64::new(0),
             throttle: Mutex::new(Instant::now()),
+            position_mode_lock: Mutex::new(()),
         }
     }
     pub fn new(mode: Mode) -> Result<Self> {
@@ -138,6 +200,7 @@ impl Binance {
             secret,
             offset: AtomicI64::new(0),
             throttle: Mutex::new(Instant::now()),
+            position_mode_lock: Mutex::new(()),
         })
     }
     pub fn configured(&self) -> bool {
@@ -354,14 +417,59 @@ impl Binance {
     }
     pub async fn preflight(&self) -> Result<Decimal> {
         self.sync_time().await?;
+        self.ensure_one_way_mode().await?;
+        self.available_balance().await
+    }
+    async fn hedge_mode(&self) -> Result<bool> {
         let m = self
             .request(Method::GET, "/fapi/v1/positionSide/dual", vec![], true)
             .await?;
+        m["dualSidePosition"]
+            .as_bool()
+            .context("币安持仓模式响应缺少有效的 dualSidePosition")
+    }
+    async fn ensure_one_way_mode(&self) -> Result<()> {
+        // Startup reconciliation and a manual connection check can run concurrently.
+        let _guard = self.position_mode_lock.lock().await;
+        if !self.hedge_mode().await? {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .request(
+                Method::POST,
+                "/fapi/v1/positionSide/dual",
+                vec![("dualSidePosition".into(), "false".into())],
+                true,
+            )
+            .await
+        {
+            let exchange_error = error.downcast_ref::<ExchangeError>();
+            let message = match exchange_error.map(|e| e.code) {
+                Some(-4067) => {
+                    Some("自动设置单向持仓失败：币安账户存在未成交挂单，请处理挂单后重试（-4067）")
+                }
+                Some(-4068) => {
+                    Some("自动设置单向持仓失败：币安账户存在持仓，请处理持仓后重试（-4068）")
+                }
+                // Another client may have changed the mode, or the POST response was lost.
+                // Query the account to confirm the result instead of resending the POST.
+                Some(-4059) => None,
+                _ if exchange_error.is_some_and(|e| e.uncertain) => None,
+                _ => Some("自动设置单向持仓失败，请检查币安 API 权限与账户状态"),
+            };
+            if let Some(message) = message {
+                return Err(error.context(message));
+            }
+        }
         ensure!(
-            m["dualSidePosition"] == false,
-            "实盘适配器只支持单向持仓模式"
+            !self
+                .hedge_mode()
+                .await
+                .context("无法确认账户已切换为单向持仓，请稍后重试")?,
+            "自动设置单向持仓尚未生效，账户仍为双向持仓，请稍后重试"
         );
-        self.available_balance().await
+        tracing::info!("币安账户已确认切换为单向持仓模式");
+        Ok(())
     }
     pub async fn available_balance(&self) -> Result<Decimal> {
         let v = self
@@ -374,6 +482,23 @@ impl Binance {
             .find(|x| x["asset"] == "USDT")
             .context("missing USDT balance")?;
         decimal(&usdt["availableBalance"])
+    }
+    pub async fn account_info(&self) -> Result<AccountInfo> {
+        // V2 includes the margin mode and complete asset balances. Its account totals
+        // are USDT in single-asset mode and USD in multi-assets mode.
+        let mut account: AccountInfo = serde_json::from_value(
+            self.request(Method::GET, "/fapi/v2/account", vec![], true)
+                .await?,
+        )?;
+        // An unavailable valuation must not hide the native account balances.
+        if let Ok(value) = self
+            .request(Method::GET, "/fapi/v1/assetIndex", vec![], false)
+            .await
+            && let Ok(indexes) = serde_json::from_value(value)
+        {
+            account.value_assets(indexes, now_ms() + self.offset.load(Ordering::Relaxed));
+        }
+        Ok(account)
     }
     pub async fn positions(&self) -> Result<Vec<RemotePosition>> {
         Ok(serde_json::from_value(
@@ -515,11 +640,367 @@ impl Binance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        Json, Router,
+        extract::{RawQuery, State},
+        http::{HeaderMap, StatusCode},
+        routing::get,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize},
+    };
+
+    fn asset_account() -> Value {
+        serde_json::json!({
+            "multiAssetsMargin": false, "totalWalletBalance": "1000",
+            "totalUnrealizedProfit": "-10", "totalMarginBalance": "990",
+            "availableBalance": "900", "totalInitialMargin": "90",
+            "assets": [
+                {"asset": "USDT", "walletBalance": "1000", "unrealizedProfit": "-10", "marginBalance": "990"},
+                {"asset": "USDC", "walletBalance": "500", "unrealizedProfit": "0", "marginBalance": "500"},
+                {"asset": "BTC", "walletBalance": "0.001", "unrealizedProfit": "0", "marginBalance": "0.001"}
+            ]
+        })
+    }
+    async fn asset_server(
+        index_status: StatusCode,
+    ) -> (Binance, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+        let failing = Arc::new(AtomicBool::new(false));
+        let failure = failing.clone();
+        let app = Router::new()
+            .route(
+                "/fapi/v2/account",
+                get(move |headers: HeaderMap, RawQuery(query): RawQuery| {
+                    let failure = failure.clone();
+                    async move {
+                        assert_signed(&headers, &query.unwrap());
+                        if failure.load(Ordering::SeqCst) {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({"code": -1000})),
+                            )
+                        } else {
+                            (StatusCode::OK, Json(asset_account()))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/fapi/v1/assetIndex",
+                get(move |headers: HeaderMap| async move {
+                    assert!(!headers.contains_key("X-MBX-APIKEY"));
+                    (
+                        index_status,
+                        Json(serde_json::json!([
+                            {"symbol":"USDTUSD", "index":"1", "time": now_ms()},
+                            {"symbol":"USDCUSD", "index":"0.999", "time": now_ms()},
+                            {"symbol":"BTCUSD", "index":"80000", "time": now_ms()}
+                        ])),
+                    )
+                }),
+            );
+        let (url, server) = crate::test_support::mock_server(app).await;
+        (Binance::mock(url), failing, server)
+    }
+
+    #[tokio::test]
+    async fn account_assets_keep_exchange_totals_and_value_native_balances() {
+        let (client, _, server) = asset_server(StatusCode::OK).await;
+        let account = client.account_info().await.unwrap();
+        assert!(!account.multi_assets_margin);
+        assert_eq!(account.total_wallet_balance, Decimal::from(1000));
+        assert_eq!(account.total_margin_balance, Decimal::from(990));
+        assert_eq!(account.available_balance, Decimal::from(900));
+        assert_eq!(
+            account.assets[1].wallet_value_usd,
+            Some(Decimal::new(4995, 1))
+        );
+        assert_eq!(account.assets[2].wallet_balance, Decimal::new(1, 3));
+        assert_eq!(account.assets[2].wallet_value_usd, Some(Decimal::from(80)));
+        let json = serde_json::to_value(account).unwrap();
+        assert_eq!(json["total_wallet_balance"], "1000");
+        assert_eq!(json["assets"][2]["asset"], "BTC");
+        server.abort();
+    }
+    #[tokio::test]
+    async fn failed_asset_prices_preserve_native_balances_without_fake_values() {
+        let (client, _, server) = asset_server(StatusCode::SERVICE_UNAVAILABLE).await;
+        let account = client.account_info().await.unwrap();
+        assert_eq!(account.total_margin_balance, Decimal::from(990));
+        assert_eq!(account.assets.len(), 3);
+        assert!(
+            account
+                .assets
+                .iter()
+                .all(|asset| asset.wallet_value_usd.is_none())
+        );
+        server.abort();
+    }
+    #[test]
+    fn stale_missing_and_invalid_asset_indexes_are_not_used() {
+        let mut account: AccountInfo = serde_json::from_value(asset_account()).unwrap();
+        account.value_assets(
+            vec![
+                AssetIndex {
+                    symbol: "USDTUSD".into(),
+                    index: Decimal::ONE,
+                    time: 100_000,
+                },
+                AssetIndex {
+                    symbol: "BTCUSD".into(),
+                    index: Decimal::from(80000),
+                    time: 1,
+                },
+                AssetIndex {
+                    symbol: "USDCUSD".into(),
+                    index: Decimal::ZERO,
+                    time: 100_000,
+                },
+            ],
+            100_000,
+        );
+        assert_eq!(
+            account.assets[0].wallet_value_usd,
+            Some(Decimal::from(1000))
+        );
+        assert!(account.assets[1].wallet_value_usd.is_none());
+        assert!(account.assets[2].wallet_value_usd.is_none());
+        account.value_assets(vec![], 100_000);
+        assert!(
+            account
+                .assets
+                .iter()
+                .all(|asset| asset.wallet_value_usd.is_none())
+        );
+    }
+    #[tokio::test]
+    async fn failed_asset_refresh_keeps_last_snapshot_and_does_not_pause_trading() {
+        let (client, failing, server) = asset_server(StatusCode::OK).await;
+        let engine = crate::engine::Engine::new(
+            Mode::Testnet,
+            crate::store::Store::open(":memory:", Mode::Testnet).unwrap(),
+            crate::config::Config::default(),
+            client,
+            crate::jev::Jev::new().unwrap(),
+        )
+        .unwrap();
+        assert!(engine.snapshot().await.account_assets.is_none());
+        engine.inner.lock().await.paused = false;
+        engine.refresh_account_assets().await;
+        let first = engine.snapshot().await;
+        assert!(first.account_assets_at > 0);
+        assert!(first.account_assets_error.is_none());
+        failing.store(true, Ordering::SeqCst);
+        engine.refresh_account_assets().await;
+        let failed = engine.snapshot().await;
+        assert_eq!(failed.account_assets_at, first.account_assets_at);
+        assert_eq!(
+            failed.account_assets.unwrap().total_margin_balance,
+            Decimal::from(990)
+        );
+        assert!(failed.account_assets_error.is_some());
+        assert!(!failed.paused);
+        assert_eq!(failed.account_at, 0); // Display data cannot mark trading reconciliation complete.
+        failing.store(false, Ordering::SeqCst);
+        engine.refresh_account_assets().await;
+        assert!(engine.snapshot().await.account_assets_error.is_none());
+        server.abort();
+    }
+
+    struct Account {
+        mode: Mutex<Value>,
+        mode_queries: AtomicUsize,
+        changes: AtomicUsize,
+        balance_queries: AtomicUsize,
+        status: StatusCode,
+        code: i64,
+        apply_change: bool,
+    }
+    fn assert_signed(headers: &HeaderMap, query: &str) {
+        assert_eq!(headers["X-MBX-APIKEY"], "local-test-key");
+        let (payload, actual_signature) = query.rsplit_once("&signature=").unwrap();
+        assert_eq!(actual_signature, signature("local-test-secret", payload));
+        let params: BTreeMap<_, _> = url::form_urlencoded::parse(payload.as_bytes()).collect();
+        assert!(params["timestamp"].parse::<i64>().unwrap() > 0);
+        assert_eq!(params["recvWindow"], "5000");
+    }
+    async fn account_server(
+        mode: Value,
+        status: StatusCode,
+        code: i64,
+        apply_change: bool,
+    ) -> (Binance, Arc<Account>, tokio::task::JoinHandle<()>) {
+        let account = Arc::new(Account {
+            mode: Mutex::new(mode),
+            mode_queries: AtomicUsize::new(0),
+            changes: AtomicUsize::new(0),
+            balance_queries: AtomicUsize::new(0),
+            status,
+            code,
+            apply_change,
+        });
+        async fn read_mode(
+            State(account): State<Arc<Account>>,
+            headers: HeaderMap,
+            RawQuery(query): RawQuery,
+        ) -> Json<Value> {
+            assert_signed(&headers, &query.unwrap());
+            account.mode_queries.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({"dualSidePosition": account.mode.lock().await.clone()}))
+        }
+        async fn change(
+            State(account): State<Arc<Account>>,
+            headers: HeaderMap,
+            body: String,
+        ) -> (StatusCode, Json<Value>) {
+            assert_signed(&headers, &body);
+            let params: BTreeMap<_, _> = url::form_urlencoded::parse(body.as_bytes()).collect();
+            assert_eq!(params["dualSidePosition"], "false");
+            assert!(!params.contains_key("symbol"));
+            account.changes.fetch_add(1, Ordering::SeqCst);
+            if account.apply_change {
+                *account.mode.lock().await = Value::Bool(false);
+            }
+            (
+                account.status,
+                Json(serde_json::json!({"code": account.code})),
+            )
+        }
+        async fn balance(
+            State(account): State<Arc<Account>>,
+            headers: HeaderMap,
+            RawQuery(query): RawQuery,
+        ) -> Json<Value> {
+            assert_signed(&headers, &query.unwrap());
+            account.balance_queries.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!([{"asset": "USDT", "availableBalance": "5000"}]))
+        }
+        let app = Router::new()
+            .route(
+                "/fapi/v1/time",
+                get(|| async { Json(serde_json::json!({"serverTime": now_ms()})) }),
+            )
+            .route("/fapi/v1/positionSide/dual", get(read_mode).post(change))
+            .route("/fapi/v3/balance", get(balance))
+            .with_state(account.clone());
+        let (url, task) = crate::test_support::mock_server(app).await;
+        (Binance::mock(url), account, task)
+    }
     #[test]
     fn hmac_known_vector() {
         assert_eq!(
             signature("key", "The quick brown fox jumps over the lazy dog"),
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
         );
+    }
+    #[tokio::test]
+    async fn preflight_leaves_existing_one_way_mode_unchanged() {
+        let (client, account, server) =
+            account_server(Value::Bool(false), StatusCode::OK, 200, true).await;
+        assert_eq!(client.preflight().await.unwrap(), Decimal::from(5000));
+        assert_eq!(account.mode_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(account.changes.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn preflight_switches_hedge_mode_and_verifies_before_balance() {
+        let (client, account, server) =
+            account_server(Value::Bool(true), StatusCode::OK, 200, true).await;
+        assert_eq!(client.preflight().await.unwrap(), Decimal::from(5000));
+        assert_eq!(account.mode_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(account.changes.load(Ordering::SeqCst), 1);
+        assert_eq!(*account.mode.lock().await, Value::Bool(false));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn preflight_rejects_invalid_mode_without_changing_account() {
+        let (client, account, server) =
+            account_server(Value::String("false".into()), StatusCode::OK, 200, true).await;
+        let error = client.preflight().await.unwrap_err();
+        assert!(error.to_string().contains("dualSidePosition"));
+        assert_eq!(account.changes.load(Ordering::SeqCst), 0);
+        assert_eq!(account.balance_queries.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn preflight_reports_orders_positions_and_permission_failures() {
+        for (code, reason) in [(-4067, "挂单"), (-4068, "持仓"), (-2015, "API 权限")] {
+            let (client, account, server) =
+                account_server(Value::Bool(true), StatusCode::BAD_REQUEST, code, false).await;
+            let error = client.preflight().await.unwrap_err();
+            assert!(error.to_string().contains(reason));
+            assert_eq!(error.downcast_ref::<ExchangeError>().unwrap().code, code);
+            assert_eq!(account.mode_queries.load(Ordering::SeqCst), 1);
+            assert_eq!(account.changes.load(Ordering::SeqCst), 1);
+            assert_eq!(account.balance_queries.load(Ordering::SeqCst), 0);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn preflight_requires_confirmed_one_way_mode_after_post() {
+        let (client, account, server) =
+            account_server(Value::Bool(true), StatusCode::OK, 200, false).await;
+        assert!(
+            client
+                .preflight()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("仍为双向持仓")
+        );
+        assert_eq!(account.mode_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(account.changes.load(Ordering::SeqCst), 1);
+        assert_eq!(account.balance_queries.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn preflight_confirms_racing_or_uncertain_changes_without_resubmitting() {
+        for (status, code) in [
+            (StatusCode::BAD_REQUEST, -4059),
+            (StatusCode::SERVICE_UNAVAILABLE, -1007),
+        ] {
+            for changed in [false, true] {
+                let (client, account, server) =
+                    account_server(Value::Bool(true), status, code, changed).await;
+                assert_eq!(client.preflight().await.is_ok(), changed);
+                assert_eq!(account.mode_queries.load(Ordering::SeqCst), 2);
+                assert_eq!(account.changes.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    account.balance_queries.load(Ordering::SeqCst),
+                    usize::from(changed)
+                );
+                server.abort();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn concurrent_preflights_only_change_mode_once() {
+        let (client, account, server) =
+            account_server(Value::Bool(true), StatusCode::OK, 200, true).await;
+        let (first, second) = tokio::join!(client.preflight(), client.preflight());
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(account.changes.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn application_connection_check_automatically_sets_one_way_mode() {
+        let (client, account, server) =
+            account_server(Value::Bool(true), StatusCode::OK, 200, true).await;
+        let engine = crate::engine::Engine::new(
+            Mode::Testnet,
+            crate::store::Store::open(":memory:", Mode::Testnet).unwrap(),
+            crate::config::Config::default(),
+            client,
+            crate::jev::Jev::new().unwrap(),
+        )
+        .unwrap();
+        let app = crate::application::Application::from_engine(engine);
+        let message = app.check_connection().await.unwrap();
+        assert!(message.contains("自动设置为单向持仓"));
+        assert_eq!(account.changes.load(Ordering::SeqCst), 1);
+        assert!(app.engine.read().await.snapshot().await.paused);
+        server.abort();
     }
 }

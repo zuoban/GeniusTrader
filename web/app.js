@@ -4,6 +4,7 @@ const names={ema_cross:'EMA CROSS',macd:'MACD',bollinger:'BOLLINGER',rsi:'RSI'};
 const modeNames={builtin:'内置策略',jev:'Jev',hybrid:'组合确认'};
 let state=null,markets=[],selected=new Set(),editing=null,closing=null,busy=false;
 let auth={initialized:false,authenticated:false},pendingAdmin=null,setupPrompted=false;
+let assetsHidden=false;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=(v,d=2)=>Number(v||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const price=v=>v==null?'—':Number(v).toLocaleString('en-US',{maximumFractionDigits:8});
@@ -38,7 +39,38 @@ async function withAdmin(fn){
   catch(err){toast(err.message,true);}
 }
 async function refresh(){
-  if(busy)return;busy=true;try{state=await api('/api/state');render();$('connection-label').textContent='● 本地控制台已连接';}catch(err){$('connection-label').textContent='○ 控制台连接中断';}finally{busy=false;}
+  if(busy)return;busy=true;try{state=await api('/api/state');render();$('connection-label').textContent='● 本地控制台已连接';}catch(err){$('connection-label').textContent='○ 控制台连接中断';$('asset-sync').textContent='本地连接中断 · 数据未更新';$('asset-sync').className='subtle sync-delayed';}finally{busy=false;}
+}
+function renderAssets(){
+  const s=state,a=s.account_assets,unit=a?.multi_assets_margin?'USD':'USDT';
+  const money=(value,d=4)=>assetsHidden?'••••••':num(value,d);
+  const native=value=>assetsHidden?'••••••':price(value);
+  $('account-kind').textContent={paper:'模拟账户',testnet:'测试网账户',live:'实盘账户'}[s.mode];
+  document.querySelectorAll('.asset-currency').forEach(el=>{el.textContent=unit;});
+  for(const [id,field] of [['asset-margin','total_margin_balance'],['asset-wallet','total_wallet_balance'],['asset-pnl','total_unrealized_profit'],['asset-available','available_balance'],['asset-initial','total_initial_margin']]){
+    $(id).textContent=a?money(a[field]):'—';
+  }
+  $('asset-pnl').className=a&&!assetsHidden?color(a.total_unrealized_profit):'';
+  $('asset-summary-note').textContent=s.mode==='paper'?'模拟账户 · 钱包余额 + 未实现盈亏':!a?'连接账户后展示币安资产汇总':a.multi_assets_margin?'联合保证金模式 · 币安 USD 汇总':'单资产保证金模式 · 币安 USDT 汇总';
+  const delayed=Boolean(s.account_assets_error)||(s.mode!=='paper'&&s.account_assets_at>0&&Date.now()-s.account_assets_at>30000);
+  $('asset-sync').className='subtle'+(delayed?' sync-delayed':'');
+  $('asset-sync').textContent=s.mode==='paper'?'本机模拟资产':delayed?(a?'同步延迟 · 显示上次成功数据':'资产同步失败 · 等待重试'):a?'更新于 '+new Date(s.account_assets_at).toLocaleTimeString('zh-CN',{hour12:false})+' · 约 10 秒同步':s.settings?.[s.mode]?.configured?'正在同步账户资产…':'请先保存当前账户的 API 密钥';
+  const assets=(a?.assets||[]).filter(x=>Number(x.wallet_balance)!==0||Number(x.unrealized_profit)!==0||Number(x.margin_balance)!==0).sort((x,y)=>Number(y.wallet_value_usd||0)-Number(x.wallet_value_usd||0)||x.asset.localeCompare(y.asset));
+  const positive=assets.filter(x=>Number(x.wallet_balance)>0),valued=positive.every(x=>x.wallet_value_usd!=null&&Number.isFinite(Number(x.wallet_value_usd)));
+  const total=valued?positive.reduce((sum,x)=>sum+Number(x.wallet_value_usd),0):0;
+  const palette=['#d5eda1','#83b4df','#ecbc72','#b39ad9','#7cc4b4','#ec8b82'];
+  const known={USDT:'#d5eda1',USDC:'#83b4df',BTC:'#ecbc72',ETH:'#b39ad9',BNB:'#7cc4b4'};
+  const swatches=new Map(assets.map((x,i)=>[x.asset,known[x.asset]||palette[i%palette.length]]));
+  let angle=0;const segments=[];
+  if(total>0)for(const x of positive){const end=angle+Number(x.wallet_value_usd)/total*360;segments.push(swatches.get(x.asset)+' '+angle+'deg '+end+'deg');angle=end;}
+  $('asset-donut').style.background=segments.length?'conic-gradient('+segments.join(',')+')':'var(--line)';
+  $('asset-count').textContent=a?String(assets.length):'—';
+  const shares=assets.map(x=>total>0&&Number(x.wallet_balance)>0?num(Number(x.wallet_value_usd)/total*100)+'%':'—');
+  $('asset-donut').setAttribute('aria-label',total>0?'钱包资产分布：'+assets.map((x,i)=>x.asset+' '+shares[i]).join('，'):!a?'资产分布等待账户同步':!valued?'资产估值暂不可用':'暂无正余额资产');
+  $('asset-legend').innerHTML=assets.length?assets.map((x,i)=>'<li><div><i class="asset-dot" aria-hidden="true"></i><b>'+esc(x.asset)+'</b><span class="asset-share">'+shares[i]+'</span></div><small>'+native(x.wallet_balance)+' '+esc(x.asset)+'</small></li>').join(''):'<li class="asset-empty">'+(a?'暂无非零余额资产':'连接账户后展示资产分布')+'</li>';
+  $('asset-legend').querySelectorAll('.asset-dot').forEach((dot,i)=>{dot.style.background=swatches.get(assets[i].asset);});
+  $('asset-distribution-note').textContent=!valued?'估值暂不可用 · 展示原币余额，占比等待更新':s.mode==='paper'?'模拟 USDT 钱包 · 按 1 USDT ≈ 1 USD 展示':'按正钱包余额的 USD 估值计算占比';
+  $('asset-details-body').innerHTML=assets.length?assets.map(x=>'<tr><td>'+esc(x.asset)+'</td><td>'+native(x.wallet_balance)+'</td><td class="'+(assetsHidden?'':color(x.unrealized_profit))+'">'+native(x.unrealized_profit)+'</td><td>'+native(x.margin_balance)+'</td><td>'+(x.wallet_value_usd==null?'—':money(x.wallet_value_usd,2))+'</td></tr>').join(''):'<tr><td colspan="5">'+(a?'暂无非零余额资产':'等待账户同步')+'</td></tr>';
 }
 function render(){
   const s=state,c=s.config;
@@ -47,6 +79,7 @@ function render(){
   $('mode').textContent={paper:'PAPER · 模拟交易',testnet:'TESTNET · 币安测试网',live:'LIVE · 币安实盘'}[s.mode];
   $('mode').className='mode'+(s.mode==='live'?' live':'');$('health').textContent=s.health;
   $('run-btn').textContent=s.paused?'启动开仓扫描 ↗':'暂停新增开仓 Ⅱ';
+  renderAssets();
   $('realized').textContent=num(s.realized_net);$('realized').className=color(s.realized_net);
   $('unrealized').textContent=num(s.unrealized);$('unrealized').className=color(s.unrealized);
   $('exposure').textContent=num(s.exposure_usdt);$('exposure-cap').textContent='上限 '+num(c.max_exposure_usdt)+' USDT';
@@ -140,7 +173,7 @@ function renderConnections(){
     section('执行模式',[
       select('execution_mode','交易模式',s.mode,{paper:'模拟交易 · Paper',testnet:'币安测试网 · Testnet',live:'币安实盘 · Live'}),
       checkInput('live_enabled','启用实盘交易',s.live_enabled)
-    ],'切换模式或当前币安账户后会暂停新增开仓。有持仓、待确认订单或账户差异时不能更换当前币安账户；可提前保存其他模式的账户。三个模式的币池、仓位和交易参数分别保存。')+
+    ],'切换模式或当前币安账户后会暂停新增开仓。测试网和实盘首次同步账户或检查连接时，会自动将该账户所有合约设为单向持仓；已有持仓或挂单导致切换失败时显示原因。有持仓、待确认订单或账户差异时不能更换当前币安账户；可提前保存其他模式的账户。三个模式的币池、仓位和交易参数分别保存。')+
     section('币安测试网账户',[
       secretInput('testnet_key','测试网 API Key',s.testnet.configured,s.testnet.key_masked),
       secretInput('testnet_secret','测试网 API Secret',s.testnet.secret_configured),
@@ -237,7 +270,7 @@ $('connections-form').addEventListener('submit',e=>{
   });
 });
 $('connection-check').addEventListener('click',()=>act(async()=>{
-  const b=$('connection-check'),r=$('connection-result');b.disabled=true;r.hidden=false;r.textContent='正在检查已保存的币安连接…';
+  const b=$('connection-check'),r=$('connection-result');b.disabled=true;r.hidden=false;r.textContent='正在检查币安连接并确认单向持仓…';
   try{const result=await api('/api/settings/check','POST');r.textContent=result.message;}
   catch(err){r.textContent=err.message;throw err;}finally{b.disabled=false;}
 }));
@@ -258,6 +291,11 @@ $('auth-form').addEventListener('submit',async e=>{
 });
 $('auth-dialog').addEventListener('close',()=>{$('auth-form').reset();pendingAdmin=null;});
 $('guest-btn').addEventListener('click',()=>{$('auth-dialog').close();});
+$('asset-visibility').addEventListener('click',()=>{
+  assetsHidden=!assetsHidden;const button=$('asset-visibility'),label=assetsHidden?'显示资产金额':'隐藏资产金额';
+  button.setAttribute('aria-pressed',String(assetsHidden));button.setAttribute('aria-label',label);button.title=label;
+  if(state)renderAssets();
+});
 $('setup-btn').addEventListener('click',()=>showAuth());
 $('admin-btn').addEventListener('click',async()=>{
   if(!auth.authenticated){await withAdmin(()=>{});return;}

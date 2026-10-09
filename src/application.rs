@@ -150,7 +150,7 @@ impl Application {
                 "请先保存当前模式的币安 API Key 和 Secret"
             );
             engine.exchange.preflight().await?;
-            Ok("币安账户连接与单向持仓模式检查通过；未提交订单")
+            Ok("币安账户连接正常，已确认或自动设置为单向持仓；未提交交易订单")
         }
     }
     pub async fn shutdown(&self) {
