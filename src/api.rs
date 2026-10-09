@@ -4,7 +4,9 @@ use crate::{
     config::Config,
     domain::{Event, PoolCoin, SymbolInfo},
     engine::Snapshot,
-    settings::{ServerSettings, SettingsPatch, SettingsView},
+    settings::{
+        CredentialTestRequest, CredentialTestResult, ServerSettings, SettingsPatch, SettingsView,
+    },
 };
 use axum::{
     Json, Router,
@@ -69,6 +71,7 @@ pub fn router(app: Arc<Application>) -> Router {
         .route("/api/config", axum::routing::put(configure))
         .route("/api/settings", get(settings).put(connections))
         .route("/api/settings/check", post(check_connection))
+        .route("/api/settings/test", post(test_credentials))
         .route("/api/pool", post(pool))
         .route("/api/pool/:symbol", axum::routing::delete(remove))
         .route("/api/control", post(control))
@@ -301,6 +304,12 @@ async fn check_connection(State(app): State<Arc<Application>>) -> Result<Json<Va
         json!({"ok": true, "message": app.check_connection().await?}),
     ))
 }
+async fn test_credentials(
+    State(app): State<Arc<Application>>,
+    Json(request): Json<CredentialTestRequest>,
+) -> Result<Json<CredentialTestResult>, ApiError> {
+    Ok(Json(app.test_credentials(request).await?))
+}
 
 #[cfg(test)]
 mod tests {
@@ -472,6 +481,7 @@ mod tests {
             ("PUT", "/api/settings"),
             ("PUT", "/api/server"),
             ("POST", "/api/settings/check"),
+            ("POST", "/api/settings/test"),
             ("POST", "/api/pool"),
             ("DELETE", "/api/pool/BTCUSDT"),
             ("POST", "/api/control"),
@@ -560,6 +570,35 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+    #[tokio::test]
+    async fn credential_test_validation_does_not_save_credentials_or_change_the_engine() {
+        let store = crate::store::Store::open(":memory:", crate::config::Mode::Paper).unwrap();
+        let application = Application::new(store.clone()).unwrap();
+        let active = application.engine.read().await.clone();
+        let router = router(application.clone());
+        let cookie = admin_cookie(&router).await;
+        for body in [
+            r#"{"mode":"testnet"}"#,
+            r#"{"mode":"live","credentials":{"key":"unsaved-key"}}"#,
+            r#"{"mode":"live","credentials":{"clear":true}}"#,
+            r#"{"mode":"paper","credentials":{"key":"unsaved-key","secret":"unsaved-secret"}}"#,
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request("POST", "/api/settings/test", body, Some(&cookie)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), 10_000)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains("unsaved-key") && !text.contains("unsaved-secret"));
+        }
+        assert!(store.settings().unwrap() == crate::settings::AppSettings::default());
+        assert!(Arc::ptr_eq(&active, &*application.engine.read().await));
+        assert_eq!(active.mode, crate::config::Mode::Paper);
     }
     #[tokio::test]
     async fn login_and_system_settings_persist_without_exposing_password_or_session() {

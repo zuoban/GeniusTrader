@@ -94,6 +94,8 @@ flowchart TD
 
 三个模式使用同一 SQLite 内独立的 portfolios 记录，切换回来恢复原来的币池和参数，不混用仓位或交易事件。「检查已保存的连接」检查当前币安公共行情 / 账户访问，并在需要时自动设置单向持仓，不提交交易订单，不调用 Jev。Jev 密钥在实际决策时验证。
 
+测试网和实盘账户各提供「测试连接」按钮，可在任意交易模式下独立验证对应账户。留空使用已保存的密钥；填写新值时与保留值合并后测试，首次配置必须同时填写 Key / Secret。测试先同步币安时间，再通过 [只读签名账户接口](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/account#account-information-v2-user_data) 验证密钥，显示成功、账户交易状态或中文错误原因（签名错误、Key / 权限 / IP 限制、网络异常等）。测试不会保存输入、切换当前模式、修改持仓模式或提交订单；测试通过后仍需点击保存。账户 `canTrade` 状态不代表 API 下单权限已经验证。
+
 当前采用 REST 轮询：盘口目标周期 2 秒，订单/仓位目标周期 5 秒，扫描目标周期 10 秒。网络和节流会影响实际周期；所有入场仅使用已收盘 5 分钟 K 线。持仓管理与 Jev 请求独立运行。尚未接入用户数据 WebSocket，也没有历史回测器。
 
 ## Jev
@@ -131,6 +133,7 @@ flowchart TD
 | GET | `/api/settings` | 当前模式、启用状态、密钥脱敏状态 |
 | PUT | `/api/settings` | 保存模式和账户连接配置；返回脱敏状态 |
 | POST | `/api/settings/check` | 检查已保存的币安连接，并在需要时自动设置单向持仓 |
+| POST | `/api/settings/test` | `{mode: "testnet" / "live", credentials: {key, secret}}`；合并已保存值，只读验证密钥，不保存或改变账户 |
 | POST | `/api/pool` | `{symbol, enabled, config}` |
 | DELETE | `/api/pool/{symbol}` | 移出候选池，保留持仓管理 |
 | POST | `/api/control` | `{running: true/false}` |

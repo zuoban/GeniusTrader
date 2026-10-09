@@ -50,6 +50,20 @@ pub struct CredentialPatch {
     pub secret: Option<String>,
     pub clear: bool,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialTestRequest {
+    pub mode: Mode,
+    #[serde(default)]
+    pub credentials: CredentialPatch,
+}
+#[derive(Serialize)]
+pub struct CredentialTestResult {
+    pub mode: Mode,
+    pub ok: bool,
+    pub can_trade: bool,
+    pub message: &'static str,
+}
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SettingsPatch {
@@ -100,6 +114,13 @@ fn masked(value: &str) -> Option<String> {
 impl Credentials {
     pub fn configured(&self) -> bool {
         !self.key.is_empty() && !self.secret.is_empty()
+    }
+    pub fn for_test(&self, patch: CredentialPatch) -> Result<Self> {
+        ensure!(!patch.clear, "请先取消清除账户，再测试密钥");
+        let mut candidate = self.clone();
+        candidate.apply(patch)?;
+        ensure!(candidate.configured(), "请填写 API Key 与 Secret 后再测试");
+        Ok(candidate)
     }
     fn apply(&mut self, patch: CredentialPatch) -> Result<()> {
         if patch.clear {

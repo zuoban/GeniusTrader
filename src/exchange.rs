@@ -420,6 +420,43 @@ impl Binance {
         self.ensure_one_way_mode().await?;
         self.available_balance().await
     }
+    pub async fn verify_credentials(&self) -> Result<bool> {
+        ensure!(self.configured(), "请填写 API Key 与 Secret 后再测试");
+        let result = async {
+            self.sync_time().await?;
+            // V2 exposes canTrade; this signed GET validates the key/secret without mutations.
+            let account = self
+                .request(Method::GET, "/fapi/v2/account", vec![], true)
+                .await?;
+            account["canTrade"]
+                .as_bool()
+                .context("币安账户响应格式异常，请稍后重试")
+        }
+        .await;
+        result.map_err(|error| {
+            let Some(exchange) = error.downcast_ref::<ExchangeError>() else {
+                return error;
+            };
+            let message = match exchange.code {
+                -2014 => "API Key 格式无效，请检查复制内容（-2014）",
+                -2015 => "验证失败：API Key 无效、IP 未获授权或权限不足；请确认密钥属于所选测试网 / 实盘环境，并检查合约权限及 IP 白名单（-2015）",
+                -1022 => "签名验证失败，请检查 API Secret 是否正确、是否与 API Key 配对（-1022）",
+                -1021 => "请求时间校验失败，请检查系统时间或网络延迟后重试（-1021）",
+                -1002 | -1099 => "账户访问未获授权，请检查 API 权限与账户状态",
+                -2017 => "该账户的 API 密钥已被锁定，请检查币安账户状态（-2017）",
+                -1003 | -1015 => "币安请求频率受限，请稍后重试",
+                _ => match exchange.status {
+                    0 => "无法连接币安或请求超时，请检查网络后重试",
+                    401 | 403 => "币安拒绝访问，请检查 API 权限、IP 白名单或访问限制",
+                    418 | 429 => "币安请求频率受限，请稍后重试",
+                    451 => "币安限制当前地区访问，请检查服务所在地区",
+                    500..=599 => "币安服务暂时不可用，请稍后重试",
+                    _ => "币安账户验证失败或响应异常，请稍后重试",
+                },
+            };
+            anyhow::anyhow!(message)
+        })
+    }
     async fn hedge_mode(&self) -> Result<bool> {
         let m = self
             .request(Method::GET, "/fapi/v1/positionSide/dual", vec![], true)
@@ -662,6 +699,112 @@ mod tests {
                 {"asset": "BTC", "walletBalance": "0.001", "unrealizedProfit": "0", "marginBalance": "0.001"}
             ]
         })
+    }
+    async fn credential_server(
+        status: StatusCode,
+        response: Value,
+    ) -> (Binance, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let router = Router::new()
+            .route(
+                "/fapi/v1/time",
+                get(|| async { Json(serde_json::json!({"serverTime":now_ms()})) }),
+            )
+            .route(
+                "/fapi/v2/account",
+                get(move |headers: HeaderMap, query: RawQuery| {
+                    let response = response.clone();
+                    async move {
+                        assert_signed(&headers, &query.0.unwrap());
+                        (status, Json(response))
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let observed = observed.clone();
+                    async move {
+                        assert_eq!(
+                            req.method(),
+                            Method::GET,
+                            "credential tests must be read-only"
+                        );
+                        assert!(matches!(
+                            req.uri().path(),
+                            "/fapi/v1/time" | "/fapi/v2/account"
+                        ));
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        next.run(req).await
+                    }
+                },
+            ));
+        let (url, server) = crate::test_support::mock_server(router).await;
+        (Binance::mock(url), requests, server)
+    }
+    #[tokio::test]
+    async fn credential_verification_signs_read_only_requests_and_reports_account_status() {
+        for can_trade in [true, false] {
+            let (client, requests, server) =
+                credential_server(StatusCode::OK, serde_json::json!({"canTrade":can_trade})).await;
+            assert_eq!(client.verify_credentials().await.unwrap(), can_trade);
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn credential_verification_explains_errors_without_exposing_remote_messages_or_secrets() {
+        for (status, code, expected) in [
+            (StatusCode::BAD_REQUEST, -1022, "API Secret"),
+            (StatusCode::UNAUTHORIZED, -2015, "IP 白名单"),
+            (StatusCode::BAD_REQUEST, -2014, "格式无效"),
+            (StatusCode::BAD_REQUEST, -1021, "时间校验失败"),
+            (StatusCode::BAD_REQUEST, -2017, "锁定"),
+            (StatusCode::FORBIDDEN, 0, "拒绝访问"),
+            (StatusCode::TOO_MANY_REQUESTS, -1003, "频率受限"),
+            (StatusCode::SERVICE_UNAVAILABLE, 0, "暂时不可用"),
+        ] {
+            let (client, requests, server) = credential_server(
+                status,
+                serde_json::json!({"code":code,"msg":"local-test-key local-test-secret"}),
+            )
+            .await;
+            let error = client.verify_credentials().await.unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("local-test-key") && !error.contains("local-test-secret"));
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn credential_verification_rejects_invalid_responses_and_network_failures() {
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"canTrade":"true"}),
+        ] {
+            let (client, _, server) = credential_server(StatusCode::OK, response).await;
+            assert!(
+                client
+                    .verify_credentials()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("响应格式异常")
+            );
+            server.abort();
+        }
+        let (client, _, server) =
+            credential_server(StatusCode::OK, serde_json::json!({"canTrade":true})).await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            client
+                .verify_credentials()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("无法连接币安")
+        );
     }
     async fn asset_server(
         index_status: StatusCode,

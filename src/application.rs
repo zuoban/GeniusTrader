@@ -4,7 +4,10 @@ use crate::{
     engine::{Engine, EngineTasks},
     exchange::Binance,
     jev::Jev,
-    settings::{AppSettings, SettingsPatch, SettingsView},
+    settings::{
+        AppSettings, CredentialTestRequest, CredentialTestResult, Credentials, SettingsPatch,
+        SettingsView,
+    },
     store::Store,
 };
 use anyhow::{Result, ensure};
@@ -153,6 +156,35 @@ impl Application {
             Ok("币安账户连接正常，已确认或自动设置为单向持仓；未提交交易订单")
         }
     }
+    async fn credentials_for_test(&self, request: CredentialTestRequest) -> Result<Credentials> {
+        let settings = self.settings.lock().await;
+        let saved = match request.mode {
+            Mode::Testnet => &settings.testnet,
+            Mode::Live => &settings.live,
+            Mode::Paper => anyhow::bail!("请选择测试网或实盘账户进行密钥测试"),
+        };
+        saved.for_test(request.credentials)
+    }
+    pub async fn test_credentials(
+        &self,
+        request: CredentialTestRequest,
+    ) -> Result<CredentialTestResult> {
+        let mode = request.mode;
+        let credentials = self.credentials_for_test(request).await?;
+        // Use an isolated client: testing never replaces the active engine or saves settings.
+        let client = Binance::with_credentials(mode, &credentials)?;
+        let can_trade = client.verify_credentials().await?;
+        Ok(CredentialTestResult {
+            mode,
+            ok: true,
+            can_trade,
+            message: if can_trade {
+                "密钥验证成功，已读取合约账户；账户允许交易，下单权限需在币安 API 管理中确认。"
+            } else {
+                "密钥验证成功，已读取合约账户；账户当前不允许交易，请检查账户状态。"
+            },
+        })
+    }
     pub async fn shutdown(&self) {
         let engine = self.engine.read().await;
         let _ = engine.set_running(false).await;
@@ -165,6 +197,76 @@ mod tests {
     use crate::domain::*;
     fn patch(value: serde_json::Value) -> SettingsPatch {
         serde_json::from_value(value).unwrap()
+    }
+    #[tokio::test]
+    async fn credential_tests_merge_only_the_selected_account_without_saving_or_switching() {
+        let store = Store::open(":memory:", Mode::Paper).unwrap();
+        let saved = AppSettings::default()
+            .patched(patch(serde_json::json!({
+                "testnet":{"key":"saved-testnet-key","secret":"saved-testnet-secret"},
+                "live":{"key":"saved-live-key","secret":"saved-live-secret"}
+            })))
+            .unwrap();
+        store.save_settings(&saved).unwrap();
+        let app = Application::new(store.clone()).unwrap();
+        let active = app.engine.read().await.clone();
+        active.inner.lock().await.paused = false;
+        for (mode, credentials, expected_key, expected_secret) in [
+            (
+                "testnet",
+                serde_json::json!({"key":"","secret":""}),
+                "saved-testnet-key",
+                "saved-testnet-secret",
+            ),
+            (
+                "live",
+                serde_json::json!({}),
+                "saved-live-key",
+                "saved-live-secret",
+            ),
+            (
+                "testnet",
+                serde_json::json!({"key":" new-key ","secret":" new-secret "}),
+                "new-key",
+                "new-secret",
+            ),
+            (
+                "live",
+                serde_json::json!({"secret":"replacement-secret"}),
+                "saved-live-key",
+                "replacement-secret",
+            ),
+        ] {
+            let request =
+                serde_json::from_value(serde_json::json!({"mode":mode,"credentials":credentials}))
+                    .unwrap();
+            let candidate = app.credentials_for_test(request).await.unwrap();
+            assert_eq!(candidate.key, expected_key);
+            assert_eq!(candidate.secret, expected_secret);
+        }
+        assert!(store.settings().unwrap() == saved);
+        assert!(app.settings.lock().await.clone() == saved);
+        assert!(Arc::ptr_eq(&active, &*app.engine.read().await));
+        assert!(!active.snapshot().await.paused);
+        assert_eq!(active.mode, Mode::Paper);
+    }
+    #[tokio::test]
+    async fn credential_tests_reject_missing_partial_clear_and_paper_requests() {
+        let app = Application::new(Store::open(":memory:", Mode::Paper).unwrap()).unwrap();
+        for value in [
+            serde_json::json!({"mode":"testnet"}),
+            serde_json::json!({"mode":"live","credentials":{"key":"only-key"}}),
+            serde_json::json!({"mode":"testnet","credentials":{"clear":true}}),
+            serde_json::json!({"mode":"paper","credentials":{"key":"key","secret":"secret"}}),
+            serde_json::json!({"mode":"live","credentials":{"key":"invalid key","secret":"secret"}}),
+        ] {
+            assert!(
+                app.test_credentials(serde_json::from_value(value).unwrap())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(app.store.settings().unwrap() == AppSettings::default());
     }
     #[tokio::test]
     async fn mode_switches_persist_and_restore_isolated_portfolios_without_keys() {
