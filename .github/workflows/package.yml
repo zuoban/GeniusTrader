@@ -81,6 +81,10 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           push: true
           tags: ${{ needs.prepare.outputs.image }}:sha-${{ github.sha }}-${{ matrix.arch }}
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            index:org.opencontainers.image.description=Binance USD-M futures service with a local Chinese console and Jev decisions
+            index:org.opencontainers.image.licenses=MIT
           build-args: |
             VERSION=${{ needs.prepare.outputs.version }}
             VCS_REF=${{ github.sha }}
@@ -107,16 +111,22 @@ jobs:
       - name: Publish version and latest manifests
         run: |
           docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --annotation "index:org.opencontainers.image.description=Binance USD-M futures service with a local Chinese console and Jev decisions" \
+            --annotation "index:org.opencontainers.image.licenses=MIT" \
             --tag "$IMAGE:$VERSION" --tag "$IMAGE:latest" --tag "$IMAGE:sha-$REVISION" \
             "$IMAGE:sha-$REVISION-amd64" "$IMAGE:sha-$REVISION-arm64"
           docker buildx imagetools inspect "$IMAGE:$VERSION" --raw > manifest.json
           python3 - <<'PY'
-          import json
+          import json, os
           with open("manifest.json") as source:
               manifest = json.load(source)
           platforms = {(entry["platform"]["os"], entry["platform"]["architecture"])
                        for entry in manifest["manifests"]}
           assert {("linux", "amd64"), ("linux", "arm64")} <= platforms, platforms
+          assert manifest["annotations"]["org.opencontainers.image.source"] == (
+              "https://github.com/" + os.environ["GITHUB_REPOSITORY"]
+          ), manifest
           print("Verified published platforms: linux/amd64, linux/arm64")
           PY
           docker buildx imagetools inspect "$IMAGE:$VERSION"
@@ -124,13 +134,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh api "users/$GITHUB_REPOSITORY_OWNER/packages/container/${IMAGE##*/}" \
-            --jq '{name,visibility,html_url,repository:.repository.full_name}' > package.json
           python3 - <<'PY'
-          import json, os
-          with open("package.json") as source:
-              package = json.load(source)
-          assert package["visibility"] == "private", package
+          import json, os, subprocess, time
+          endpoint = ("users/" + os.environ["GITHUB_REPOSITORY_OWNER"]
+                      + "/packages/container/" + os.environ["IMAGE"].rsplit("/", 1)[1])
+          for attempt in range(10):
+              package = json.loads(subprocess.check_output([
+                  "gh", "api", endpoint,
+                  "--jq", "{name,visibility,html_url,repository:.repository.full_name}"
+              ], text=True))
+              assert package["visibility"] == "private", package
+              if package["repository"] == os.environ["GITHUB_REPOSITORY"]:
+                  break
+              time.sleep(3)
           assert package["repository"] == os.environ["GITHUB_REPOSITORY"], package
           print(json.dumps(package))
           url = package.get("html_url") or (
