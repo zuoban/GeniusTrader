@@ -38,6 +38,12 @@ def ready(base):
     raise RuntimeError("Container API did not become ready within 45 seconds")
 
 
+def base_url(name):
+    address = docker("port", name, "8787/tcp")
+    assert address.startswith("127.0.0.1:"), address
+    return "http://" + address
+
+
 def main(image):
     name = "genius-trader-smoke-" + uuid.uuid4().hex[:12]
     try:
@@ -46,9 +52,7 @@ def main(image):
         docker("run", "--detach", "--name", name, "--publish", "127.0.0.1::8787", image)
         inspect = json.loads(docker("inspect", name))[0]
         assert inspect["Config"]["User"] == "10001:10001"
-        address = docker("port", name, "8787/tcp")
-        assert address.startswith("127.0.0.1:"), address
-        base = "http://" + address
+        base = base_url(name)
         state = ready(base)
         assert state["mode"] == "paper" and state["paused"] is True, state
         assert state["auth"]["initialized"] is False, state["auth"]
@@ -65,7 +69,8 @@ def main(image):
         stopped = json.loads(docker("inspect", name))[0]
         assert stopped["State"]["ExitCode"] == 0, stopped["State"]
         docker("start", name)
-        restarted = ready(base)
+        # Docker can reallocate an ephemeral host port when a container restarts.
+        restarted = ready(base_url(name))
         assert restarted["auth"]["initialized"] is True, restarted["auth"]
         assert restarted["mode"] == "paper" and restarted["paused"] is True, restarted
         print("Container verified: UI/API, non-root SQLite permissions, graceful stop, persistence and paused paper mode")

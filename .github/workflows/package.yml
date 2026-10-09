@@ -120,8 +120,25 @@ jobs:
           print("Verified published platforms: linux/amd64, linux/arm64")
           PY
           docker buildx imagetools inspect "$IMAGE:$VERSION"
-          {
-            printf 'Published `%s:%s` and `%s:latest`\n\n' "$IMAGE" "$VERSION" "$IMAGE"
-            printf 'Platforms: `linux/amd64`, `linux/arm64`\n\n'
-            printf '[GitHub package](https://github.com/%s/pkgs/container/geniustrader)\n' "$GITHUB_REPOSITORY_OWNER"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify private package and repository association
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "users/$GITHUB_REPOSITORY_OWNER/packages/container/${IMAGE##*/}" \
+            --jq '{name,visibility,html_url,repository:.repository.full_name}' > package.json
+          python3 - <<'PY'
+          import json, os
+          with open("package.json") as source:
+              package = json.load(source)
+          assert package["visibility"] == "private", package
+          assert package["repository"] == os.environ["GITHUB_REPOSITORY"], package
+          print(json.dumps(package))
+          url = package.get("html_url") or (
+              "https://github.com/" + os.environ["GITHUB_REPOSITORY"]
+              + "/pkgs/container/" + package["name"]
+          )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f'Published `{os.environ["IMAGE"]}:{os.environ["VERSION"]}` and `latest`\n\n')
+              summary.write('Platforms: `linux/amd64`, `linux/arm64`; visibility: private\n\n')
+              summary.write(f'[GitHub package]({url})\n')
+          PY
