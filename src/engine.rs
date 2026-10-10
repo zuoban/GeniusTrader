@@ -161,16 +161,16 @@ impl Inner {
         coin.enabled
             && !self.occupied(&coin.symbol)
             && now - bar <= self.config.signal_max_age_seconds as i64 * 1000
-            && !self
+            && self
                 .book
                 .last_bar
                 .get(&coin.symbol)
-                .is_some_and(|last| *last >= bar)
-            && !self
+                .is_none_or(|last| *last < bar)
+            && self
                 .book
                 .cooldown_until
                 .get(&coin.symbol)
-                .is_some_and(|until| *until > bar)
+                .is_none_or(|until| *until <= bar)
     }
     fn scan_work(&self, now: i64) -> Vec<(PoolCoin, u64)> {
         let mut work: Vec<_> = self
