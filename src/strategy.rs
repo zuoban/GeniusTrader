@@ -46,6 +46,10 @@ impl StrategyConfig {
 pub struct Decision {
     pub action: Action,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_action: Option<Action>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub indicators: BTreeMap<String, f64>,
     pub model: Option<String>,
     pub confidence: Option<f64>,
@@ -71,6 +75,8 @@ impl Decision {
         Self {
             action: Action::Wait,
             source: source.into(),
+            model_action: None,
+            reason: None,
             indicators: BTreeMap::new(),
             model: None,
             confidence: None,
@@ -181,6 +187,21 @@ pub fn indicators(bars: &[Candle], c: &StrategyConfig) -> Result<BTreeMap<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_decisions_without_filter_details_remain_readable() {
+        let old = serde_json::json!({
+            "action": "WAIT", "source": "jev", "indicators": {},
+            "model": "jev-test-version", "confidence": 0.6,
+            "probabilities": {"LONG": 0.8, "SHORT": 0.1, "WAIT": 0.1},
+            "input_tokens": 100
+        });
+        let decision: Decision = serde_json::from_value(old).unwrap();
+        assert_eq!(decision.action, Action::Wait);
+        assert_eq!(decision.model_action, None);
+        assert_eq!(decision.reason, None);
+        assert_eq!(decision.confidence, Some(0.6));
+        assert_eq!(decision.probabilities["LONG"], 0.8);
+    }
     #[test]
     fn flat_rsi_is_neutral() {
         let r = rsi(&vec![10.0; 120], 14);

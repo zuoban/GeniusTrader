@@ -102,7 +102,7 @@ impl Default for Config {
                 model: "jev-latest".into(),
                 lookback_bars: 120,
                 forecast_bars: 6,
-                min_confidence: 0.7,
+                min_confidence: 0.55,
                 timeout_seconds: 15,
             },
         }

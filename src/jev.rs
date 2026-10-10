@@ -150,11 +150,43 @@ impl Jev {
         validate_choice(answer)?;
         let mut d = Decision::wait("jev");
         d.indicators = indicators;
-        d.action = if answer.confidence < c.jev.min_confidence {
-            Action::Wait
-        } else {
-            answer.choice
+        d.model_action = Some(answer.choice);
+        let label = match answer.choice {
+            Action::Long => "做多",
+            Action::Short => "做空",
+            Action::Wait => "等待",
         };
+        let (action, reason) = if answer.choice == Action::Wait {
+            (
+                Action::Wait,
+                format!(
+                    "Jev 选择等待：做多 {:.1}% / 做空 {:.1}% / 等待 {:.1}%",
+                    answer.probabilities["LONG"] * 100.0,
+                    answer.probabilities["SHORT"] * 100.0,
+                    answer.probabilities["WAIT"] * 100.0,
+                ),
+            )
+        } else if answer.confidence < c.jev.min_confidence {
+            (
+                Action::Wait,
+                format!(
+                    "Jev 选择{label}，但置信度 {:.1}% 低于开仓门槛 {:.1}%",
+                    answer.confidence * 100.0,
+                    c.jev.min_confidence * 100.0,
+                ),
+            )
+        } else {
+            (
+                answer.choice,
+                format!(
+                    "Jev 选择{label}：置信度 {:.1}%，达到开仓门槛 {:.1}%",
+                    answer.confidence * 100.0,
+                    c.jev.min_confidence * 100.0,
+                ),
+            )
+        };
+        d.action = action;
+        d.reason = Some(reason);
         d.model = Some(response.model);
         d.confidence = Some(answer.confidence);
         d.probabilities = answer.probabilities.clone();
@@ -199,6 +231,7 @@ fn decision_request(
             "indicator_parameters": c.strategy,
             "notional_usdt": c.notional_usdt,
             "target_net_profit_usdt": c.profit_usdt,
+            "profit_target_role": "exit_take_profit_only_not_entry_requirement",
             "maker_fee": c.maker_fee,
             "taker_fee": c.taker_fee,
             "forecast_bars": c.jev.forecast_bars,
@@ -207,11 +240,11 @@ fn decision_request(
         "questions": {
             "action": {
                 "type": "choice",
-                "instructions": "Choose an entry for forecast_bars using only these closed 5m bars, indicators and quote. Account for spread and fees. No external or missing data. WAIT on weak/conflicting evidence. Confidence is not win probability.",
+                "instructions": "Choose the entry with a supported directional edge over forecast_bars using only these closed 5m bars, indicators and quote. Account for spread and entry taker / exit maker fees. A modest edge can qualify; do not require every indicator to agree. target_net_profit_usdt is an exit take-profit objective, not a minimum forecast move or a deadline: do not require reaching it within forecast_bars. WAIT when neither direction has a supported edge after costs or data is insufficient. No external or missing data. Confidence is not win probability.",
                 "criteria": {
-                    "LONG": "Upward move supports target_net_profit_usdt after spread and fees.",
-                    "SHORT": "Downward move supports target_net_profit_usdt after spread and fees.",
-                    "WAIT": "Insufficient, conflicting or non-profitable evidence."
+                    "LONG": "Price action and indicators favor an upward move that can cover spread and fees, even if the full exit profit target needs more time.",
+                    "SHORT": "Price action and indicators favor a downward move that can cover spread and fees, even if the full exit profit target needs more time.",
+                    "WAIT": "Neither direction has an edge after costs, evidence is evenly balanced, or supplied data is insufficient."
                 }
             }
         }
@@ -618,6 +651,11 @@ mod tests {
             assert_eq!(body["questions"]["action"]["type"], "choice");
             assert_eq!(body["state"]["timeframe"], "5m");
             assert_eq!(body["state"]["position"], "flat");
+            assert_eq!(
+                body["state"]["profit_target_role"],
+                "exit_take_profit_only_not_entry_requirement"
+            );
+            assert_eq!(body["state"]["target_net_profit_usdt"], "0.5");
             assert!(body["state"].get("builtin_signal").is_none());
             assert!(body["state"]["indicator_parameters"].get("kind").is_none());
             assert_eq!(
@@ -671,6 +709,8 @@ mod tests {
         };
         let result = jev.decide("XUSDT", &bars, &quote, &c).await.unwrap();
         assert_eq!(result.action, Action::Long);
+        assert_eq!(result.model_action, Some(Action::Long));
+        assert!(result.reason.as_deref().unwrap().contains("达到开仓门槛"));
         assert_eq!(result.source, "jev");
         assert_eq!(result.model.as_deref(), Some("jev-test-version"));
         assert_eq!(result.input_tokens, 100);
@@ -700,14 +740,42 @@ mod tests {
             response.lock().await["answers"]["action"] = json!({"type":"choice","choice":choice,"confidence":0.9,"probabilities":probabilities});
             let result = jev.decide("XUSDT", &bars, &quote, &c).await.unwrap();
             assert_eq!(result.action, action);
+            assert_eq!(result.model_action, Some(action));
             assert_eq!(result.source, "jev");
         }
         response.lock().await["answers"]["action"] = json!({"type":"choice","choice":"LONG","confidence":0.9,"probabilities":{"LONG":0.9,"SHORT":0.05,"WAIT":0.05}});
-        response.lock().await["answers"]["action"]["confidence"] = json!(0.6);
-        assert_eq!(
-            jev.decide("XUSDT", &bars, &quote, &c).await.unwrap().action,
-            Action::Wait
-        );
+        for (confidence, expected) in [
+            (0.54, Action::Wait),
+            (0.55, Action::Long),
+            (0.6, Action::Long),
+        ] {
+            response.lock().await["answers"]["action"]["confidence"] = json!(confidence);
+            let result = jev.decide("XUSDT", &bars, &quote, &c).await.unwrap();
+            assert_eq!(result.action, expected);
+            assert_eq!(result.model_action, Some(Action::Long));
+            if expected == Action::Wait {
+                let reason = result.reason.as_deref().unwrap();
+                assert!(reason.contains("选择做多"));
+                assert!(reason.contains("54.0% 低于开仓门槛 55.0%"));
+            }
+        }
+        // A saved/custom threshold is still honored; changing the default does
+        // not automatically lower an existing portfolio's threshold.
+        let mut saved = c.clone();
+        saved.jev.min_confidence = 0.7;
+        let result = jev.decide("XUSDT", &bars, &quote, &saved).await.unwrap();
+        assert_eq!(result.action, Action::Wait);
+        assert!(result.reason.as_deref().unwrap().contains("70.0%"));
+        // WAIT remains the model's choice even below the confidence threshold.
+        response.lock().await["answers"]["action"] = json!({"type":"choice","choice":"WAIT","confidence":0.4,"probabilities":{"LONG":0.1,"SHORT":0.2,"WAIT":0.7}});
+        let result = jev.decide("XUSDT", &bars, &quote, &c).await.unwrap();
+        assert_eq!(result.action, Action::Wait);
+        assert_eq!(result.model_action, Some(Action::Wait));
+        let reason = result.reason.as_deref().unwrap();
+        assert!(reason.contains("Jev 选择等待"));
+        assert!(reason.contains("等待 70.0%"));
+        assert!(!reason.contains("低于开仓门槛"));
+        response.lock().await["answers"]["action"] = json!({"type":"choice","choice":"LONG","confidence":0.9,"probabilities":{"LONG":0.9,"SHORT":0.05,"WAIT":0.05}});
         response.lock().await["answers"]["action"]["probabilities"]["SHORT"] = json!(0.9);
         let error = jev
             .decide("XUSDT", &bars, &quote, &c)
@@ -721,7 +789,7 @@ mod tests {
             json!({"LONG":0.85,"SHORT":0.04,"WAIT":0.12}),
         ] {
             response.lock().await["answers"]["action"]["probabilities"] = probabilities.clone();
-            for confidence in [0.9, 0.6] {
+            for confidence in [0.9, 0.54] {
                 response.lock().await["answers"]["action"]["confidence"] = json!(confidence);
                 let result = jev.decide("XUSDT", &bars, &quote, &c).await.unwrap();
                 assert_eq!(
@@ -740,7 +808,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 9);
+        assert_eq!(calls.load(Ordering::SeqCst), 13);
         server.abort();
     }
     fn choice(probabilities: [f64; 3], action: Action) -> Choice {

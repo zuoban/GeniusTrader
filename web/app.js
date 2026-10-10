@@ -101,6 +101,7 @@ const sideClass=action=>action==='LONG'?'long':action==='SHORT'?'short':'wait';
 const actionBadge=action=>'<span class="decision-badge '+sideClass(action)+'">'+esc(actionLabel(action))+'</span>';
 const timestamp=value=>value?new Date(value).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}):'—';
 const confidence=value=>value==null?'未返回置信度':num(Number(value)*100,1)+'% 置信度';
+const decisionReason=d=>d.reason||d.source;
 function replaceRegion(id,html){
   const region=$(id),open=new Set([...region.querySelectorAll('details[open][data-key]')].map(d=>d.dataset.key));
   const focused=region.contains(document.activeElement)?document.activeElement.dataset.focusKey:null;
@@ -130,7 +131,7 @@ function renderWatchlist(){
     const btn=(action,label,glyph)=>'<button type="button" class="icon-btn" data-action="'+action+'" data-symbol="'+esc(coin.symbol)+'" data-focus-key="'+esc(coin.symbol)+':'+action+'" aria-label="'+label+' '+esc(coin.symbol)+'" title="'+label+'">'+glyph+'</button>';
     const position=p?'<div class="card-position"><div class="card-section-label"><span>持仓 '+actionBadge(p.side)+' <b>'+p.leverage+'×</b></span><strong class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' <small>USDT</small></strong></div><div class="card-stats"><span>数量<b>'+price(p.quantity)+'</b></span><span>开仓均价<b>'+price(p.entry_price)+'</b></span><span>止盈价<b>'+price(p.tp_price)+'</b></span></div></div>':'<div class="card-flat"><span>当前空仓</span><span>单币 '+price(coin.notional_usdt)+' / 止盈 '+price(coin.profit_usdt)+' USDT</span></div>';
     const orders=coin.orders.length?coin.orders.map(o=>'<div class="card-order"><span>'+esc(roleLabel(o.role))+' · '+(o.order_side==='BUY'?'买':'卖')+'</span><b>'+(o.price==null?'市价':price(o.price))+'</b><small>'+esc(statusLabel(o.status))+' · 剩余 '+price(o.remaining_quantity)+'</small></div>').join(''):'<div class="card-no-order">暂无挂单</div>';
-    const decision=d?'<div class="card-decision-heading"><span>最近决策</span><time>'+timestamp(d.time)+'</time></div><div class="card-decision-result">'+actionBadge(d.action)+'<span>'+confidence(d.confidence)+'</span><small title="'+esc(d.model||d.source)+'">'+esc(d.model||'JEV')+'</small></div><p class="card-decision-source" title="'+esc(d.source)+'">'+esc(d.source)+'</p>':'<div class="card-decision-heading"><span>最近决策</span><span>尚未评估</span></div><p class="card-decision-source">等待启用扫描与新的收盘信号</p>';
+    const decision=d?'<div class="card-decision-heading"><span>最近决策</span><time>'+timestamp(d.time)+'</time></div><div class="card-decision-result">'+actionBadge(d.action)+'<span>'+confidence(d.confidence)+'</span><small title="'+esc(d.model||d.source)+'">'+esc(d.model||'JEV')+'</small></div><p class="card-decision-source" title="'+esc(decisionReason(d))+'">'+esc(decisionReason(d))+'</p>':'<div class="card-decision-heading"><span>最近决策</span><span>尚未评估</span></div><p class="card-decision-source">等待启用扫描与新的收盘信号</p>';
     return '<article class="watch-card'+(!coin.enabled?' disabled':'')+'"><div class="watch-card-head"><div class="symbol-identity"><span class="coin-code">'+esc(coin.symbol.replace(/USDT$/,'').slice(0,3))+'</span><div><h3>'+esc(coin.symbol.replace(/USDT$/,''))+'<span> / USDT</span></h3><small class="coin-state'+(hasExternal?' uncertain':'')+'"><i class="state-dot'+(!coin.enabled?' off':'')+'"></i>'+status+'</small></div></div><div class="coin-actions">'+btn('toggle',coin.enabled?'停用扫描':'启用扫描',coin.enabled?'Ⅱ':'▷')+btn('edit','单币配置','⚙')+btn('remove','移出自选','×')+'</div></div><div class="card-quote"><strong>'+price(coin.price)+'</strong><span class="quote-state'+(coin.quote_stale?' delayed':'')+'">'+(coin.quote_stale?'报价待更新':coin.quote?'点差 '+num((Number(coin.quote.ask)-Number(coin.quote.bid))/Number(coin.price)*10000,2)+' bps':'暂无报价')+'</span></div>'+position+'<div class="card-orders"><div class="card-section-label">挂单 <span>'+coin.orders.length+'</span></div>'+orders+'</div><div class="card-decision">'+decision+'</div>'+(hasExternal?'<p class="card-external">'+(coin.external_position!=null?'外部持仓 '+price(coin.external_position)+' ':'')+(coin.external_order?'存在外部挂单':'')+' · 待核对</p>':'')+'</article>';
   }).join(''));
 }
@@ -140,7 +141,7 @@ function renderDecisions(){
   replaceRegion('decisions-body',decisions.length?decisions.map(d=>{
     const probabilities=Object.entries(d.probabilities).map(([action,value])=>'<span>'+esc(actionLabel(action))+' <b>'+num(value*100,1)+'%</b></span>').join('');
     const indicators=Object.entries(d.indicators).map(([key,value])=>'<span>'+esc(key)+' <b>'+num(value,4)+'</b></span>').join('');
-    return '<article class="decision-item"><div class="decision-top"><div><b>'+esc(d.symbol)+'</b>'+actionBadge(d.action)+'</div><time>'+timestamp(d.time)+'</time></div><div class="decision-summary"><span>'+confidence(d.confidence)+'</span><span>'+esc(d.model||'JEV')+'</span></div><p>'+esc(d.source)+'</p><details data-key="decision:'+state.mode+':'+d.id+'"><summary data-focus-key="decision:'+d.id+'">概率、指标与用量 <span>＋</span></summary><div class="decision-probabilities">'+(probabilities||'服务未返回概率')+'</div>'+(indicators?'<div class="decision-indicators">'+indicators+'</div>':'')+'<div class="decision-usage"><span>K 线收盘 '+timestamp(d.bar_close)+'</span><span>输入 '+num(d.input_tokens,0)+' / 输出 '+num(d.output_tokens,0)+' tokens</span><span>请求 '+num(d.request_bytes,0)+' bytes</span></div></details></article>';
+    return '<article class="decision-item"><div class="decision-top"><div><b>'+esc(d.symbol)+'</b>'+actionBadge(d.action)+'</div><time>'+timestamp(d.time)+'</time></div><div class="decision-summary"><span>'+confidence(d.confidence)+'</span><span>'+esc(d.model||'JEV')+'</span></div><p>'+esc(decisionReason(d))+'</p><details data-key="decision:'+state.mode+':'+d.id+'"><summary data-focus-key="decision:'+d.id+'">概率、指标与用量 <span>＋</span></summary><div class="decision-probabilities">'+(probabilities||'服务未返回概率')+'</div>'+(indicators?'<div class="decision-indicators">'+indicators+'</div>':'')+'<div class="decision-usage">'+(d.model_action?'<span>模型原始选择 '+esc(actionLabel(d.model_action))+'</span>':'')+'<span>K 线收盘 '+timestamp(d.bar_close)+'</span><span>输入 '+num(d.input_tokens,0)+' / 输出 '+num(d.output_tokens,0)+' tokens</span><span>请求 '+num(d.request_bytes,0)+' bytes</span></div></details></article>';
   }).join(''):'<div class="empty"><div class="empty-mark">⌁</div><h3>尚无决策记录</h3><p>启动扫描后，等待下一根 5 分钟 K 线收盘。</p></div>');
 }
 
@@ -188,7 +189,7 @@ function showSettings(){
       input('model','模型',j.model,'required'),numeric('min_confidence','最低置信度',j.min_confidence,0,1,'.01'),
       numeric('lookback_bars','行情回看 / 根',j.lookback_bars,100,500),numeric('forecast_bars','判断窗口 / 根',j.forecast_bars,1,288),
       numeric('timeout_seconds','请求超时 / 秒',j.timeout_seconds,1,30)
-    ],(state.jev_available?'Jev 密钥已配置。':'请在「账户与连接」中配置 Jev API Key。')+' 测试连接只验证模型列表，决策请求还包括行情上传与模型处理。请求超时包含连接、上传和结果读取，建议 15 秒，网络较慢时可调整至 30 秒。置信度不是交易胜率；判断窗口不触发自动平仓。')+
+    ],(state.jev_available?'Jev 密钥已配置。':'请在「账户与连接」中配置 Jev API Key。')+' 开仓按扣除点差与手续费后的方向优势判断，允许部分指标分歧；净止盈用于退出，不要求在判断窗口内达成。默认置信度门槛为 0.55；旧配置保留原值，可填入推荐参数后保存。测试连接只验证模型列表；决策超时包含连接、上传和结果读取，建议至少 15 秒。置信度不是交易胜率；判断窗口不触发自动平仓。','<button class="quiet" type="button" id="jev-recommended">填入推荐参数：置信度 0.55 / 超时至少 15 秒</button>')+
     section('模拟费用',[
       numeric('maker_fee','Maker 费率 / 小数',c.maker_fee,0,.1,'.00001'),numeric('taker_fee','Taker 费率 / 小数',c.taker_fee,0,.1,'.00001'),
       numeric('paper_balance_usdt','初始模拟余额 / USDT',c.paper_balance_usdt,1,10000000,'.01')
@@ -271,6 +272,13 @@ $('coin-form').addEventListener('submit',e=>{
     await api('/api/pool','POST',{...editing,config:{notional_usdt:f.elements.notional.value||null,profit_usdt:f.elements.profit.value||null,strategy:editing.config?.strategy||null,decision_mode:null,allowed_direction:editing.config?.allowed_direction||null}});
     $('coin-dialog').close();toast('单币配置已保存');
   });
+});
+$('settings-form').addEventListener('click',e=>{
+  if(e.target.id!=='jev-recommended')return;
+  const f=e.currentTarget;
+  f.elements.min_confidence.value='0.55';
+  f.elements.timeout_seconds.value=String(Math.max(15,Number(f.elements.timeout_seconds.value)||15));
+  toast('已填入推荐参数，点击保存交易配置后生效');
 });
 $('settings-form').addEventListener('submit',e=>{
   e.preventDefault();act(async()=>{const c=structuredClone(state.config),f=e.target;

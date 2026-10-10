@@ -38,14 +38,14 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 ## GitHub Packages 容器
 
-镜像：`ghcr.io/zuoban/geniustrader:0.1.2`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
+镜像：`ghcr.io/zuoban/geniustrader:0.1.3`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
 
 ```sh
-rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.2
+rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.3
 rtk proxy docker run -d --name genius-trader \
   --publish 8787:8787 \
   --mount type=volume,source=genius-trader-data,target=/app/data \
-  ghcr.io/zuoban/geniustrader:0.1.2
+  ghcr.io/zuoban/geniustrader:0.1.3
 ```
 
 本机打开 http://127.0.0.1:8787，服务器部署则打开 `http://服务器IPv4:8787`，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
@@ -76,7 +76,7 @@ rtk proxy docker compose up -d
 rtk proxy docker compose ps
 ```
 
-`compose.yaml` 使用已发布的 `0.1.2` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
+`compose.yaml` 使用已发布的 `0.1.3` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
 
 打开 `http://服务器IPv4:8787`（本机部署使用 http://127.0.0.1:8787），首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"8877:8787"`，再访问 `http://服务器IPv4:8877`；容器端口仍为 8787。
 
@@ -191,9 +191,13 @@ flowchart TD
 
 决策模式固定为 `jev`。在「账户与连接」保存 Jev API Key，再在「策略与交易」配置模型、最低置信度、回看长度和判断窗口；模拟 / 测试网 / 实盘启动扫描都需要 Jev 密钥。EMA、MACD、RSI 和布林带同时提供给模型，仅作为行情输入，不独立产生开仓信号。使用官方 `POST https://api.typesafe.ai/v1/systemone`；Choice 为 LONG / SHORT / WAIT，验证选项、概率及置信度。超时、异常或低于阈值时等待，不自动降级开单。
 
+入场按判断窗口内扣除点差、开仓 Taker 和退出 Maker 手续费后的方向优势评估，允许部分指标分歧和幅度较小但足以覆盖费用的机会。`profit_usdt` 是持仓退出的净止盈目标，不再要求模型预测在判断窗口内达到完整目标；判断窗口也不触发自动平仓。默认最低置信度从 0.70 调整为 0.55；已有 SQLite 配置保留原阈值与超时。在「策略与交易 → TypeSafe AI · Jev」点击「填入推荐参数」，会将表单置信度改为 0.55、低于 15 秒的超时提高到 15 秒，保存后才生效。仍由 Jev 选择 LONG / SHORT / WAIT，不将模型 WAIT 转换成开仓；点差、行情时效、保证金、名额和总敞口检查继续生效。实际交易频率和盈亏需要行情验证。
+
+决策日志新增 `model_action`（模型原始选择）和 `reason`（本地筛选说明）；页面显示模型选择等待的概率分布，或模型选择开仓但置信度低于门槛的具体数值。说明来自结构化输出与本地门槛，不是模型生成的市场分析。旧决策没有这些字段时仍可读取。
+
 旧 SQLite 全局和单币配置中的 `builtin` / `hybrid` 兼容读取为 `jev`，下次保存时写回 `jev`；旧 `strategy.kind` 兼容读取后忽略，保存时移除。指标周期、金额、净止盈、币池和持仓数据继续保留。每次启动仍暂停新增开仓，配置 Jev 后手动启动扫描。
 
-Jev 请求使用紧凑行情表降低输入消耗：[官方 `state` 格式](https://docs.typesafe.ai/concepts/state)允许结构化 JSON 和文本。完整回看行情按从旧到新排列，OHLCV 以单个 CSV 表头和数据行传入；起始开盘时间、5 分钟间隔和收盘偏移只传一次。第 i 行的开盘时间为 `first_open_time_ms + i × interval_ms`（i 从 0 开始），收盘时间再加 `close_offset_ms`。不裁剪 K 线、不降低价格或成交量精度；压缩前校验连续性和收盘状态。提示词精简后仍包含费用、点差、净止盈及证据不足时等待的要求。本地 120 / 500 根、高低价样本请求体减少约 44%–51%；字节缩减不等于实际 token 缩减，实际以返回的 `usage` 为准。原始行情继续保存在本地决策日志。
+Jev 请求使用紧凑行情表降低输入消耗：[官方 `state` 格式](https://docs.typesafe.ai/concepts/state)允许结构化 JSON 和文本。完整回看行情按从旧到新排列，OHLCV 以单个 CSV 表头和数据行传入；起始开盘时间、5 分钟间隔和收盘偏移只传一次。第 i 行的开盘时间为 `first_open_time_ms + i × interval_ms`（i 从 0 开始），收盘时间再加 `close_offset_ms`。不裁剪 K 线、不降低价格或成交量精度；压缩前校验连续性和收盘状态。提示词包含费用、点差、净止盈的退出用途及没有扣费后方向优势时等待的要求。本地 120 / 500 根、高低价样本请求体大小由紧凑请求测试验证；字节缩减不等于实际 token 缩减，实际以返回的 `usage` 为准。原始行情继续保存在本地决策日志。
 
 概率总和按[官方 SDK 的「近似 1」约定](https://docs.typesafe.ai/sdk/python/api/types/responses)校验：兼容三项概率保留两位小数后的总和 0.99–1.01（包含端点），记录保留原始值。各项仍必须是 0–1 的有限数，选项必须完整且 choice 为最高概率选项（允许并列）；超出容差时等待，并在错误中显示 LONG / SHORT / WAIT 数值及总和，便于区分舍入误差与真正异常。
 
