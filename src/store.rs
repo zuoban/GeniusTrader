@@ -333,6 +333,65 @@ impl Store {
 mod tests {
     use super::*;
     #[test]
+    fn legacy_decision_modes_and_coin_overrides_are_saved_as_jev() {
+        use crate::config::DecisionMode;
+        use serde_json::json;
+        for mode in ["builtin", "hybrid", "jev"] {
+            let store = Store::open(":memory:", Mode::Paper).unwrap();
+            let mut config = serde_json::to_value(Config::default()).unwrap();
+            config["decision_mode"] = json!(mode);
+            config["strategy"]["kind"] = json!("macd");
+            let coin = json!({
+                "symbol":"BTCUSDT", "enabled":true,
+                "config":{
+                    "notional_usdt":"200", "profit_usdt":"1",
+                    "decision_mode":mode, "strategy":config["strategy"],
+                    "allowed_direction":null
+                }
+            });
+            let mut book = serde_json::to_value(Book::default()).unwrap();
+            book["pool"]["BTCUSDT"] = coin;
+            book["last_bar"]["BTCUSDT"] = json!(123);
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO portfolios(mode,config,book) VALUES('paper',?1,?2)",
+                    params![config.to_string(), book.to_string()],
+                )
+                .unwrap();
+            let (loaded, book) = store.load().unwrap().unwrap();
+            loaded.validate().unwrap();
+            assert_eq!(loaded.decision_mode, DecisionMode::Jev);
+            let effective = loaded.for_coin(&book.pool["BTCUSDT"]).unwrap();
+            assert_eq!(effective.decision_mode, DecisionMode::Jev);
+            assert_eq!(effective.notional_usdt, rust_decimal::Decimal::from(200));
+            store.save(Mode::Paper, &loaded, &book).unwrap();
+            let (config, book): (String, String) = store
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT config,book FROM portfolios WHERE mode='paper'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+            let book: serde_json::Value = serde_json::from_str(&book).unwrap();
+            assert_eq!(config["decision_mode"], "jev");
+            assert!(config["strategy"].get("kind").is_none());
+            assert_eq!(book["pool"]["BTCUSDT"]["config"]["decision_mode"], "jev");
+            assert!(
+                book["pool"]["BTCUSDT"]["config"]["strategy"]
+                    .get("kind")
+                    .is_none()
+            );
+            assert_eq!(book["last_bar"]["BTCUSDT"], 123);
+        }
+    }
+    #[test]
     fn portfolios_and_events_are_isolated_in_one_database() {
         let paper = Store::open(":memory:", Mode::Paper).unwrap();
         let mut book = Book::default();

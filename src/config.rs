@@ -11,12 +11,13 @@ pub enum Mode {
     Testnet,
     Live,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionMode {
-    Builtin,
+    // Existing SQLite portfolios and older API clients resolve to Jev as well.
+    #[default]
+    #[serde(alias = "builtin", alias = "hybrid")]
     Jev,
-    Hybrid,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,7 +81,7 @@ impl Default for Config {
             max_exposure_usdt: Decimal::from(1000),
             leverage: 2,
             cooldown_bars: 1,
-            decision_mode: DecisionMode::Builtin,
+            decision_mode: DecisionMode::Jev,
             allowed_direction: Direction::Both,
             maker_fee: Decimal::new(2, 4),
             taker_fee: Decimal::new(5, 4),
@@ -88,7 +89,7 @@ impl Default for Config {
             max_spread_bps: Decimal::from(10),
             signal_max_age_seconds: 60,
             strategy: StrategyConfig {
-                kind: "ema_cross".into(),
+                kind: String::new(),
                 fast: 9,
                 slow: 21,
                 signal: 9,
@@ -152,7 +153,7 @@ impl Config {
         ensure!(
             self.jev.lookback_bars >= self.strategy.slow + self.strategy.signal + 2
                 && self.jev.lookback_bars >= self.strategy.period + 2,
-            "回看长度不足以预热策略"
+            "回看长度不足以预热指标"
         );
         Ok(())
     }

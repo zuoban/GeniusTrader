@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StrategyConfig {
+    // Read legacy strategy selectors for compatibility, but never execute them
+    // or write them back. Every indicator below is supplied to Jev.
+    #[serde(default, skip_serializing)]
     pub kind: String,
     pub fast: usize,
     pub slow: usize,
@@ -17,13 +20,6 @@ pub struct StrategyConfig {
 }
 impl StrategyConfig {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            matches!(
-                self.kind.as_str(),
-                "ema_cross" | "macd" | "bollinger" | "rsi"
-            ),
-            "未知策略"
-        );
         ensure!(
             self.fast >= 2
                 && self.fast < self.slow
@@ -55,6 +51,10 @@ pub struct Decision {
     pub confidence: Option<f64>,
     pub probabilities: BTreeMap<String, f64>,
     pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub request_bytes: usize,
 }
 impl Decision {
     pub fn wait(source: &str) -> Self {
@@ -66,19 +66,10 @@ impl Decision {
             confidence: None,
             probabilities: BTreeMap::new(),
             input_tokens: 0,
+            output_tokens: 0,
+            request_bytes: 0,
         }
     }
-}
-pub trait Strategy: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn evaluate(&self, bars: &[Candle], config: &StrategyConfig) -> Result<Decision>;
-}
-pub struct IndicatorStrategy(pub &'static str);
-pub fn registry() -> BTreeMap<&'static str, Box<dyn Strategy>> {
-    ["ema_cross", "macd", "bollinger", "rsi"]
-        .into_iter()
-        .map(|name| (name, Box::new(IndicatorStrategy(name)) as Box<dyn Strategy>))
-        .collect()
 }
 pub fn validate_bars(bars: &[Candle], now: i64) -> Result<()> {
     ensure!(bars.len() >= 100, "K 线尚未完成预热");
@@ -144,83 +135,38 @@ fn rsi(values: &[f64], period: usize) -> Vec<f64> {
     }
     out
 }
-fn cross(prev: f64, now: f64) -> Action {
-    if prev <= 0.0 && now > 0.0 {
-        Action::Long
-    } else if prev >= 0.0 && now < 0.0 {
-        Action::Short
-    } else {
-        Action::Wait
-    }
-}
-impl Strategy for IndicatorStrategy {
-    fn name(&self) -> &'static str {
-        self.0
-    }
-    fn evaluate(&self, bars: &[Candle], c: &StrategyConfig) -> Result<Decision> {
-        c.validate()?;
-        ensure!(
-            bars.len() >= c.slow + c.signal + 2 && bars.len() >= c.period + 2,
-            "指标预热不足"
-        );
-        let close: Vec<f64> = bars.iter().map(|b| b.close).collect();
-        let n = close.len() - 1;
-        let mut d = Decision::wait(self.name());
-        match self.name() {
-            "ema_cross" => {
-                let a = ema(&close, c.fast);
-                let b = ema(&close, c.slow);
-                d.action = cross(a[n - 1] - b[n - 1], a[n] - b[n]);
-                d.indicators.insert("ema_fast".into(), a[n]);
-                d.indicators.insert("ema_slow".into(), b[n]);
-            }
-            "macd" => {
-                let a = ema(&close, c.fast);
-                let b = ema(&close, c.slow);
-                let line: Vec<f64> = (c.slow - 1..close.len()).map(|i| a[i] - b[i]).collect();
-                let sig = ema(&line, c.signal);
-                let j = line.len() - 1;
-                d.action = cross(line[j - 1] - sig[j - 1], line[j] - sig[j]);
-                d.indicators.insert("macd".into(), line[j]);
-                d.indicators.insert("signal".into(), sig[j]);
-                d.indicators.insert("histogram".into(), line[j] - sig[j]);
-            }
-            "rsi" => {
-                let r = rsi(&close, c.period);
-                if r[n - 1] < c.lower && r[n] >= c.lower {
-                    d.action = Action::Long;
-                } else if r[n - 1] > c.upper && r[n] <= c.upper {
-                    d.action = Action::Short;
-                }
-                d.indicators.insert("rsi".into(), r[n]);
-            }
-            "bollinger" => {
-                let band = |i: usize| {
-                    let s = &close[i + 1 - c.period..=i];
-                    let mean = s.iter().sum::<f64>() / c.period as f64;
-                    let std = (s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / c.period as f64)
-                        .sqrt();
-                    (mean - std * c.deviations, mean, mean + std * c.deviations)
-                };
-                let prev = band(n - 1);
-                let cur = band(n);
-                if close[n - 1] < prev.0 && close[n] >= cur.0 && close[n] <= cur.2 {
-                    d.action = Action::Long;
-                } else if close[n - 1] > prev.2 && close[n] <= cur.2 && close[n] >= cur.0 {
-                    d.action = Action::Short;
-                }
-                d.indicators.insert("lower".into(), cur.0);
-                d.indicators.insert("middle".into(), cur.1);
-                d.indicators.insert("upper".into(), cur.2);
-            }
-            _ => anyhow::bail!("策略未注册"),
-        }
-        ensure!(
-            d.indicators.values().all(|v| v.is_finite()),
-            "指标包含无效值"
-        );
-        Ok(d)
-    }
+pub fn indicators(bars: &[Candle], c: &StrategyConfig) -> Result<BTreeMap<String, f64>> {
+    c.validate()?;
+    ensure!(
+        bars.len() >= c.slow + c.signal + 2 && bars.len() >= c.period + 2,
+        "指标预热不足"
+    );
+    let close: Vec<f64> = bars.iter().map(|b| b.close).collect();
+    let n = close.len() - 1;
+    let fast = ema(&close, c.fast);
+    let slow = ema(&close, c.slow);
+    let line: Vec<f64> = (c.slow - 1..close.len())
+        .map(|i| fast[i] - slow[i])
+        .collect();
+    let signal = ema(&line, c.signal);
+    let j = line.len() - 1;
+    let rsi = rsi(&close, c.period);
+    let window = &close[close.len() - c.period..];
+    let mean = window.iter().sum::<f64>() / c.period as f64;
+    let std = (window.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / c.period as f64).sqrt();
+    let values = BTreeMap::from([
+        ("ema_fast".into(), fast[n]),
+        ("ema_slow".into(), slow[n]),
+        ("macd".into(), line[j]),
+        ("signal".into(), signal[j]),
+        ("histogram".into(), line[j] - signal[j]),
+        ("rsi".into(), rsi[n]),
+        ("lower".into(), mean - std * c.deviations),
+        ("middle".into(), mean),
+        ("upper".into(), mean + std * c.deviations),
+    ]);
+    ensure!(values.values().all(|v| v.is_finite()), "指标包含无效值");
+    Ok(values)
 }
 #[cfg(test)]
 mod tests {
@@ -229,6 +175,37 @@ mod tests {
     fn flat_rsi_is_neutral() {
         let r = rsi(&vec![10.0; 120], 14);
         assert_eq!(r[119], 50.0);
+    }
+    #[test]
+    fn all_indicators_are_supplied_regardless_of_legacy_strategy_kind() {
+        let bars: Vec<Candle> = (0..120)
+            .map(|i| Candle {
+                open_time: i * BAR_MS,
+                close_time: (i + 1) * BAR_MS - 1,
+                open: 10.0,
+                high: 11.0,
+                low: 9.0,
+                close: 10.0,
+                volume: 1.0,
+            })
+            .collect();
+        let mut config = crate::config::Config::default().strategy;
+        for kind in ["", "ema_cross", "macd", "bollinger", "rsi"] {
+            config.kind = kind.into();
+            let values = indicators(&bars, &config).unwrap();
+            assert_eq!(values.len(), 9);
+            for key in ["ema_fast", "ema_slow", "lower", "middle", "upper"] {
+                assert_eq!(values[key], 10.0);
+            }
+            for key in ["macd", "signal", "histogram"] {
+                assert_eq!(values[key], 0.0);
+            }
+            assert_eq!(values["rsi"], 50.0);
+        }
+        assert!(indicators(&bars[..30], &config).is_err());
+        let mut malformed = bars;
+        malformed[119].close = f64::NAN;
+        assert!(indicators(&malformed, &config).is_err());
     }
     #[test]
     fn gaps_and_unclosed_bars_are_rejected() {
@@ -248,11 +225,5 @@ mod tests {
         let mut gap = bars.clone();
         gap[50].open_time += 1;
         assert!(validate_bars(&gap, 100 * BAR_MS).is_err());
-    }
-    #[test]
-    fn crossing_is_an_event_not_a_direction() {
-        assert_eq!(cross(-1., 1.), Action::Long);
-        assert_eq!(cross(1., -1.), Action::Short);
-        assert_eq!(cross(1., 2.), Action::Wait);
     }
 }

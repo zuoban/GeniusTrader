@@ -322,12 +322,12 @@ impl Engine {
                 i.external_positions.is_empty() && i.external_orders.is_empty(),
                 "存在外部持仓或订单，请先处理"
             );
+            ensure!(
+                self.jev.read().await.available(),
+                "请在账户与连接中配置 Jev API Key 后再启动扫描"
+            );
             for coin in i.book.pool.values().filter(|c| c.enabled) {
-                let c = i.config.for_coin(coin)?;
-                ensure!(
-                    c.decision_mode == DecisionMode::Builtin || self.jev.read().await.available(),
-                    "币种策略需要 Jev API key"
-                );
+                i.config.for_coin(coin)?;
             }
         }
         i.paused = !run;
@@ -528,7 +528,6 @@ impl Engine {
             self.save(&i)?;
             quote
         };
-        let registry = strategy::registry();
         let (maker_fee, taker_fee) = if self.mode == Mode::Paper {
             (c.maker_fee, c.taker_fee)
         } else {
@@ -536,15 +535,11 @@ impl Engine {
         };
         c.maker_fee = maker_fee;
         c.taker_fee = taker_fee;
-        let builtin = registry
-            .get(c.strategy.kind.as_str())
-            .context("策略未注册")?
-            .evaluate(&bars, &c.strategy)?;
         let decision = self
             .jev
             .read()
             .await
-            .decide(&coin.symbol, &bars, &quote, &c, builtin)
+            .decide(&coin.symbol, &bars, &quote, &c)
             .await?;
         self.event("decision", Some(&coin.symbol), "5 分钟收盘决策",
             json!({"bar_close": bar, "config": c, "quote": quote, "candles": bars, "decision": decision}));
@@ -1546,6 +1541,24 @@ mod tests {
             },
         );
         i.market_at = now_ms();
+    }
+    #[tokio::test]
+    async fn scanning_requires_jev_credentials_even_in_paper_mode() {
+        let e = paper();
+        seed(&e).await;
+        e.set_pool(PoolCoin {
+            symbol: "XUSDT".into(),
+            enabled: true,
+            config: None,
+        })
+        .await
+        .unwrap();
+        let error = e.set_running(true).await.unwrap_err().to_string();
+        assert!(error.contains("Jev API Key"));
+        assert!(e.inner.lock().await.paused);
+        *e.jev.write().await = Arc::new(Jev::with_key("local-jev-test-key").unwrap());
+        e.set_running(true).await.unwrap();
+        assert!(!e.inner.lock().await.paused);
     }
     #[tokio::test]
     async fn paper_long_and_short_complete_partial_maker_cycle_while_paused_and_removed() {

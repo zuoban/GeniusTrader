@@ -1,7 +1,5 @@
 'use strict';
 const $=id=>document.getElementById(id);
-const names={ema_cross:'EMA CROSS',macd:'MACD',bollinger:'BOLLINGER',rsi:'RSI'};
-const modeNames={builtin:'内置策略',jev:'Jev',hybrid:'组合确认'};
 let state=null,markets=[],selected=new Set(),editing=null,closing=null,busy=false;
 let auth={initialized:false,authenticated:false},pendingAdmin=null,setupPrompted=false;
 let assetsHidden=false;
@@ -86,7 +84,7 @@ function render(){
   $('exposure').textContent=num(s.exposure_usdt);$('exposure-cap').textContent='上限 '+num(c.max_exposure_usdt)+' USDT';
   const slots=new Set(s.positions.map(p=>p.symbol).concat(s.pending.filter(o=>o.role==='entry').map(o=>o.symbol))).size;
   $('slot-count').textContent=slots+' / '+c.max_positions;$('available').textContent=s.mode!=='paper'&&!s.account_at?'账户尚未连接':'可用保证金 '+num(s.available_usdt)+' USDT';
-  $('strategy-label').textContent=names[c.strategy.kind]+' / '+modeNames[c.decision_mode];
+  $('strategy-label').textContent='JEV';
   $('notional-label').textContent=price(c.notional_usdt)+' USDT';$('profit-label').textContent=price(c.profit_usdt)+' USDT';
   $('position-count').textContent=s.positions.length;$('positions-empty').hidden=s.positions.length>0;
   $('positions-body').innerHTML=s.positions.map(p=>{
@@ -100,9 +98,8 @@ function render(){
   $('pool-body').innerHTML=s.pool.map(coin=>{
     const p=s.positions.find(p=>p.symbol===coin.symbol),pending=s.pending.some(o=>o.symbol===coin.symbol&&o.role==='entry'),d=s.decisions[coin.symbol];
     const status=p?'持仓 · '+p.side:pending?'开仓跟踪中':!coin.enabled?'已停用':d?'最近 '+d.action:'等待收盘信号';
-    const kind=coin.config?.strategy?.kind||c.strategy.kind;
     const btn=(action,label,glyph)=>'<button class="icon-btn" data-action="'+action+'" data-symbol="'+esc(coin.symbol)+'" aria-label="'+label+' '+esc(coin.symbol)+'">'+glyph+'</button>';
-    return '<div class="coin"><span class="coin-code">'+esc(coin.symbol.replace('USDT','').slice(0,3))+'</span><div class="coin-info"><b>'+esc(coin.symbol)+'</b><small>'+esc(status)+' / '+names[kind]+'</small></div><div class="coin-actions">'+btn('toggle',coin.enabled?'停用':'启用',coin.enabled?'Ⅱ':'▷')+btn('edit','配置','⚙')+btn('remove','移出币池','×')+'</div></div>';
+    return '<div class="coin"><span class="coin-code">'+esc(coin.symbol.replace('USDT','').slice(0,3))+'</span><div class="coin-info"><b>'+esc(coin.symbol)+'</b><small>'+esc(status)+' / JEV</small></div><div class="coin-actions">'+btn('toggle',coin.enabled?'停用':'启用',coin.enabled?'Ⅱ':'▷')+btn('edit','配置','⚙')+btn('remove','移出币池','×')+'</div></div>';
   }).join('');
   $('update-time').textContent='SYNC '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
 }
@@ -135,13 +132,12 @@ function showSettings(){
       select('allowed_direction','允许方向',c.allowed_direction,{both:'做多与做空',long:'仅做多',short:'仅做空'}),
       numeric('max_spread_bps','点差上限 / bps',c.max_spread_bps,.1,1000,'.1')
     ],'名义金额不再乘杠杆。退出采用 Maker 止盈或手动平仓。')+
-    section('决策引擎 · 固定 5 分钟',[
-      select('decision_mode','决策模式',c.decision_mode,modeNames),select('kind','内置策略',s.kind,{ema_cross:'EMA 双均线交叉',macd:'MACD 交叉',bollinger:'布林带回归',rsi:'RSI 回归'}),
+    section('JEV 行情指标 · 固定 5 分钟',[
       numeric('fast','快线周期',s.fast,2,149),numeric('slow','慢线周期',s.slow,3,150),
       numeric('signal','MACD 信号周期',s.signal,2,100),numeric('period','RSI / 布林带周期',s.period,2,150),
       numeric('lower','RSI 下阈值',s.lower,0,100,'.1'),numeric('upper','RSI 上阈值',s.upper,0,100,'.1'),
       numeric('deviations','布林带标准差倍数',s.deviations,.1,10,'.1'),numeric('signal_max_age_seconds','信号有效期 / 秒',c.signal_max_age_seconds,1,120)
-    ])+
+    ],'EMA、MACD、RSI 和布林带共同作为 JEV 的行情输入，由 JEV 选择做多、做空或等待。')+
     section('TypeSafe AI · Jev',[
       input('model','模型',j.model,'required'),numeric('min_confidence','最低置信度',j.min_confidence,0,1,'.01'),
       numeric('lookback_bars','行情回看 / 根',j.lookback_bars,100,500),numeric('forecast_bars','判断窗口 / 根',j.forecast_bars,1,288),
@@ -200,9 +196,7 @@ function showCoin(coin){
   $('coin-fields').innerHTML=section('覆盖配置',[
     input('notional','名义金额 / 留空继承',o.notional_usdt||'','type="number" min="1" step=".01"'),
     input('profit','净止盈 / 留空继承',o.profit_usdt||'','type="number" min=".01" step=".01"'),
-    select('strategy','策略',o.strategy?.kind||'',{'':'继承全局',ema_cross:'EMA 交叉',macd:'MACD',bollinger:'布林带回归',rsi:'RSI'}),
-    select('mode','决策模式',o.decision_mode||'',{'':'继承全局',...modeNames})
-  ],'完整单币策略参数可通过 /api/pool 配置。');
+  ],'决策统一使用 JEV。单币指标参数可通过 /api/pool 配置。');
   $('coin-dialog').showModal();
 }
 const addCoin=symbol=>{
@@ -227,9 +221,8 @@ $('pool-body').addEventListener('click',e=>{
   });
 });
 $('coin-form').addEventListener('submit',e=>{
-  e.preventDefault();act(async()=>{const f=e.target,k=f.elements.strategy.value;
-    const strategy=k?(editing.config?.strategy?.kind===k?editing.config.strategy:{...state.config.strategy,kind:k,...(k==='macd'?{fast:12,slow:26}:k==='bollinger'?{period:20}:{})}):null;
-    await api('/api/pool','POST',{...editing,config:{notional_usdt:f.elements.notional.value||null,profit_usdt:f.elements.profit.value||null,strategy,decision_mode:f.elements.mode.value||null,allowed_direction:editing.config?.allowed_direction||null}});
+  e.preventDefault();act(async()=>{const f=e.target;
+    await api('/api/pool','POST',{...editing,config:{notional_usdt:f.elements.notional.value||null,profit_usdt:f.elements.profit.value||null,strategy:editing.config?.strategy||null,decision_mode:null,allowed_direction:editing.config?.allowed_direction||null}});
     $('coin-dialog').close();toast('单币配置已保存');
   });
 });
@@ -237,8 +230,8 @@ $('settings-form').addEventListener('submit',e=>{
   e.preventDefault();act(async()=>{const c=structuredClone(state.config),f=e.target;
     ['notional_usdt','profit_usdt','max_exposure_usdt','maker_fee','taker_fee','max_spread_bps','paper_balance_usdt'].forEach(k=>{c[k]=f.elements[k].value;});
     ['max_positions','leverage','cooldown_bars','signal_max_age_seconds'].forEach(k=>{c[k]=Number(f.elements[k].value);});
-    ['decision_mode','allowed_direction'].forEach(k=>{c[k]=f.elements[k].value;});
-    c.strategy.kind=f.elements.kind.value;['fast','slow','signal','period','lower','upper','deviations'].forEach(k=>{c.strategy[k]=Number(f.elements[k].value);});
+    c.decision_mode='jev';c.allowed_direction=f.elements.allowed_direction.value;
+    ['fast','slow','signal','period','lower','upper','deviations'].forEach(k=>{c.strategy[k]=Number(f.elements[k].value);});
     c.jev.model=f.elements.model.value;['min_confidence','lookback_bars','forecast_bars','timeout_seconds'].forEach(k=>{c.jev[k]=Number(f.elements[k].value);});
     await api('/api/config','PUT',c);$('settings-dialog').close();toast('配置已保存，后续新开仓生效');
   });

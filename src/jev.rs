@@ -1,13 +1,13 @@
 use crate::{
-    config::{Config, DecisionMode},
-    domain::{Action, Candle, Quote},
-    strategy::Decision,
+    config::Config,
+    domain::{Action, BAR_MS, Candle, Quote, now_ms},
+    strategy::{self, Decision},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::json;
-use std::{collections::BTreeMap, error::Error as _, time::Duration};
+use serde_json::{Value, json};
+use std::{collections::BTreeMap, error::Error as _, fmt::Write as _, time::Duration};
 
 pub struct Jev {
     client: Client,
@@ -25,6 +25,8 @@ struct Response {
 struct Usage {
     #[serde(default)]
     input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 #[derive(Debug, Deserialize)]
 struct Choice {
@@ -102,24 +104,22 @@ impl Jev {
         bars: &[Candle],
         quote: &Quote,
         c: &Config,
-        builtin: Decision,
     ) -> Result<Decision> {
-        if c.decision_mode == DecisionMode::Builtin
-            || (c.decision_mode == DecisionMode::Hybrid && builtin.action == Action::Wait)
-        {
-            return Ok(builtin);
-        }
         let key = self
             .key
             .as_deref()
             .context("请在页面的账户与连接中配置 Jev API Key")?;
-        let body = json!({"model":c.jev.model,"state":{"symbol":symbol,"timeframe":"5m","closed_candles":bars,"quote":quote,"indicators":builtin.indicators,"builtin_signal":builtin.action,"notional_usdt":c.notional_usdt,"target_net_profit_usdt":c.profit_usdt,"maker_fee":c.maker_fee,"taker_fee":c.taker_fee,"forecast_bars":c.jev.forecast_bars,"position":"flat"},"questions":{"action":{"type":"choice","instructions":"Using only the supplied closed 5-minute market data and precomputed indicators, select the entry direction for the specified forecast window after accounting for spread and commission. Do not treat confidence as win probability. Select WAIT when evidence is insufficient. Do not assume live market access or infer missing data.","criteria":{"LONG":"Evidence supports an upward move sufficient to cover costs and the configured profit target.","SHORT":"Evidence supports a downward move sufficient to cover costs and the configured profit target.","WAIT":"No sufficiently supported opportunity, ambiguous signals, or insufficient data."}}}});
+        let indicators = strategy::indicators(bars, &c.strategy)?;
+        let body = decision_request(symbol, bars, quote, c, &indicators)?;
+        let payload = serde_json::to_vec(&body)?;
+        let request_bytes = payload.len();
         let r = self
             .client
             .post(format!("{}/v1/systemone", self.base))
             .bearer_auth(key)
             .timeout(Duration::from_secs(c.jev.timeout_seconds))
-            .json(&body)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload)
             .send()
             .await
             .map_err(|error| transport_error(error, "决策请求", c.jev.timeout_seconds))?;
@@ -148,27 +148,74 @@ impl Jev {
             .get("action")
             .context("Jev 未返回 action")?;
         validate_choice(answer)?;
-        let mut d = builtin.clone();
+        let mut d = Decision::wait("jev");
+        d.indicators = indicators;
         d.action = if answer.confidence < c.jev.min_confidence {
             Action::Wait
         } else {
             answer.choice
         };
-        if c.decision_mode == DecisionMode::Hybrid && d.action != builtin.action {
-            d.action = Action::Wait;
-        }
-        d.source = if c.decision_mode == DecisionMode::Hybrid {
-            "hybrid"
-        } else {
-            "jev"
-        }
-        .into();
         d.model = Some(response.model);
         d.confidence = Some(answer.confidence);
         d.probabilities = answer.probabilities.clone();
         d.input_tokens = response.usage.input_tokens;
+        d.output_tokens = response.usage.output_tokens;
+        d.request_bytes = request_bytes;
         Ok(d)
     }
+}
+fn decision_request(
+    symbol: &str,
+    bars: &[Candle],
+    quote: &Quote,
+    c: &Config,
+    indicators: &BTreeMap<String, f64>,
+) -> Result<Value> {
+    // Shared timestamps are lossless only for validated, contiguous closed bars.
+    strategy::validate_bars(bars, now_ms())?;
+    let mut csv = String::from("open,high,low,close,volume");
+    for bar in bars {
+        // Display uses round-trip numeric precision; do not round prices/volume.
+        write!(
+            csv,
+            "\n{},{},{},{},{}",
+            bar.open, bar.high, bar.low, bar.close, bar.volume
+        )?;
+    }
+    Ok(json!({
+        "model": c.jev.model,
+        "state": {
+            "symbol": symbol,
+            "timeframe": "5m",
+            "closed_candles": {
+                "first_open_time_ms": bars[0].open_time,
+                "interval_ms": BAR_MS,
+                "close_offset_ms": BAR_MS - 1,
+                "order": "oldest_first",
+                "csv": csv
+            },
+            "quote": quote,
+            "indicators": indicators,
+            "indicator_parameters": c.strategy,
+            "notional_usdt": c.notional_usdt,
+            "target_net_profit_usdt": c.profit_usdt,
+            "maker_fee": c.maker_fee,
+            "taker_fee": c.taker_fee,
+            "forecast_bars": c.jev.forecast_bars,
+            "position": "flat"
+        },
+        "questions": {
+            "action": {
+                "type": "choice",
+                "instructions": "Choose an entry for forecast_bars using only these closed 5m bars, indicators and quote. Account for spread and fees. No external or missing data. WAIT on weak/conflicting evidence. Confidence is not win probability.",
+                "criteria": {
+                    "LONG": "Upward move supports target_net_profit_usdt after spread and fees.",
+                    "SHORT": "Downward move supports target_net_profit_usdt after spread and fees.",
+                    "WAIT": "Insufficient, conflicting or non-profitable evidence."
+                }
+            }
+        }
+    }))
 }
 fn transport_error(error: reqwest::Error, operation: &str, timeout_seconds: u64) -> anyhow::Error {
     if error.is_timeout() {
@@ -259,6 +306,127 @@ fn validate_choice(a: &Choice) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::Value;
+    fn candles() -> Vec<Candle> {
+        candles_with_count(120)
+    }
+    fn candles_with_count(count: i64) -> Vec<Candle> {
+        let end = crate::domain::now_ms() / crate::domain::BAR_MS * crate::domain::BAR_MS;
+        (0..count)
+            .map(|i| {
+                let open_time = end - (count - i) * crate::domain::BAR_MS;
+                Candle {
+                    open_time,
+                    close_time: open_time + crate::domain::BAR_MS - 1,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.0,
+                    volume: 10.0,
+                }
+            })
+            .collect()
+    }
+    #[test]
+    fn compact_request_preserves_every_bar_and_reduces_payload_size() {
+        let c = Config::default();
+        let quote = Quote {
+            bid: 100.into(),
+            ask: 100.into(),
+            bid_qty: 1.into(),
+            ask_qty: 1.into(),
+            time: now_ms(),
+        };
+        for count in [120, 500] {
+            for price in [0.0000123456789, 123.456789, 65000.1234567] {
+                let mut bars = candles_with_count(count);
+                for (i, bar) in bars.iter_mut().enumerate() {
+                    bar.open = price * (1.0 + i as f64 * 0.0001);
+                    bar.high = bar.open * 1.002;
+                    bar.low = bar.open * 0.998;
+                    bar.close = bar.open * 1.001;
+                    bar.volume = if i == 0 {
+                        0.0
+                    } else {
+                        123456.789 + i as f64 * 1.2345
+                    };
+                }
+                let indicators = strategy::indicators(&bars, &c.strategy).unwrap();
+                let body = decision_request("XUSDT", &bars, &quote, &c, &indicators).unwrap();
+                let table = &body["state"]["closed_candles"];
+                let mut lines = table["csv"].as_str().unwrap().lines();
+                assert_eq!(lines.next(), Some("open,high,low,close,volume"));
+                assert_eq!(table["order"], "oldest_first");
+                let rows = lines.collect::<Vec<_>>();
+                assert_eq!(rows.len(), bars.len());
+                for (i, (row, bar)) in rows.iter().zip(&bars).enumerate() {
+                    let values = row
+                        .split(',')
+                        .map(|v| v.parse::<f64>().unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(values.len(), 5);
+                    for (actual, original) in values
+                        .iter()
+                        .zip([bar.open, bar.high, bar.low, bar.close, bar.volume])
+                    {
+                        assert_eq!(actual.to_bits(), original.to_bits());
+                    }
+                    let open = table["first_open_time_ms"].as_i64().unwrap()
+                        + i as i64 * table["interval_ms"].as_i64().unwrap();
+                    assert_eq!(open, bar.open_time);
+                    assert_eq!(
+                        open + table["close_offset_ms"].as_i64().unwrap(),
+                        bar.close_time
+                    );
+                }
+                assert_eq!(body["state"]["quote"], json!(quote));
+                assert_eq!(body["state"]["indicators"], json!(indicators));
+                assert_eq!(body["state"]["indicator_parameters"], json!(c.strategy));
+                let mut legacy = body.clone();
+                legacy["state"]["closed_candles"] = json!(bars);
+                legacy["questions"]["action"] = json!({
+                    "type":"choice",
+                    "instructions":"Using only the supplied closed 5-minute market data and precomputed indicators, select the entry direction for the specified forecast window after accounting for spread and commission. Do not treat confidence as win probability. Select WAIT when evidence is insufficient. Do not assume live market access or infer missing data.",
+                    "criteria":{
+                        "LONG":"Evidence supports an upward move sufficient to cover costs and the configured profit target.",
+                        "SHORT":"Evidence supports a downward move sufficient to cover costs and the configured profit target.",
+                        "WAIT":"No sufficiently supported opportunity, ambiguous signals, or insufficient data."
+                    }
+                });
+                let old_bytes = serde_json::to_vec(&legacy).unwrap().len();
+                let new_bytes = serde_json::to_vec(&body).unwrap().len();
+                assert!(
+                    new_bytes * 100 <= old_bytes * 65,
+                    "{count} bars: {new_bytes}/{old_bytes}"
+                );
+                println!(
+                    "{count} bars, price {price}: {old_bytes} -> {new_bytes} bytes ({:.1}% reduction)",
+                    100.0 * (1.0 - new_bytes as f64 / old_bytes as f64)
+                );
+            }
+        }
+    }
+    #[test]
+    fn compact_request_rejects_gaps_unclosed_bars_and_incomplete_history() {
+        let c = Config::default();
+        let quote = Quote {
+            bid: 100.into(),
+            ask: 100.into(),
+            bid_qty: 1.into(),
+            ask_qty: 1.into(),
+            time: now_ms(),
+        };
+        let bars = candles();
+        let indicators = strategy::indicators(&bars, &c.strategy).unwrap();
+        assert!(decision_request("XUSDT", &bars[..99], &quote, &c, &indicators).is_err());
+        let mut gap = bars.clone();
+        gap[50].open_time += BAR_MS;
+        gap[50].close_time += BAR_MS;
+        assert!(decision_request("XUSDT", &gap, &quote, &c, &indicators).is_err());
+        let mut future = bars;
+        future[119].open_time += BAR_MS;
+        future[119].close_time += BAR_MS;
+        assert!(decision_request("XUSDT", &future, &quote, &c, &indicators).is_err());
+    }
     #[tokio::test]
     async fn credential_tests_only_list_models_and_sanitize_errors() {
         use axum::{
@@ -379,11 +547,9 @@ mod tests {
             key: Some("local-jev-decision-key".into()),
             base,
         };
-        let mut c = Config {
-            decision_mode: DecisionMode::Jev,
-            ..Config::default()
-        };
+        let mut c = Config::default();
         c.jev.timeout_seconds = 1;
+        let bars = candles();
         let quote = Quote {
             bid: 100.into(),
             ask: 100.into(),
@@ -405,7 +571,7 @@ mod tests {
                 json!({"error":"local-jev-decision-key"}),
             );
             let error = jev
-                .decide("XUSDT", &[], &quote, &c, Decision::wait("test"))
+                .decide("XUSDT", &bars, &quote, &c)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -424,7 +590,7 @@ mod tests {
                 json!({"model":"local-jev-decision-key"}),
             );
             let error = jev
-                .decide("XUSDT", &[], &quote, &c, Decision::wait("test"))
+                .decide("XUSDT", &bars, &quote, &c)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -434,7 +600,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn typed_http_decisions_enforce_confidence_and_hybrid_agreement() {
+    async fn jev_decides_without_local_signals_and_enforces_confidence() {
         use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
         use std::sync::{
             Arc,
@@ -448,14 +614,41 @@ mod tests {
             Json(body): Json<Value>,
         ) -> Json<Value> {
             assert_eq!(headers["authorization"], "Bearer local-jev-key");
+            assert_eq!(headers["content-type"], "application/json");
             assert_eq!(body["questions"]["action"]["type"], "choice");
             assert_eq!(body["state"]["timeframe"], "5m");
             assert_eq!(body["state"]["position"], "flat");
+            assert!(body["state"].get("builtin_signal").is_none());
+            assert!(body["state"]["indicator_parameters"].get("kind").is_none());
+            assert_eq!(
+                body["state"]["closed_candles"]["csv"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .count(),
+                121
+            );
+            for key in [
+                "ema_fast",
+                "ema_slow",
+                "macd",
+                "signal",
+                "histogram",
+                "rsi",
+                "lower",
+                "middle",
+                "upper",
+            ] {
+                assert!(
+                    body["state"]["indicators"][key].is_number(),
+                    "missing {key}"
+                );
+            }
             count.fetch_add(1, Ordering::SeqCst);
             Json(response.lock().await.clone())
         }
         let response = Arc::new(Mutex::new(
-            json!({"model":"jev-test-version","usage":{"input_tokens":100},"answers":{"action":{"type":"choice","choice":"LONG","confidence":0.9,"probabilities":{"LONG":0.9,"SHORT":0.05,"WAIT":0.05}}}}),
+            json!({"model":"jev-test-version","usage":{"input_tokens":100,"output_tokens":34},"answers":{"action":{"type":"choice","choice":"LONG","confidence":0.9,"probabilities":{"LONG":0.9,"SHORT":0.05,"WAIT":0.05}}}}),
         ));
         let calls = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
@@ -467,7 +660,8 @@ mod tests {
             key: Some("local-jev-key".into()),
             base,
         };
-        let mut c = Config::default();
+        let c = Config::default();
+        let bars = candles();
         let quote = Quote {
             bid: 100.into(),
             ask: 100.into(),
@@ -475,42 +669,48 @@ mod tests {
             ask_qty: 1.into(),
             time: crate::domain::now_ms(),
         };
-        let mut builtin = Decision::wait("ema_cross");
-        builtin.action = Action::Short;
-        let unchanged = jev
-            .decide("XUSDT", &[], &quote, &c, builtin.clone())
-            .await
-            .unwrap();
-        assert_eq!(unchanged.action, Action::Short);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        c.decision_mode = DecisionMode::Jev;
-        let result = jev
-            .decide("XUSDT", &[], &quote, &c, builtin.clone())
-            .await
-            .unwrap();
+        let result = jev.decide("XUSDT", &bars, &quote, &c).await.unwrap();
         assert_eq!(result.action, Action::Long);
+        assert_eq!(result.source, "jev");
         assert_eq!(result.model.as_deref(), Some("jev-test-version"));
         assert_eq!(result.input_tokens, 100);
-        c.decision_mode = DecisionMode::Hybrid;
+        assert_eq!(result.output_tokens, 34);
         assert_eq!(
-            jev.decide("XUSDT", &[], &quote, &c, builtin.clone())
-                .await
-                .unwrap()
-                .action,
-            Action::Wait
+            result.request_bytes,
+            serde_json::to_vec(
+                &decision_request("XUSDT", &bars, &quote, &c, &result.indicators).unwrap()
+            )
+            .unwrap()
+            .len()
         );
+        assert_eq!(result.indicators["rsi"], 50.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for (choice, probabilities, action) in [
+            (
+                "SHORT",
+                json!({"LONG":0.05,"SHORT":0.9,"WAIT":0.05}),
+                Action::Short,
+            ),
+            (
+                "WAIT",
+                json!({"LONG":0.05,"SHORT":0.05,"WAIT":0.9}),
+                Action::Wait,
+            ),
+        ] {
+            response.lock().await["answers"]["action"] = json!({"type":"choice","choice":choice,"confidence":0.9,"probabilities":probabilities});
+            let result = jev.decide("XUSDT", &bars, &quote, &c).await.unwrap();
+            assert_eq!(result.action, action);
+            assert_eq!(result.source, "jev");
+        }
+        response.lock().await["answers"]["action"] = json!({"type":"choice","choice":"LONG","confidence":0.9,"probabilities":{"LONG":0.9,"SHORT":0.05,"WAIT":0.05}});
         response.lock().await["answers"]["action"]["confidence"] = json!(0.6);
-        c.decision_mode = DecisionMode::Jev;
         assert_eq!(
-            jev.decide("XUSDT", &[], &quote, &c, builtin.clone())
-                .await
-                .unwrap()
-                .action,
+            jev.decide("XUSDT", &bars, &quote, &c).await.unwrap().action,
             Action::Wait
         );
         response.lock().await["answers"]["action"]["probabilities"]["SHORT"] = json!(0.9);
         let error = jev
-            .decide("XUSDT", &[], &quote, &c, builtin.clone())
+            .decide("XUSDT", &bars, &quote, &c)
             .await
             .unwrap_err()
             .to_string();
@@ -523,10 +723,7 @@ mod tests {
             response.lock().await["answers"]["action"]["probabilities"] = probabilities.clone();
             for confidence in [0.9, 0.6] {
                 response.lock().await["answers"]["action"]["confidence"] = json!(confidence);
-                let result = jev
-                    .decide("XUSDT", &[], &quote, &c, builtin.clone())
-                    .await
-                    .unwrap();
+                let result = jev.decide("XUSDT", &bars, &quote, &c).await.unwrap();
                 assert_eq!(
                     result.action,
                     if confidence < c.jev.min_confidence {
@@ -543,7 +740,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 8);
+        assert_eq!(calls.load(Ordering::SeqCst), 9);
         server.abort();
     }
     fn choice(probabilities: [f64; 3], action: Action) -> Choice {

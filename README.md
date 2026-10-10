@@ -95,8 +95,7 @@ IP 访问失败时先看 `rtk proxy docker compose ps` 的端口：应显示 `0.
 
 - 合约成交额排序、手动输入、批量添加、启用/停用、删除币种。
 - 全局配置与单币覆盖，金额和止盈目标使用十进制字符串。
-- EMA、MACD、布林带回归、RSI 回归；通过 `Strategy` trait 和注册表扩展。
-- 内置策略、Jev 独立决策、内置策略 + Jev 同向确认。
+- 仅使用 Jev 决策做多、做空或等待；EMA、MACD、RSI、布林带统一作为行情输入，支持配置指标参数。
 - SQLite WAL 持久化配置、币池、持仓、订单、信号去重及事件；同一数据库仅允许一个服务实例。
 - 订单发送前持久化，状态未知时查询原订单，不盲目重发。
 - 止盈按实际数量/均价、手续费、已结算资金费与部分平仓利润反解价格，并按 tick size 取整。
@@ -109,12 +108,12 @@ IP 访问失败时先看 `rtk proxy docker compose ps` 的端口：应显示 `0.
 ```mermaid
 flowchart TD
     A[启动 Rust 服务 / 恢复 SQLite] --> B[同步交易规则、盘口、账户]
-    B --> C[选择币池 / 配置金额、策略、净止盈]
+    B --> C[选择币池 / 配置金额、Jev、净止盈]
     C --> D[手动启动开仓扫描]
     D --> E{该币有持仓或待确认订单？}
     E -- 有 --> M[继续对账与管理 Maker 止盈]
     E -- 无 --> F[读取已收盘 5m K 线 / 检查连续性与时效]
-    F --> G[内置策略 / Jev / 同向确认]
+    F --> G[计算行情指标 / Jev 决策]
     G --> H{LONG、SHORT 或 WAIT}
     H -- WAIT --> D
     H -- LONG 或 SHORT --> I[检查点差、交易规则、保证金、名额与总敞口]
@@ -139,7 +138,7 @@ flowchart TD
 5. 策略、净止盈和杠杆修改只影响后续入场；已有仓位保存自己的净止盈目标和杠杆。模拟本金按差额调整，并保留累计收益。部分成交、资金费结算后重新核算剩余止盈，确认撤单后才替换挂单。
 6. 停用、移出币池、暂停扫描均只停止新增入场。订单/持仓管理独立运行；服务重启先查询原委托和真实仓位，再恢复持仓管理。
 
-代码入口：`src/main.rs`；流程编排：`src/engine.rs`；交易所适配：`src/exchange.rs`；策略接口：`src/strategy.rs`；Jev：`src/jev.rs`；本地 API：`src/api.rs`。
+代码入口：`src/main.rs`；流程编排：`src/engine.rs`；交易所适配：`src/exchange.rs`；行情指标与决策结构：`src/strategy.rs`；Jev：`src/jev.rs`；本地 API：`src/api.rs`。
 
 ## 模式
 
@@ -163,13 +162,17 @@ flowchart TD
 
 ## Jev
 
-在「账户与连接」保存 Jev API Key，再在「策略与交易」选择 `jev` 或 `hybrid`。使用官方 `POST https://api.typesafe.ai/v1/systemone`；Choice 为 LONG / SHORT / WAIT，验证选项、概率及置信度。超时、异常或低于阈值时等待，不自动降级开单。
+决策模式固定为 `jev`。在「账户与连接」保存 Jev API Key，再在「策略与交易」配置模型、最低置信度、回看长度和判断窗口；模拟 / 测试网 / 实盘启动扫描都需要 Jev 密钥。EMA、MACD、RSI 和布林带同时提供给模型，仅作为行情输入，不独立产生开仓信号。使用官方 `POST https://api.typesafe.ai/v1/systemone`；Choice 为 LONG / SHORT / WAIT，验证选项、概率及置信度。超时、异常或低于阈值时等待，不自动降级开单。
+
+旧 SQLite 全局和单币配置中的 `builtin` / `hybrid` 兼容读取为 `jev`，下次保存时写回 `jev`；旧 `strategy.kind` 兼容读取后忽略，保存时移除。指标周期、金额、净止盈、币池和持仓数据继续保留。每次启动仍暂停新增开仓，配置 Jev 后手动启动扫描。
+
+Jev 请求使用紧凑行情表降低输入消耗：[官方 `state` 格式](https://docs.typesafe.ai/concepts/state)允许结构化 JSON 和文本。完整回看行情按从旧到新排列，OHLCV 以单个 CSV 表头和数据行传入；起始开盘时间、5 分钟间隔和收盘偏移只传一次。第 i 行的开盘时间为 `first_open_time_ms + i × interval_ms`（i 从 0 开始），收盘时间再加 `close_offset_ms`。不裁剪 K 线、不降低价格或成交量精度；压缩前校验连续性和收盘状态。提示词精简后仍包含费用、点差、净止盈及证据不足时等待的要求。本地 120 / 500 根、高低价样本请求体减少约 44%–51%；字节缩减不等于实际 token 缩减，实际以返回的 `usage` 为准。原始行情继续保存在本地决策日志。
 
 概率总和按[官方 SDK 的「近似 1」约定](https://docs.typesafe.ai/sdk/python/api/types/responses)校验：兼容三项概率保留两位小数后的总和 0.99–1.01（包含端点），记录保留原始值。各项仍必须是 0–1 的有限数，选项必须完整且 choice 为最高概率选项（允许并列）；超出容差时等待，并在错误中显示 LONG / SHORT / WAIT 数值及总和，便于区分舍入误差与真正异常。
 
 Jev 密钥配置提供「测试连接」：填写时测试当前输入，留空时使用已保存的密钥，勾选清除时需先取消清除才能测试。通过官方 [模型列表接口](https://docs.typesafe.ai/models) `GET https://api.typesafe.ai/v1/models` 验证密钥、网络和账户模型访问，显示成功或中文错误原因；10 秒超时。测试不保存密钥、不影响正在运行的交易，也不调用决策模型或触发模型推理计费；通过后仍需保存新密钥。实际决策时继续验证模型调用。
 
-默认 `jev-latest` 可改为账户支持的固定版本。决策请求默认总超时为 15 秒，包含建立连接、上传行情和读取结果；已有 SQLite 配置保留原来的值，可在「策略与交易 → TypeSafe AI · Jev」调整（1–30 秒）。「测试连接」成功说明模型列表可访问，不代表决策接口的模型处理一定能在配置的时限内完成。错误记录区分超时、DNS、TLS、连接中断与 HTTP 状态，错误时本轮等待；不自动重试可能已计费的决策请求。置信度不是交易胜率。记录输入、配置、结构化输出、实际模型版本和 token 用量；模型费用尚未自动换算为 USDT。
+默认 `jev-latest` 可改为账户支持的固定版本。决策请求默认总超时为 15 秒，包含建立连接、上传行情和读取结果；已有 SQLite 配置保留原来的值，可在「策略与交易 → TypeSafe AI · Jev」调整（1–30 秒）。「测试连接」成功说明模型列表可访问，不代表决策接口的模型处理一定能在配置的时限内完成。错误记录区分超时、DNS、TLS、连接中断与 HTTP 状态，错误时本轮等待；不自动重试可能已计费的决策请求。置信度不是交易胜率。记录输入、配置、结构化输出、实际模型版本和服务返回的 `input_tokens` / `output_tokens`，以及实际请求的 `request_bytes`；服务未返回的用量字段记为 0，模型费用尚未自动换算为 USDT。
 
 ## 当前边界
 
@@ -208,7 +211,7 @@ Jev 密钥配置提供「测试连接」：填写时测试当前输入，留空�
 | POST | `/api/positions/{symbol}/close` | 手动平仓 |
 | POST | `/api/markets/refresh` | 更新规则与排名 |
 
-单币 `config` 字段：`notional_usdt`、`profit_usdt`、`strategy`、`decision_mode`、`allowed_direction`；未覆盖字段为 null。时间为 Unix 毫秒。
+单币 `config` 字段：`notional_usdt`、`profit_usdt`、`strategy`（指标参数）、`decision_mode`（固定为 `jev`，可为 null 继承）、`allowed_direction`；未覆盖字段为 null。时间为 Unix 毫秒。
 
 连接设置支持部分更新，例如 `{ "mode": "testnet", "testnet": { "key": "...", "secret": "..." }, "jev_key": "..." }`。空字符串 / 省略密钥字段表示保留，`testnet.clear`、`live.clear`、`clear_jev` 表示显式清除。实盘模式需要 `live_enabled: true`。
 
