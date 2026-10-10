@@ -34,19 +34,19 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 ## GitHub Packages 容器
 
-镜像：`ghcr.io/zuoban/geniustrader:0.1.0`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
+镜像：`ghcr.io/zuoban/geniustrader:0.1.1`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
 
 ```sh
-rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.0
+rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.1
 rtk proxy docker run -d --name genius-trader \
-  --publish 127.0.0.1:8787:8787 \
+  --publish 8787:8787 \
   --mount type=volume,source=genius-trader-data,target=/app/data \
-  ghcr.io/zuoban/geniustrader:0.1.0
+  ghcr.io/zuoban/geniustrader:0.1.1
 ```
 
-打开 http://127.0.0.1:8787，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
+本机打开 http://127.0.0.1:8787，服务器部署则打开 `http://服务器IPv4:8787`，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
 
-容器内通过 `--bind 0.0.0.0` 接收映射流量，宿主机仅映射到回环地址；API 继续校验 localhost / 127.0.0.1 Host、来源及管理员会话。`docker stop genius-trader` 会发送 SIGINT 并正常停止服务。
+容器内通过 `--bind 0.0.0.0` 接收映射流量，允许 localhost、127.0.0.1 和 IPv4 Host；API 继续校验来源及管理员会话。服务器防火墙和云安全组需允许客户端访问 TCP 8787，建议仅放行你的客户端 IP。若只需本机或 SSH 隧道访问，将端口映射改为 `127.0.0.1:8787:8787`。`docker stop genius-trader` 会发送 SIGINT 并正常停止服务。
 
 本地构建与验证：
 
@@ -72,9 +72,11 @@ rtk proxy docker compose up -d
 rtk proxy docker compose ps
 ```
 
-`compose.yaml` 使用已发布的 `0.1.0` 公开镜像，监听宿主机 `127.0.0.1:8787`，数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
+`compose.yaml` 使用已发布的 `0.1.1` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
 
-打开 http://127.0.0.1:8787，首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"127.0.0.1:8877:8787"`，再访问 http://127.0.0.1:8877；容器端口仍为 8787。
+打开 `http://服务器IPv4:8787`（本机部署使用 http://127.0.0.1:8787），首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"8877:8787"`，再访问 `http://服务器IPv4:8877`；容器端口仍为 8787。
+
+从 `0.1.0` 升级时，必须同时更新镜像版本和端口映射：旧版本只接受 localhost / 127.0.0.1 Host，旧的 `127.0.0.1:8787:8787` 映射也只能在服务器本机访问。更新后执行 `rtk proxy docker compose pull` 和 `rtk proxy docker compose up -d`，保留现有数据卷。
 
 查看日志和停止服务：
 
@@ -83,7 +85,9 @@ rtk proxy docker compose logs --tail 100 -f trader
 rtk proxy docker compose down
 ```
 
-远程服务器部署时，在本机执行 `rtk proxy ssh -N -L 8877:127.0.0.1:8787 用户名@服务器IP`，然后打开 http://127.0.0.1:8877。应用仍要求 localhost / 127.0.0.1 Host，API 密钥和交易配置由页面保存到 SQLite。
+若使用 SSH 隧道，将端口映射设为 `"127.0.0.1:8787:8787"`，在本机执行 `rtk proxy ssh -N -L 8877:127.0.0.1:8787 用户名@服务器IP`，然后打开 http://127.0.0.1:8877。API 密钥和交易配置由页面保存到 SQLite。
+
+IP 访问失败时先看 `rtk proxy docker compose ps` 的端口：应显示 `0.0.0.0:8787->8787/tcp`；若仅显示 `127.0.0.1:8787`，端口仍只允许本机访问。服务器本机 `rtk proxy curl http://127.0.0.1:8787/api/auth/status` 成功、远程连接超时通常需要检查防火墙 / 云安全组；收到 HTTP 403 则检查是否仍使用旧镜像或覆盖了容器的 `--bind 0.0.0.0` 启动参数。
 
 升级时修改 `compose.yaml` 中的镜像版本，再执行 `rtk proxy docker compose pull` 和 `rtk proxy docker compose up -d`，复用原数据卷。
 
@@ -178,7 +182,7 @@ Jev 密钥配置提供「测试连接」：填写时测试当前输入，留空�
 
 ## API
 
-写请求需要 `X-Genius-Request: 1`，拒绝浏览器跨源写请求及非 localhost / 127.0.0.1 的 Host。服务默认绑定本机回环地址；容器的宿主机端口也仅映射到回环地址。
+写请求需要 `X-Genius-Request: 1`，拒绝浏览器跨源写请求。服务默认绑定本机回环地址，仅接受 localhost / 127.0.0.1 Host；显式使用 `--bind 0.0.0.0` 或其他非回环 IPv4 地址启动时也接受 IPv4 Host，域名 Host 仍被拒绝。Origin 存在时必须与请求的 `http://Host`（包含端口）完全一致；管理员验证保持生效。
 所有业务写请求还需要有效的管理员会话 Cookie；未登录返回 401。仅初始化、登录和退出端点不要求已有会话。初始化仅在管理员记录不存在时成功，并以数据库唯一约束防止重复初始化。
 
 | 方法 | 路径 | 内容 |

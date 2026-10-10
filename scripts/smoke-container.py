@@ -14,12 +14,17 @@ def docker(*args):
     return subprocess.check_output(["docker", *args], text=True).strip()
 
 
-def request(base, path, data=None):
+def request(base, path, data=None, host=None, origin=None):
     payload = None if data is None else json.dumps(data).encode()
+    headers = {"Content-Type": "application/json", "X-Genius-Request": "1"}
+    if host is not None:
+        headers["Host"] = host
+    if origin is not None:
+        headers["Origin"] = origin
     req = urllib.request.Request(
         base + path,
         data=payload,
-        headers={"Content-Type": "application/json", "X-Genius-Request": "1"},
+        headers=headers,
     )
     # Use loopback directly even when the host has an HTTP proxy configured.
     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
@@ -57,10 +62,24 @@ def main(image):
         assert state["mode"] == "paper" and state["paused"] is True, state
         assert state["auth"]["initialized"] is False, state["auth"]
         assert b"Genius" in request(base, "/")
+        remote_host = "203.0.113.10:8787"
+        assert b"Genius" in request(base, "/", host=remote_host)
+        try:
+            request(base, "/", host="attacker.example:8787")
+        except urllib.error.HTTPError as error:
+            assert error.code == 403, error.code
+        else:
+            raise AssertionError("Domain Host must be rejected")
         assert b"/api/settings/jev/test" in request(base, "/app.js")
         password = "Container-smoke-" + uuid.uuid4().hex
         initialized = json.loads(
-            request(base, "/api/auth/setup", {"password": password, "confirm_password": password})
+            request(
+                base,
+                "/api/auth/setup",
+                {"password": password, "confirm_password": password},
+                host=remote_host,
+                origin="http://" + remote_host,
+            )
         )
         assert initialized["initialized"] is True, initialized
         permissions = docker("exec", name, "stat", "-c", "%u:%a", "/app/data/trader.sqlite")
@@ -73,7 +92,7 @@ def main(image):
         restarted = ready(base_url(name))
         assert restarted["auth"]["initialized"] is True, restarted["auth"]
         assert restarted["mode"] == "paper" and restarted["paused"] is True, restarted
-        print("Container verified: UI/API, non-root SQLite permissions, graceful stop, persistence and paused paper mode")
+        print("Container verified: local/remote IPv4 UI/API, admin setup, domain rejection, non-root SQLite permissions, graceful stop, persistence and paused paper mode")
     except Exception:
         subprocess.run(["docker", "logs", "--tail", "50", name], check=False)
         raise

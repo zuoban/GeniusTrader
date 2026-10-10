@@ -19,7 +19,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{net::Ipv4Addr, sync::Arc};
 
 pub struct ApiError(anyhow::Error);
 impl From<anyhow::Error> for ApiError {
@@ -37,6 +37,9 @@ impl IntoResponse for ApiError {
     }
 }
 pub fn router(app: Arc<Application>) -> Router {
+    router_with_bind(app, Ipv4Addr::LOCALHOST)
+}
+pub fn router_with_bind(app: Arc<Application>, bind: Ipv4Addr) -> Router {
     Router::new()
         .route(
             "/",
@@ -80,7 +83,7 @@ pub fn router(app: Arc<Application>) -> Router {
         .route("/api/positions/:symbol/close", post(close))
         .route("/api/markets/refresh", post(refresh))
         .layer(middleware::from_fn_with_state(app.clone(), admin_guard))
-        .layer(middleware::from_fn(local_request_guard))
+        .layer(middleware::from_fn_with_state(bind, request_guard))
         .with_state(app)
 }
 async fn admin_guard(State(app): State<Arc<Application>>, req: Request, next: Next) -> Response {
@@ -108,15 +111,24 @@ async fn admin_guard(State(app): State<Arc<Application>>, req: Request, next: Ne
     }
     next.run(req).await
 }
-async fn local_request_guard(req: Request, next: Next) -> Response {
-    let local_host = req
+async fn request_guard(State(bind): State<Ipv4Addr>, req: Request, next: Next) -> Response {
+    let allowed_host = req
         .headers()
         .get("host")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<axum::http::uri::Authority>().ok())
-        .is_some_and(|a| matches!(a.host(), "localhost" | "127.0.0.1"));
-    if !local_host {
-        return StatusCode::FORBIDDEN.into_response();
+        .is_some_and(|a| {
+            matches!(a.host(), "localhost" | "127.0.0.1")
+                || (!bind.is_loopback() && a.host().parse::<Ipv4Addr>().is_ok())
+        });
+    if !allowed_host {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                json!({"error":"访问地址不在允许范围；远程 IPv4 访问需要使用 --bind 0.0.0.0 启动"}),
+            ),
+        )
+            .into_response();
     }
     if !matches!(*req.method(), Method::GET | Method::HEAD) {
         if req
@@ -325,6 +337,9 @@ mod tests {
     use axum::body::Body;
     use tower::ServiceExt;
     fn app() -> Router {
+        app_with_bind(Ipv4Addr::LOCALHOST)
+    }
+    fn app_with_bind(bind: Ipv4Addr) -> Router {
         let c = Config::default();
         let e = crate::engine::Engine::new(
             crate::config::Mode::Paper,
@@ -334,7 +349,7 @@ mod tests {
             crate::jev::Jev::new().unwrap(),
         )
         .unwrap();
-        router(Application::from_engine(e))
+        router_with_bind(Application::from_engine(e), bind)
     }
     fn request(method: &str, path: &str, body: &str, cookie: Option<&str>) -> Request {
         let mut request = Request::builder()
@@ -449,6 +464,135 @@ mod tests {
         assert_eq!(
             app().oneshot(request).await.unwrap().status(),
             StatusCode::FORBIDDEN
+        );
+    }
+    #[tokio::test]
+    async fn remote_ip_hosts_require_a_non_loopback_bind_and_domains_remain_rejected() {
+        for bind in [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED] {
+            let router = app_with_bind(bind);
+            for host in [
+                "203.0.113.10:8787",
+                "attacker.example:8787",
+                "999.1.2.3:8787",
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/")
+                            .header("host", host)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let expected = if !bind.is_loopback() && host == "203.0.113.10:8787" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                };
+                assert_eq!(response.status(), expected, "bind={bind}, host={host}");
+            }
+        }
+    }
+    fn remote_request(method: &str, path: &str, body: &str, cookie: Option<&str>) -> Request {
+        let mut request = request(method, path, body, cookie);
+        request
+            .headers_mut()
+            .insert("host", HeaderValue::from_static("203.0.113.10:8787"));
+        request.headers_mut().insert(
+            "origin",
+            HeaderValue::from_static("http://203.0.113.10:8787"),
+        );
+        request
+    }
+    #[tokio::test]
+    async fn remote_admin_setup_and_writes_keep_authentication_and_origin_checks() {
+        let router = app_with_bind(Ipv4Addr::UNSPECIFIED);
+        let settings = r#"{"port":8877,"session_minutes":30}"#;
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(remote_request("PUT", "/api/server", settings, None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let setup = router.clone().oneshot(remote_request("POST", "/api/auth/setup",
+            r#"{"password":"remote-api-test-password","confirm_password":"remote-api-test-password"}"#, None)).await.unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+        let cookie = setup.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(remote_request("PUT", "/api/server", settings, None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        for origin in [
+            "http://attacker.example",
+            "http://203.0.113.10:8877",
+            "null",
+        ] {
+            let mut request = remote_request("PUT", "/api/server", settings, Some(cookie));
+            request
+                .headers_mut()
+                .insert("origin", HeaderValue::from_str(origin).unwrap());
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let mut missing_marker = remote_request("PUT", "/api/server", settings, Some(cookie));
+        missing_marker.headers_mut().remove("x-genius-request");
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(missing_marker)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let before = router
+            .clone()
+            .oneshot(remote_request("GET", "/api/server", "", None))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(before.into_body(), 10_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["port"],
+            8787
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(remote_request("PUT", "/api/server", settings, Some(cookie)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let after = router
+            .oneshot(remote_request("GET", "/api/server", "", None))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(after.into_body(), 10_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["port"],
+            8877
         );
     }
     #[tokio::test]

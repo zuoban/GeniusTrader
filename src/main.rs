@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     // Bootstrap paths and the container bind address precede SQLite runtime settings.
     let Some(options) = parse_bootstrap(std::env::args().skip(1))? else {
         println!(
-            "genius-trader [--db data/trader.sqlite] [--bind 127.0.0.1]\n运行配置在页面设置并保存到 SQLite；首次打开页面设置管理员密码。\n容器可指定 --bind 0.0.0.0，并仅向宿主机回环地址映射端口。"
+            "genius-trader [--db data/trader.sqlite] [--bind 127.0.0.1]\n运行配置在页面设置并保存到 SQLite；首次打开页面设置管理员密码。\n使用 --bind 0.0.0.0 支持服务器 IPv4 访问；容器部署时还需映射宿主机端口。"
         );
         return Ok(());
     };
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         tracing::info!("尚未初始化管理员，请打开控制台设置密码；游客可只读查看运行情况");
     }
     let shutdown = Arc::clone(&app);
-    axum::serve(listener, api::router(app))
+    axum::serve(listener, api::router_with_bind(app, options.bind))
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
             shutdown.shutdown().await;
