@@ -2,16 +2,18 @@ use crate::{
     application::Application,
     auth::{self, AuthError, AuthStatus, ChangePasswordInput, PasswordInput, Session, SetupInput},
     config::Config,
+    dashboard::{self, DashboardView},
     domain::{Event, PoolCoin, SymbolInfo},
     engine::Snapshot,
     settings::{
         CredentialTestRequest, CredentialTestResult, JevCredentialTestRequest,
         JevCredentialTestResult, ServerSettings, SettingsPatch, SettingsView,
     },
+    strategy::DecisionRecord,
 };
 use axum::{
     Json, Router,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -64,6 +66,8 @@ pub fn router_with_bind(app: Arc<Application>, bind: Ipv4Addr) -> Router {
             }),
         )
         .route("/api/state", get(state))
+        .route("/api/dashboard", get(dashboard))
+        .route("/api/decisions", get(decisions))
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/setup", post(auth_setup))
         .route("/api/auth/login", post(auth_login))
@@ -188,6 +192,65 @@ async fn state(
         server: app.store.server_settings()?,
     }))
 }
+#[derive(Serialize)]
+struct DashboardResponse {
+    #[serde(flatten)]
+    state: StateResponse,
+    #[serde(flatten)]
+    view: DashboardView,
+}
+async fn dashboard(
+    State(app): State<Arc<Application>>,
+    headers: HeaderMap,
+) -> Result<Json<DashboardResponse>, ApiError> {
+    let engine = app.engine.read().await;
+    let trading = engine.snapshot().await;
+    let view = dashboard::build(
+        &trading,
+        engine.store.latest_decisions(
+            &trading
+                .pool
+                .iter()
+                .map(|coin| coin.symbol.as_str())
+                .collect::<Vec<_>>(),
+        )?,
+        engine.store.recent_decisions(30, None)?,
+    )?;
+    Ok(Json(DashboardResponse {
+        state: StateResponse {
+            trading,
+            settings: app.settings_view().await,
+            auth: app
+                .auth
+                .status(auth::cookie_token(&headers))
+                .map_err(|e| anyhow::anyhow!(e.1))?,
+            server: app.store.server_settings()?,
+        },
+        view,
+    }))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionQuery {
+    limit: Option<usize>,
+    symbol: Option<String>,
+}
+async fn decisions(
+    State(app): State<Arc<Application>>,
+    Query(query): Query<DecisionQuery>,
+) -> Result<Json<Vec<DecisionRecord>>, ApiError> {
+    let limit = query.limit.unwrap_or(30);
+    if !(1..=100).contains(&limit) {
+        return Err(anyhow::anyhow!("limit 必须在 1–100 之间").into());
+    }
+    let symbol = query
+        .symbol
+        .map(|s| s.trim().to_uppercase().replace('/', ""));
+    let engine = app.engine.read().await;
+    Ok(Json(
+        engine.store.recent_decisions(limit, symbol.as_deref())?,
+    ))
+}
 async fn auth_status(
     State(app): State<Arc<Application>>,
     headers: HeaderMap,
@@ -255,9 +318,21 @@ async fn markets(State(app): State<Arc<Application>>) -> Json<Vec<SymbolInfo>> {
     markets.sort_by_key(|a| std::cmp::Reverse(a.quote_volume));
     Json(markets)
 }
-async fn events(State(app): State<Arc<Application>>) -> Result<Json<Vec<Event>>, ApiError> {
+#[derive(Deserialize)]
+struct EventQuery {
+    #[serde(default)]
+    exclude_decisions: bool,
+}
+async fn events(
+    State(app): State<Arc<Application>>,
+    Query(query): Query<EventQuery>,
+) -> Result<Json<Vec<Event>>, ApiError> {
     let e = app.engine.read().await;
-    Ok(Json(e.store.events(100)?))
+    Ok(Json(if query.exclude_decisions {
+        e.store.activity_events(100)?
+    } else {
+        e.store.events(100)?
+    }))
 }
 async fn configure(
     State(app): State<Arc<Application>>,
@@ -453,6 +528,151 @@ mod tests {
         assert_eq!(v["paused"], true);
         assert_eq!(v["mode"], "paper");
         assert!(v.get("api_key").is_none());
+    }
+    #[tokio::test]
+    async fn dashboard_is_public_and_decision_history_survives_engine_restart() {
+        let store = crate::store::Store::open(":memory:", crate::config::Mode::Paper).unwrap();
+        let older = crate::strategy::Decision::wait("older decision");
+        for (symbol, time, decision) in [
+            ("BTCUSDT", 1, older),
+            (
+                "ETHUSDT",
+                2,
+                crate::strategy::Decision::wait("eth decision"),
+            ),
+            (
+                "BTCUSDT",
+                3,
+                crate::strategy::Decision::wait("latest decision"),
+            ),
+        ] {
+            store.event(&Event {
+                time, level: "decision".into(), symbol: Some(symbol.into()),
+                message: "5 分钟收盘决策".into(),
+                detail: json!({"decision":decision,"bar_close":time-1,"candles":[{"private_input":"not in summary"}]}),
+            }).unwrap();
+        }
+        // Keep a decision beyond the event feed's window; the card must still recover it.
+        for time in 4..110 {
+            store
+                .event(&Event {
+                    time,
+                    level: "info".into(),
+                    symbol: None,
+                    message: "tick".into(),
+                    detail: json!({}),
+                })
+                .unwrap();
+        }
+        store
+            .for_mode(crate::config::Mode::Live)
+            .event(&Event {
+                time: 110,
+                level: "decision".into(),
+                symbol: Some("BTCUSDT".into()),
+                message: "live only".into(),
+                detail: json!({"decision":crate::strategy::Decision::wait("live only")}),
+            })
+            .unwrap();
+        let mut book = crate::domain::Book::default();
+        book.pool.insert(
+            "BTCUSDT".into(),
+            PoolCoin {
+                symbol: "BTCUSDT".into(),
+                enabled: false,
+                config: None,
+            },
+        );
+        store
+            .save(crate::config::Mode::Paper, &Config::default(), &book)
+            .unwrap();
+        // Application::new restores the portfolio while its in-memory decisions start empty.
+        let router = router(Application::new(store).unwrap());
+        let response = router
+            .clone()
+            .oneshot(request("GET", "/api/dashboard", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["auth"]["authenticated"], false);
+        assert_eq!(
+            value["watchlist"][0]["latest_decision"]["source"],
+            "latest decision"
+        );
+        assert_eq!(value["watchlist"][0]["latest_decision"]["time"], 3);
+        assert!(value["watchlist"][0]["price"].is_null());
+        assert_eq!(value["watchlist"][0]["quote_stale"], true);
+        assert_eq!(value["recent_decisions"].as_array().unwrap().len(), 3);
+        assert!(
+            !value["recent_decisions"]
+                .to_string()
+                .contains("private_input")
+        );
+        assert!(
+            value["recent_decisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|d| d["source"] != "live only")
+        );
+        assert!(value.get("api_key").is_none());
+        let response = router
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/api/decisions?symbol=btc%2Fusdt&limit=1",
+                "",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 100_000)
+            .await
+            .unwrap();
+        let decisions: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decisions.as_array().unwrap().len(), 1);
+        assert_eq!(decisions[0]["source"], "latest decision");
+        let response = router
+            .oneshot(request(
+                "GET",
+                "/api/events?exclude_decisions=true",
+                "",
+                None,
+            ))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 100_000)
+            .await
+            .unwrap();
+        let events: Vec<Event> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(events.len(), 100);
+        assert!(events.iter().all(|e| e.level != "decision"));
+    }
+    #[tokio::test]
+    async fn decision_query_limits_are_bounded() {
+        let router = app();
+        for query in [
+            "limit=0",
+            "limit=101",
+            "limit=-1",
+            "limit=nope",
+            "extra=true",
+        ] {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(request("GET", &format!("/api/decisions?{query}"), "", None))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
     }
     #[tokio::test]
     async fn non_local_host_is_rejected() {

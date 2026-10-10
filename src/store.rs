@@ -2,6 +2,7 @@ use crate::{
     config::{Config, Mode},
     domain::{Book, Event},
     settings::{AppSettings, ServerSettings},
+    strategy::DecisionRecord,
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -95,6 +96,8 @@ impl Store {
                 tx.execute("UPDATE events SET mode=?1", [tag(mode)])?;
             }
         }
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS events_decision_lookup ON events(mode, json_extract(body, '$.level'), json_extract(body, '$.symbol'), id);
+            CREATE INDEX IF NOT EXISTS events_decision_recent ON events(mode, json_extract(body, '$.level'), id);")?;
         tx.commit()?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
@@ -274,13 +277,71 @@ impl Store {
         Ok(())
     }
     pub fn events(&self, limit: usize) -> Result<Vec<Event>> {
+        self.event_history(limit, false)
+    }
+    pub fn activity_events(&self, limit: usize) -> Result<Vec<Event>> {
+        self.event_history(limit, true)
+    }
+    fn event_history(&self, limit: usize, exclude_decisions: bool) -> Result<Vec<Event>> {
         let c = self.connection.lock().unwrap();
-        let mut stmt =
-            c.prepare("SELECT body FROM events WHERE mode=?1 ORDER BY id DESC LIMIT ?2")?;
-        let texts = stmt.query_map(params![tag(self.mode), limit.min(500) as i64], |r| {
-            r.get::<_, String>(0)
-        })?;
+        let mut stmt = c.prepare("SELECT body FROM events WHERE mode=?1 AND (?3=0 OR json_extract(body,'$.level')!='decision') ORDER BY id DESC LIMIT ?2")?;
+        let texts = stmt.query_map(
+            params![tag(self.mode), limit.min(500) as i64, exclude_decisions],
+            |r| r.get::<_, String>(0),
+        )?;
         texts.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
+    pub fn recent_decisions(
+        &self,
+        limit: usize,
+        symbol: Option<&str>,
+    ) -> Result<Vec<DecisionRecord>> {
+        self.decision_records(limit.min(100), symbol)
+    }
+    pub fn latest_decisions(&self, symbols: &[&str]) -> Result<Vec<DecisionRecord>> {
+        // Each lookup uses the symbol index and stops at the first row, even with a long history.
+        let mut decisions = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            decisions.extend(self.recent_decisions(1, Some(symbol))?);
+        }
+        Ok(decisions)
+    }
+    fn decision_records(&self, limit: usize, symbol: Option<&str>) -> Result<Vec<DecisionRecord>> {
+        let c = self.connection.lock().unwrap();
+        let selection = if symbol.is_some() {
+            "AND json_extract(body,'$.symbol')=?2"
+        } else {
+            "AND ?2 IS NULL"
+        };
+        let sql = format!(
+            "SELECT id,time,json_extract(body,'$.symbol'),json_extract(body,'$.detail.bar_close'),json_extract(body,'$.detail.decision')
+             FROM events WHERE mode=?1 AND json_extract(body,'$.level')='decision'
+             AND json_extract(body,'$.symbol') IS NOT NULL {selection} ORDER BY id DESC LIMIT ?3"
+        );
+        let mut stmt = c.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![tag(self.mode), symbol, limit.min(i64::MAX as usize) as i64],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
+        )?;
+        rows.map(|row| {
+            let (id, time, symbol, bar_close, decision) = row?;
+            Ok(DecisionRecord {
+                id,
+                time,
+                symbol,
+                bar_close,
+                decision: serde_json::from_str(&decision)?,
+            })
+        })
+        .collect()
     }
     /// Import a previous per-mode database once; never read .env or overwrite a portfolio.
     pub fn import_legacy(&self, path: &Path) -> Result<bool> {

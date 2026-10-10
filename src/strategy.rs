@@ -56,6 +56,16 @@ pub struct Decision {
     #[serde(default)]
     pub request_bytes: usize,
 }
+/// A persisted decision summary; deliberately excludes candles and request inputs.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionRecord {
+    pub id: i64,
+    pub time: i64,
+    pub symbol: String,
+    pub bar_close: Option<i64>,
+    #[serde(flatten)]
+    pub decision: Decision,
+}
 impl Decision {
     pub fn wait(source: &str) -> Self {
         Self {

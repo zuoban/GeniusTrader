@@ -2,6 +2,7 @@ pub mod api;
 pub mod application;
 pub mod auth;
 pub mod config;
+pub mod dashboard;
 pub mod domain;
 pub mod engine;
 pub mod exchange;

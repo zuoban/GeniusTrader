@@ -61,7 +61,14 @@ def main(image):
         state = ready(base)
         assert state["mode"] == "paper" and state["paused"] is True, state
         assert state["auth"]["initialized"] is False, state["auth"]
-        assert b"Genius" in request(base, "/")
+        page = request(base, "/")
+        assert b"Genius" in page
+        assert b'id="watchlist"' in page and b'id="decisions-body"' in page
+        dashboard = json.loads(request(base, "/api/dashboard"))
+        assert dashboard["mode"] == "paper" and dashboard["paused"] is True
+        for field in ("watchlist", "position_views", "open_orders", "recent_decisions"):
+            assert dashboard[field] == [], (field, dashboard[field])
+        assert json.loads(request(base, "/api/decisions?limit=30")) == []
         remote_host = "203.0.113.10:8787"
         assert b"Genius" in request(base, "/", host=remote_host)
         try:
@@ -70,7 +77,8 @@ def main(image):
             assert error.code == 403, error.code
         else:
             raise AssertionError("Domain Host must be rejected")
-        assert b"/api/settings/jev/test" in request(base, "/app.js")
+        app_js = request(base, "/app.js")
+        assert b"/api/settings/jev/test" in app_js and b"/api/dashboard" in app_js
         password = "Container-smoke-" + uuid.uuid4().hex
         initialized = json.loads(
             request(
@@ -92,7 +100,10 @@ def main(image):
         restarted = ready(base_url(name))
         assert restarted["auth"]["initialized"] is True, restarted["auth"]
         assert restarted["mode"] == "paper" and restarted["paused"] is True, restarted
-        print("Container verified: local/remote IPv4 UI/API, admin setup, domain rejection, non-root SQLite permissions, graceful stop, persistence and paused paper mode")
+        restarted_dashboard = json.loads(request(base_url(name), "/api/dashboard"))
+        assert restarted_dashboard["auth"]["initialized"] is True
+        assert restarted_dashboard["mode"] == "paper" and restarted_dashboard["paused"] is True
+        print("Container verified: dashboard/decision APIs, watchlist UI, local/remote IPv4 access, admin setup, domain rejection, non-root SQLite permissions, graceful stop, persistence and paused paper mode")
     except Exception:
         subprocess.run(["docker", "logs", "--tail", "50", name], check=False)
         raise

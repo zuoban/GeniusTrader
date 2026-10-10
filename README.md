@@ -20,6 +20,10 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 总览的「合约账户资产」展示保证金余额、钱包余额、未实现盈亏、可用余额和初始保证金占用，并提供资产分布、原币余额明细及金额隐藏。测试网 / 实盘读取币安账户汇总：单资产模式以 USDT 显示，联合保证金模式以 USD 显示。资产分布按正钱包余额乘以币安资产 USD 指数计算；缺少或过期的指数不补造估值，保留原币余额并提示占比等待更新。账户资产约每 10 秒独立同步；失败时保留上次数据并标记延迟，不影响订单 / 持仓管理。Paper 展示本机模拟资产，与币安账户资产明确区分。
 
+控制台以「我的自选」卡片展示币对，支持搜索以及全部 / 有持仓 / 有挂单 / 已停用筛选。每张卡片汇总盘口中间价、报价状态、持仓方向 / 杠杆 / 数量 / 均价 / 浮盈亏 / 止盈价、挂单角色 / 买卖方向 / 剩余数量，以及最近决策的方向、置信度、模型与时间。缺失报价显示「—」，过期报价标记待更新。移出自选的持仓与委托仍显示在独立的持仓、挂单面板中。
+
+「最近决策」展示当前模式最近 30 次评估，展开可查看概率、指标、K 线收盘时间和模型用量。决策摘要从 SQLite 恢复，不受最近事件条数或服务重启影响；自动刷新保留已展开的详情。决策方向表示模型评估，不代表已经成交。外部持仓或挂单差异会单独提示。
+
 管理员验证后，在页面点击「配置交易参数」：
 
 - **策略与交易**：金额、净止盈、指标参数、Jev 模型、置信度、杠杆、持仓上限、模拟本金等。
@@ -34,14 +38,14 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 ## GitHub Packages 容器
 
-镜像：`ghcr.io/zuoban/geniustrader:0.1.1`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
+镜像：`ghcr.io/zuoban/geniustrader:0.1.2`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
 
 ```sh
-rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.1
+rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.2
 rtk proxy docker run -d --name genius-trader \
   --publish 8787:8787 \
   --mount type=volume,source=genius-trader-data,target=/app/data \
-  ghcr.io/zuoban/geniustrader:0.1.1
+  ghcr.io/zuoban/geniustrader:0.1.2
 ```
 
 本机打开 http://127.0.0.1:8787，服务器部署则打开 `http://服务器IPv4:8787`，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
@@ -72,7 +76,7 @@ rtk proxy docker compose up -d
 rtk proxy docker compose ps
 ```
 
-`compose.yaml` 使用已发布的 `0.1.1` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
+`compose.yaml` 使用已发布的 `0.1.2` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
 
 打开 `http://服务器IPv4:8787`（本机部署使用 http://127.0.0.1:8787），首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"8877:8787"`，再访问 `http://服务器IPv4:8877`；容器端口仍为 8787。
 
@@ -213,9 +217,11 @@ Jev 密钥配置提供「测试连接」：填写时测试当前输入，留空�
 
 | 方法 | 路径 | 内容 |
 | --- | --- | --- |
+| GET | `/api/dashboard` | 控制台聚合快照：兼容 state 字段，新增 updated_at、watchlist、position_views、open_orders、recent_decisions；仅当前交易模式 |
+| GET | `/api/decisions?limit=30&symbol=BTCUSDT` | 最近决策摘要；limit 为 1–100，symbol 可选、忽略大小写并支持 BTC/USDT；按记录顺序倒序，不包含原始行情输入 |
 | GET | `/api/state` | 配置、币池、持仓、订单、收益、健康状态、account_assets 及其同步时间 / 错误状态 |
 | GET | `/api/markets` | 可交易币对，按成交额降序 |
-| GET | `/api/events` | 最近 100 条事件及决策输入 |
+| GET | `/api/events` | 最近 100 条事件及决策输入；加 `?exclude_decisions=true` 只读取运行事件 |
 | GET | `/api/auth/status` | 是否初始化、当前请求是否登录、到期时间 |
 | POST | `/api/auth/setup` | 首次设置管理员密码：password / confirm_password |
 | POST | `/api/auth/login` | 管理员密码登录：password |
@@ -233,6 +239,8 @@ Jev 密钥配置提供「测试连接」：填写时测试当前输入，留空�
 | POST | `/api/control` | `{running: true/false}` |
 | POST | `/api/positions/{symbol}/close` | 手动平仓 |
 | POST | `/api/markets/refresh` | 更新规则与排名 |
+
+`watchlist` 为每个自选币对聚合有效 notional_usdt / profit_usdt、quote / price / quote_stale、position、orders、latest_decision 及 external_position / external_order。`position_views` 保留原持仓字段并增加 mark_price / unrealized / quote_stale；缺失盘口时前两者为 null，金额仍使用十进制字符串。`open_orders` 保留原委托字段并增加 order_side（BUY / SELL，退出方向与持仓相反）及 remaining_quantity（委托数量减已核对成交数量，不小于零）。`latest_decision` / `recent_decisions` 包含 id、time、symbol、bar_close 以及结构化决策字段；time 和 bar_close 为 Unix 毫秒。
 
 单币 `config` 字段：`notional_usdt`、`profit_usdt`、`strategy`（指标参数）、`decision_mode`（固定为 `jev`，可为 null 继承）、`allowed_direction`；未覆盖字段为 null。时间为 Unix 毫秒。
 
