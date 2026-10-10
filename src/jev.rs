@@ -379,6 +379,7 @@ mod tests {
             ask_qty: 1.into(),
             time: now_ms(),
             exchange_time: None,
+            update_id: None,
         };
         let indicators = strategy::indicators(&bars, &config.strategy).unwrap();
         for (symbol, asset) in [("BTCUSDT", "USDT"), ("BTCUSDC", "USDC")] {
@@ -404,6 +405,7 @@ mod tests {
             ask_qty: 1.into(),
             time: now_ms(),
             exchange_time: None,
+            update_id: None,
         };
         for count in [120, 500] {
             for price in [0.0000123456789, 123.456789, 65000.1234567] {
@@ -484,6 +486,7 @@ mod tests {
             ask_qty: 1.into(),
             time: now_ms(),
             exchange_time: None,
+            update_id: None,
         };
         let bars = candles();
         let indicators = strategy::indicators(&bars, &c.strategy).unwrap();
@@ -627,6 +630,7 @@ mod tests {
             ask_qty: 1.into(),
             time: crate::domain::now_ms(),
             exchange_time: None,
+            update_id: None,
         };
         for (status, reason) in [
             (401, "密钥"),
@@ -745,6 +749,7 @@ mod tests {
             ask_qty: 1.into(),
             time: crate::domain::now_ms(),
             exchange_time: None,
+            update_id: None,
         };
         let result = jev.decide("XUSDT", &bars, &quote, &c).await.unwrap();
         assert_eq!(result.action, Action::Long);

@@ -1,15 +1,135 @@
 use crate::{
     config::{Config, Mode},
-    domain::{Book, Event},
+    domain::{Book, ClosedTrade, Event},
+    rate_limit::PersistedCooldown,
     settings::{AppSettings, ServerSettings},
     strategy::DecisionRecord,
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rust_decimal::Decimal;
 use std::{
     path::Path,
+    str::FromStr,
     sync::{Arc, Mutex},
 };
+
+const HISTORY_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS exchange_cooldowns (origin TEXT PRIMARY KEY, body TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS closed_trades (
+        mode TEXT NOT NULL, symbol TEXT NOT NULL, opened_at INTEGER NOT NULL,
+        closed_at INTEGER NOT NULL, net_profit TEXT NOT NULL, body TEXT NOT NULL,
+        PRIMARY KEY(mode,symbol,opened_at,closed_at));
+    CREATE INDEX IF NOT EXISTS closed_trades_recent ON closed_trades(mode,closed_at DESC);
+    CREATE TABLE IF NOT EXISTS funding_income (
+        mode TEXT NOT NULL, id TEXT NOT NULL, symbol TEXT, time INTEGER, body TEXT,
+        PRIMARY KEY(mode,id));
+    CREATE TABLE IF NOT EXISTS history_totals (
+        mode TEXT PRIMARY KEY, realized_net TEXT NOT NULL);
+";
+
+fn put_trade(tx: &Transaction<'_>, mode: &str, trade: &ClosedTrade) -> Result<()> {
+    let body = serde_json::to_string(trade)?;
+    let previous: Option<(String, String)> = tx.query_row(
+        "SELECT net_profit,body FROM closed_trades WHERE mode=?1 AND symbol=?2 AND opened_at=?3 AND closed_at=?4",
+        params![mode,trade.symbol,trade.opened_at,trade.closed_at],
+        |r| Ok((r.get(0)?,r.get(1)?)),
+    ).optional()?;
+    if previous.as_ref().is_some_and(|(_, old)| old == &body) {
+        return Ok(());
+    }
+    let old_net = previous
+        .map(|(net, _)| Decimal::from_str(&net))
+        .transpose()?
+        .unwrap_or_default();
+    let total: Option<String> = tx
+        .query_row(
+            "SELECT realized_net FROM history_totals WHERE mode=?1",
+            [mode],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let total = total
+        .map(|net| Decimal::from_str(&net))
+        .transpose()?
+        .unwrap_or_default()
+        + trade.net_profit
+        - old_net;
+    tx.execute("INSERT INTO closed_trades VALUES(?1,?2,?3,?4,?5,?6)
+        ON CONFLICT(mode,symbol,opened_at,closed_at) DO UPDATE SET net_profit=excluded.net_profit,body=excluded.body",
+        params![mode,trade.symbol,trade.opened_at,trade.closed_at,trade.net_profit.to_string(),body])?;
+    tx.execute("INSERT INTO history_totals VALUES(?1,?2) ON CONFLICT(mode) DO UPDATE SET realized_net=excluded.realized_net", params![mode,total.to_string()])?;
+    Ok(())
+}
+
+fn save_history(tx: &Transaction<'_>, mode: &str, book: &Book) -> Result<()> {
+    for trade in &book.closed_trades {
+        put_trade(tx, mode, trade)?;
+    }
+    for income in &book.funding_income {
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO funding_income(mode,id,symbol,time,body) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                mode,
+                income.id,
+                income.symbol,
+                income.time,
+                serde_json::to_string(income)?
+            ],
+        )?;
+        if inserted == 0 {
+            continue;
+        }
+        // Recent trades were corrected in memory alongside active positions.
+        // Correct archived trades in this same transaction, using exact decimals.
+        let trades = {
+            let mut q = tx.prepare("SELECT body FROM closed_trades WHERE mode=?1 AND symbol=?2 AND opened_at<=?3 AND closed_at>?3")?;
+            q.query_map(params![mode, income.symbol, income.time], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for body in trades {
+            let mut trade: ClosedTrade = serde_json::from_str(&body)?;
+            if book.closed_trades.iter().any(|local| {
+                local.symbol == trade.symbol
+                    && local.opened_at == trade.opened_at
+                    && local.closed_at == trade.closed_at
+            }) {
+                continue;
+            }
+            trade.net_profit += income.amount;
+            put_trade(tx, mode, &trade)?;
+        }
+    }
+    for id in &book.funding_ids {
+        tx.execute(
+            "INSERT OR IGNORE INTO funding_income(mode,id) VALUES(?1,?2)",
+            params![mode, id],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_history(tx: &Transaction<'_>) -> Result<()> {
+    let rows = {
+        let mut q = tx.prepare("SELECT mode,book FROM portfolios")?;
+        q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (mode, body) in rows {
+        let book: Book = serde_json::from_str(&body).context("迁移交易历史失败")?;
+        if book.closed_trades.is_empty() && book.funding_ids.is_empty() {
+            continue;
+        }
+        save_history(tx, &mode, &book)?;
+        tx.execute(
+            "UPDATE portfolios SET book=?2 WHERE mode=?1",
+            params![mode, serde_json::to_string(&book)?],
+        )?;
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -41,7 +161,41 @@ fn decision_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionRecord> 
         })?,
     })
 }
+fn recent_trades(c: &Connection, mode: &str, limit: usize) -> Result<Vec<ClosedTrade>> {
+    let mut q = c.prepare_cached(
+        "SELECT body FROM closed_trades WHERE mode=?1 ORDER BY closed_at DESC,rowid DESC LIMIT ?2",
+    )?;
+    let rows = q.query_map(params![mode, limit.min(100) as i64], |r| {
+        r.get::<_, String>(0)
+    })?;
+    let mut trades = rows
+        .map(|row| Ok(serde_json::from_str(&row?)?))
+        .collect::<Result<Vec<_>>>()?;
+    trades.reverse();
+    Ok(trades)
+}
 impl Store {
+    pub(crate) fn load_cooldown(&self, origin: &str) -> Result<Option<PersistedCooldown>> {
+        let body: Option<String> = self
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT body FROM exchange_cooldowns WHERE origin=?1",
+                [origin],
+                |r| r.get(0),
+            )
+            .optional()?;
+        body.map(|body| serde_json::from_str(&body).context("读取限流退避记录失败"))
+            .transpose()
+    }
+    pub(crate) fn save_cooldown(&self, origin: &str, state: &PersistedCooldown) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO exchange_cooldowns(origin,body) VALUES(?1,?2) ON CONFLICT(origin) DO UPDATE SET body=excluded.body",
+            params![origin, serde_json::to_string(state)?],
+        )?;
+        Ok(())
+    }
     pub fn open(path: &str, mode: Mode) -> Result<Self> {
         if path != ":memory:" {
             if let Some(parent) = Path::new(path)
@@ -116,6 +270,8 @@ impl Store {
         }
         tx.execute_batch("CREATE INDEX IF NOT EXISTS events_decision_lookup ON events(mode, json_extract(body, '$.level'), json_extract(body, '$.symbol'), id);
             CREATE INDEX IF NOT EXISTS events_decision_recent ON events(mode, json_extract(body, '$.level'), id);")?;
+        tx.execute_batch(HISTORY_SCHEMA)?;
+        migrate_history(&tx)?;
         tx.commit()?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
@@ -140,24 +296,68 @@ impl Store {
             )
             .optional()?;
         row.map(|(config, book)| {
-            Ok((
-                serde_json::from_str(&config).context("读取配置失败")?,
-                serde_json::from_str(&book).context("读取持仓失败")?,
-            ))
+            let mut book: Book = serde_json::from_str(&book).context("读取持仓失败")?;
+            book.closed_trades = recent_trades(&c, tag(self.mode), 100)?;
+            Ok((serde_json::from_str(&config).context("读取配置失败")?, book))
         })
         .transpose()
     }
-    pub fn save(&self, mode: Mode, config: &Config, book: &Book) -> Result<()> {
+    pub fn save(&self, mode: Mode, config: &Config, book: &Book) -> Result<Decimal> {
         ensure!(mode == self.mode, "禁止跨交易模式写入持仓");
         let config = serde_json::to_string(config)?;
+        let mut c = self.connection.lock().unwrap();
+        let tx = c.transaction()?;
+        save_history(&tx, tag(mode), book)?;
         let book = serde_json::to_string(book)?;
-        self.connection.lock().unwrap().execute(
+        tx.execute(
             "INSERT INTO portfolios(mode,config,book) VALUES(?1,?2,?3)
              ON CONFLICT(mode) DO UPDATE SET config=excluded.config,book=excluded.book
              WHERE portfolios.config != excluded.config OR portfolios.book != excluded.book",
             params![tag(mode), config, book],
         )?;
-        Ok(())
+        let total: Option<String> = tx
+            .query_row(
+                "SELECT realized_net FROM history_totals WHERE mode=?1",
+                [tag(mode)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let total = total
+            .map(|v| Decimal::from_str(&v))
+            .transpose()?
+            .unwrap_or_default();
+        tx.commit()?;
+        Ok(total)
+    }
+    pub fn history_total(&self) -> Result<Decimal> {
+        let total: Option<String> = self
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT realized_net FROM history_totals WHERE mode=?1",
+                [tag(self.mode)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(total
+            .map(|v| Decimal::from_str(&v))
+            .transpose()?
+            .unwrap_or_default())
+    }
+    pub fn has_funding(&self, id: &str) -> Result<bool> {
+        Ok(self.connection.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM funding_income WHERE mode=?1 AND id=?2)",
+            params![tag(self.mode), id],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn has_closed_symbol(&self, symbol: &str) -> Result<bool> {
+        Ok(self.connection.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM closed_trades WHERE mode=?1 AND symbol=?2)",
+            params![tag(self.mode), symbol],
+            |r| r.get(0),
+        )?)
     }
     #[cfg(test)]
     pub(crate) fn with_test_connection<T>(&self, inspect: impl FnOnce(&Connection) -> T) -> T {
@@ -382,14 +582,15 @@ impl Store {
         };
         let mode: Mode = serde_json::from_str(&mode)?;
         let _: Config = serde_json::from_str(&config)?;
-        let _: Book = serde_json::from_str(&book)?;
+        let history: Book = serde_json::from_str(&book)?;
         let mut dest = self.connection.lock().unwrap();
         let tx = dest.transaction()?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO portfolios(mode,config,book) VALUES(?1,?2,?3)",
-            params![tag(mode), config, book],
+            params![tag(mode), config, serde_json::to_string(&history)?],
         )?;
         if inserted == 1 {
+            save_history(&tx, tag(mode), &history)?;
             let mut events = source.prepare("SELECT time,body FROM events ORDER BY id")?;
             let rows =
                 events.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
@@ -408,6 +609,220 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn trade(index: i64) -> ClosedTrade {
+        ClosedTrade {
+            symbol: "XUSDT".into(),
+            side: crate::domain::Action::Long,
+            opened_at: index * 20,
+            closed_at: index * 20 + 10,
+            net_profit: Decimal::new(1, 1),
+            accounting_complete: true,
+        }
+    }
+    #[test]
+    fn history_is_bounded_in_book_but_totals_and_modes_cover_all_trades() {
+        let store = Store::open(":memory:", Mode::Paper).unwrap();
+        let book = Book {
+            closed_trades: (0..150).map(trade).collect(),
+            funding_ids: vec!["legacy-id".into()],
+            ..Default::default()
+        };
+        store.save(Mode::Paper, &Config::default(), &book).unwrap();
+        let restored = store.load().unwrap().unwrap().1;
+        assert_eq!(restored.closed_trades.len(), 100);
+        assert_eq!(restored.closed_trades[0].opened_at, 1000);
+        assert_eq!(store.history_total().unwrap(), Decimal::from(15));
+        assert!(store.has_funding("legacy-id").unwrap());
+        assert!(restored.funding_ids.is_empty());
+        let live = store.for_mode(Mode::Live);
+        assert_eq!(live.history_total().unwrap(), Decimal::ZERO);
+        assert!(!live.has_funding("legacy-id").unwrap());
+        let before = store.with_test_connection(Connection::total_changes);
+        store
+            .save(Mode::Paper, &Config::default(), &restored)
+            .unwrap();
+        assert_eq!(
+            store.with_test_connection(Connection::total_changes),
+            before
+        );
+        store.with_test_connection(|c| {
+            let body:String=c.query_row("SELECT book FROM portfolios WHERE mode='paper'",[],|r|r.get(0)).unwrap();
+            let json:serde_json::Value=serde_json::from_str(&body).unwrap();
+            assert!(json.get("closed_trades").is_none() && json.get("funding_ids").is_none() && json.get("funding_income").is_none());
+            let count:i64=c.query_row("SELECT count(*) FROM closed_trades",[],|r|r.get(0)).unwrap();
+            assert_eq!(count,150);
+            let mut q=c.prepare("EXPLAIN QUERY PLAN SELECT body FROM closed_trades WHERE mode='paper' ORDER BY closed_at DESC,rowid DESC LIMIT 100").unwrap();
+            let plan=q.query_map([],|r|r.get::<_,String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert!(plan.iter().any(|p|p.contains("closed_trades_recent")),"{plan:?}");
+        });
+    }
+    #[test]
+    fn late_funding_corrects_archived_and_recent_trades_exactly_once() {
+        let store = Store::open(":memory:", Mode::Testnet).unwrap();
+        store
+            .save(
+                Mode::Testnet,
+                &Config::default(),
+                &Book {
+                    closed_trades: (0..150).map(trade).collect(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut book = store.load().unwrap().unwrap().1;
+        let income = crate::domain::FundingIncome {
+            id: "late".into(),
+            symbol: "XUSDT".into(),
+            asset: "USDT".into(),
+            time: 5,
+            amount: Decimal::new(17, 8),
+        };
+        book.funding_income.push(income.clone());
+        book.funding_ids.push(income.id.clone());
+        store
+            .save(Mode::Testnet, &Config::default(), &book)
+            .unwrap();
+        store
+            .save(Mode::Testnet, &Config::default(), &book)
+            .unwrap();
+        assert_eq!(
+            store.history_total().unwrap(),
+            Decimal::from(15) + income.amount
+        );
+        let recent = crate::domain::FundingIncome {
+            id: "recent".into(),
+            time: 2985,
+            amount: Decimal::new(-5, 3),
+            ..income.clone()
+        };
+        book.closed_trades.last_mut().unwrap().net_profit += recent.amount;
+        book.funding_income.push(recent.clone());
+        book.funding_ids.push(recent.id.clone());
+        store
+            .save(Mode::Testnet, &Config::default(), &book)
+            .unwrap();
+        store
+            .save(Mode::Testnet, &Config::default(), &book)
+            .unwrap();
+        assert_eq!(
+            store.history_total().unwrap(),
+            Decimal::from(15) + income.amount + recent.amount
+        );
+        store.with_test_connection(|c| {
+            let body: String = c
+                .query_row(
+                    "SELECT body FROM closed_trades WHERE mode='testnet' AND opened_at=0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<ClosedTrade>(&body)
+                    .unwrap()
+                    .net_profit,
+                Decimal::new(1, 1) + income.amount
+            );
+        });
+        assert_eq!(
+            store.for_mode(Mode::Live).history_total().unwrap(),
+            Decimal::ZERO
+        );
+    }
+    #[test]
+    fn history_and_funding_roll_back_with_a_failed_portfolio_save() {
+        let store = Store::open(":memory:", Mode::Paper).unwrap();
+        store
+            .save(Mode::Paper, &Config::default(), &Book::default())
+            .unwrap();
+        store.with_test_connection(|c|c.execute_batch("CREATE TRIGGER fail_portfolio BEFORE UPDATE ON portfolios BEGIN SELECT RAISE(ABORT,'test failure'); END").unwrap());
+        let book = Book {
+            paper_cash: Decimal::ONE,
+            closed_trades: vec![trade(0)],
+            funding_ids: vec!["new-id".into()],
+            ..Default::default()
+        };
+        assert!(store.save(Mode::Paper, &Config::default(), &book).is_err());
+        assert_eq!(store.history_total().unwrap(), Decimal::ZERO);
+        assert!(!store.has_funding("new-id").unwrap());
+        assert!(store.load().unwrap().unwrap().1.closed_trades.is_empty());
+        store.with_test_connection(|c| c.execute_batch("DROP TRIGGER fail_portfolio").unwrap());
+        store.save(Mode::Paper, &Config::default(), &book).unwrap();
+        assert_eq!(store.history_total().unwrap(), Decimal::new(1, 1));
+        assert!(store.has_funding("new-id").unwrap());
+    }
+    #[test]
+    fn legacy_history_migrates_once_and_survives_reopening() {
+        let path = std::env::temp_dir().join(format!(
+            "genius-history-{}-{}.sqlite",
+            std::process::id(),
+            crate::domain::now_ms()
+        ));
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("CREATE TABLE portfolios(mode TEXT PRIMARY KEY,config TEXT NOT NULL,book TEXT NOT NULL)").unwrap();
+            let mut body = serde_json::to_value(Book::default()).unwrap();
+            body["closed_trades"] = serde_json::json!([trade(0), trade(1)]);
+            body["funding_ids"] = serde_json::json!(["old-fee", "old-fee"]);
+            c.execute(
+                "INSERT INTO portfolios VALUES('testnet',?1,?2)",
+                params![
+                    serde_json::to_string(&Config::default()).unwrap(),
+                    body.to_string()
+                ],
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let store = Store::open(path.to_str().unwrap(), Mode::Testnet).unwrap();
+            assert_eq!(store.load().unwrap().unwrap().1.closed_trades.len(), 2);
+            assert_eq!(store.history_total().unwrap(), Decimal::new(2, 1));
+            assert!(store.has_funding("old-fee").unwrap());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn failed_history_migration_keeps_original_portfolios_and_rolls_back_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "genius-history-invalid-{}-{}.sqlite",
+            std::process::id(),
+            crate::domain::now_ms()
+        ));
+        let mut body = serde_json::to_value(Book::default()).unwrap();
+        body["closed_trades"] = serde_json::json!([trade(0)]);
+        let original = body.to_string();
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("CREATE TABLE portfolios(mode TEXT PRIMARY KEY,config TEXT NOT NULL,book TEXT NOT NULL)").unwrap();
+            c.execute(
+                "INSERT INTO portfolios VALUES('paper',?1,?2)",
+                params![serde_json::to_string(&Config::default()).unwrap(), original],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO portfolios VALUES('live','{}','invalid JSON')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(Store::open(path.to_str().unwrap(), Mode::Paper).is_err());
+        let c = Connection::open(&path).unwrap();
+        let unchanged: String = c
+            .query_row("SELECT book FROM portfolios WHERE mode='paper'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(unchanged, original);
+        let migrated: bool = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='closed_trades')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!migrated);
+        drop(c);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn batch_latest_decisions_preserves_order_isolation_and_indexed_lookup() {
         let store = Store::open(":memory:", Mode::Paper).unwrap();

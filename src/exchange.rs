@@ -4,6 +4,7 @@ use crate::{
     domain::*,
     rate_limit::{AdmissionError, RequestThrottle, request_cost, retry_after, shared_throttle},
     settings::Credentials,
+    store::Store,
 };
 use anyhow::{Context, Result, ensure};
 use hmac::{Hmac, Mac};
@@ -46,6 +47,7 @@ enum ExchangeErrorKind {
     InvalidJson,
     Api,
     Cooldown(Duration),
+    CooldownPersistence,
     Budget(Duration),
 }
 impl ExchangeErrorKind {
@@ -121,6 +123,7 @@ impl std::fmt::Display for ExchangeError {
             ExchangeErrorKind::IncompleteJson => "返回不完整 JSON，数据可能被截断",
             ExchangeErrorKind::InvalidJson => "返回无效 JSON，请检查网络或代理是否返回了其他内容",
             ExchangeErrorKind::Cooldown(_) => "限流退避中，暂缓发送请求",
+            ExchangeErrorKind::CooldownPersistence => "限流退避状态读写失败，请求尚未发送",
             ExchangeErrorKind::Budget(_) => "请求权重预算不足，暂缓发送请求",
             ExchangeErrorKind::Api => match self.code {
                 -1021 => "请求时间校验失败，请检查系统时间或网络延迟",
@@ -207,6 +210,9 @@ pub struct Binance {
     offset: AtomicI64,
     throttle: Arc<Mutex<RequestThrottle>>,
     position_mode_lock: Mutex<()>,
+    cooldown_store: Option<Store>,
+    #[cfg(test)]
+    pub(crate) stream_base: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -341,6 +347,8 @@ impl Binance {
             offset: AtomicI64::new(0),
             throttle,
             position_mode_lock: Mutex::new(()),
+            cooldown_store: None,
+            stream_base: None,
         }
     }
     pub fn new(mode: Mode) -> Result<Self> {
@@ -369,13 +377,93 @@ impl Binance {
             offset: AtomicI64::new(0),
             throttle,
             position_mode_lock: Mutex::new(()),
+            cooldown_store: None,
+            #[cfg(test)]
+            stream_base: None,
         })
     }
     pub fn configured(&self) -> bool {
         self.key.is_some() && self.secret.is_some()
     }
+    pub(crate) fn with_store(mut self, store: Store) -> Self {
+        self.cooldown_store = Some(store);
+        self
+    }
+    pub(crate) async fn stream_admission(&self) -> Result<()> {
+        // Establish the persisted gate before a WebSocket handshake as well.
+        self.request_slot(&Method::GET, "/ws", &[]).await?;
+        Ok(())
+    }
+    pub(crate) async fn start_user_stream(&self) -> Result<String> {
+        ensure!(self.configured(), "账户密钥未配置");
+        let result = self
+            .request(Method::POST, "/fapi/v1/listenKey", vec![], false)
+            .await?;
+        let key = result["listenKey"]
+            .as_str()
+            .context("账户推送订阅响应无效")?;
+        ensure!(
+            !key.is_empty() && key.len() <= 256 && key.bytes().all(|c| c.is_ascii_alphanumeric()),
+            "账户推送订阅响应无效"
+        );
+        Ok(key.into())
+    }
+    pub(crate) async fn keep_user_stream(&self) -> Result<()> {
+        self.request(Method::PUT, "/fapi/v1/listenKey", vec![], false)
+            .await?;
+        Ok(())
+    }
+    pub(crate) async fn stream_limit(&self, started: Instant, status: u16, retry: Option<&str>) {
+        self.record_limit(
+            started,
+            "/ws",
+            status,
+            0,
+            retry_after(retry, SystemTime::now()),
+        )
+        .await;
+    }
+    pub(crate) fn user_stream_url(&self, key: &str) -> String {
+        #[cfg(test)]
+        if let Some(base) = &self.stream_base {
+            return format!("{base}/{key}");
+        }
+        #[cfg(test)]
+        if self.base.starts_with("http://127.0.0.1:") {
+            return format!("{}/ws/{key}", self.base.replacen("http://", "ws://", 1));
+        }
+        let base = if self.base == "https://demo-fapi.binance.com" {
+            "wss://demo-fstream.binance.com/ws"
+        } else {
+            "wss://fstream.binance.com/private/ws"
+        };
+        format!("{base}/{key}")
+    }
+    pub(crate) fn market_stream_url(&self) -> String {
+        #[cfg(test)]
+        if let Some(base) = &self.stream_base {
+            return base.clone();
+        }
+        #[cfg(test)]
+        if self.base.starts_with("http://127.0.0.1:") {
+            return format!(
+                "{}/public/stream",
+                self.base.replacen("http://", "ws://", 1)
+            );
+        }
+        if self.base == "https://demo-fapi.binance.com" {
+            "wss://demo-fstream.binance.com/stream".into()
+        } else {
+            "wss://fstream.binance.com/public/stream".into()
+        }
+    }
     pub async fn rate_limit_snapshot(&self) -> RateLimitSnapshot {
-        self.throttle.lock().await.snapshot(Instant::now())
+        let mut gate = self.throttle.lock().await;
+        if let Some(store) = &self.cooldown_store {
+            // A failed read is retried at admission, where it blocks sending.
+            let _ = gate.attach_store(store, &self.base, Instant::now(), now_ms());
+        }
+        gate.snapshot(Instant::now())
     }
     async fn request_slot(
         &self,
@@ -385,12 +473,33 @@ impl Binance {
     ) -> Result<Instant> {
         // Keep FIFO admission while allowing responses to update cooldown state
         // immediately. This queue lock is released before sending the HTTP request.
-        let dispatch = self.throttle.lock().await.dispatch.clone();
+        let dispatch = {
+            let mut gate = self.throttle.lock().await;
+            if let Some(store) = &self.cooldown_store {
+                gate.attach_store(store, &self.base, Instant::now(), now_ms())
+                    .map_err(|_| ExchangeError {
+                        status: 0,
+                        code: 0,
+                        uncertain: false,
+                        path,
+                        kind: ExchangeErrorKind::CooldownPersistence,
+                    })?;
+            }
+            gate.dispatch.clone()
+        };
         let _queued = dispatch.lock().await;
         let cost = request_cost(method, path, params);
         loop {
             let mut gate = self.throttle.lock().await;
             let now = Instant::now();
+            gate.persist_cooldown(now, now_ms())
+                .map_err(|_| ExchangeError {
+                    status: 0,
+                    code: 0,
+                    uncertain: false,
+                    path,
+                    kind: ExchangeErrorKind::CooldownPersistence,
+                })?;
             let slot = gate.reserve(now, cost);
             drop(gate);
             match slot {
@@ -427,11 +536,13 @@ impl Binance {
         code: i64,
         retry: Option<Duration>,
     ) {
-        let delay =
-            self.throttle
-                .lock()
-                .await
-                .penalize(started, Instant::now(), status, code, retry);
+        let mut gate = self.throttle.lock().await;
+        let now = Instant::now();
+        let delay = gate.penalize(started, now, status, code, retry);
+        if gate.persist_cooldown(now, now_ms()).is_err() {
+            tracing::error!("限流退避保存失败，后续请求需先重试保存");
+        }
+        drop(gate);
         tracing::warn!(
             path,
             status,
@@ -512,7 +623,7 @@ impl Binance {
         let mut req = self
             .client
             .request(method.clone(), format!("{}{}", self.base, path));
-        if signed {
+        if signed || path == "/fapi/v1/listenKey" {
             req = req.header(
                 "X-MBX-APIKEY",
                 self.key.as_deref().context("missing Binance key")?,
@@ -695,9 +806,35 @@ impl Binance {
         let v = self
             .request(Method::GET, "/fapi/v1/ticker/bookTicker", vec![], false)
             .await?;
+        Self::parse_quotes(v)
+    }
+    pub(crate) async fn quotes_for(&self, symbols: &[String]) -> Result<BTreeMap<String, Quote>> {
+        if symbols.len() >= 3 {
+            return self.quotes().await;
+        }
+        let mut quotes = BTreeMap::new();
+        for symbol in symbols {
+            let v = self
+                .request(
+                    Method::GET,
+                    "/fapi/v1/ticker/bookTicker",
+                    vec![("symbol".into(), symbol.clone())],
+                    false,
+                )
+                .await?;
+            quotes.extend(Self::parse_quotes(v)?);
+        }
+        Ok(quotes)
+    }
+    fn parse_quotes(v: Value) -> Result<BTreeMap<String, Quote>> {
+        let rows = if v.is_object() {
+            vec![v]
+        } else {
+            v.as_array().context("invalid quotes")?.clone()
+        };
         let mut out = BTreeMap::new();
         let received_at = now_ms();
-        for q in v.as_array().context("invalid quotes")? {
+        for q in rows {
             let exchange_time = q["time"]
                 .as_i64()
                 .context("missing quote transaction time")?;
@@ -709,6 +846,7 @@ impl Binance {
                 ask_qty: decimal(&q["askQty"])?,
                 time: received_at,
                 exchange_time: Some(exchange_time),
+                update_id: q["lastUpdateId"].as_u64().filter(|id| *id > 0),
             };
             if quote.validate().is_ok() {
                 out.insert(
@@ -890,10 +1028,32 @@ impl Binance {
                 .await?,
         )?)
     }
+    pub async fn positions_for(&self, symbol: &str) -> Result<Vec<RemotePosition>> {
+        Ok(serde_json::from_value(
+            self.request(
+                Method::GET,
+                "/fapi/v3/positionRisk",
+                vec![("symbol".into(), symbol.into())],
+                true,
+            )
+            .await?,
+        )?)
+    }
     pub async fn open_orders(&self) -> Result<Vec<ExchangeOrder>> {
         Ok(serde_json::from_value(
             self.request(Method::GET, "/fapi/v1/openOrders", vec![], true)
                 .await?,
+        )?)
+    }
+    pub async fn open_orders_for(&self, symbol: &str) -> Result<Vec<ExchangeOrder>> {
+        Ok(serde_json::from_value(
+            self.request(
+                Method::GET,
+                "/fapi/v1/openOrders",
+                vec![("symbol".into(), symbol.into())],
+                true,
+            )
+            .await?,
         )?)
     }
     pub async fn fees(&self, symbol: &str) -> Result<(Decimal, Decimal)> {
@@ -1282,6 +1442,164 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         replacement.order("XUSDT", "test").await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn disk_cooldown_survives_closing_the_client_and_database_then_expires() {
+        use crate::rate_limit::PersistedCooldown;
+        use axum::{Json, Router, http::StatusCode, routing::any};
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route(
+            "/fapi/v1/order",
+            any(move || {
+                let count = count.clone();
+                async move {
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "60")],
+                            Json(serde_json::json!({"code":-1003,"msg":"private-message"})),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [("retry-after", "0")],
+                            Json(serde_json::json!({})),
+                        )
+                    }
+                }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let path = std::env::temp_dir().join(format!(
+            "genius-cooldown-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let path_str = path.to_str().unwrap();
+        let first =
+            Binance::mock(base.clone()).with_store(Store::open(path_str, Mode::Paper).unwrap());
+        first
+            .request(Method::GET, "/fapi/v1/order", vec![], false)
+            .await
+            .unwrap_err();
+        drop(first);
+        // Reopen in another mode with a fresh admission gate, simulating a process restart.
+        let store = Store::open(path_str, Mode::Live).unwrap();
+        let saved = store.load_cooldown(&base).unwrap().unwrap();
+        assert_eq!(saved.strikes, 1);
+        assert!(saved.until_ms > now_ms() + 50_000);
+        assert!(
+            !serde_json::to_string(&saved)
+                .unwrap()
+                .contains("private-message")
+        );
+        let restored = Binance::mock(base.clone()).with_store(store.clone());
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            let error = restored
+                .request(method, "/fapi/v1/order", vec![], false)
+                .await
+                .unwrap_err();
+            let error = error.downcast_ref::<ExchangeError>().unwrap();
+            assert!(matches!(error.kind, ExchangeErrorKind::Cooldown(_)));
+            assert!(!error.uncertain);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(restored.stream_admission().await.is_err());
+        drop(restored);
+        store
+            .save_cooldown(
+                &base,
+                &PersistedCooldown {
+                    until_ms: now_ms() - 1,
+                    ..saved
+                },
+            )
+            .unwrap();
+        drop(store);
+        let recovered = Binance::mock(base).with_store(Store::open(path_str, Mode::Live).unwrap());
+        recovered
+            .request(Method::GET, "/fapi/v1/order", vec![], false)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(recovered);
+        std::fs::remove_file(path).unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn cooldown_database_failures_block_unsent_mutations_and_retry_persistence() {
+        use axum::{Json, Router, http::StatusCode, routing::any};
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route(
+            "/fapi/v1/order",
+            any(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "60")],
+                        Json(serde_json::json!({"code":-1003})),
+                    )
+                }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let store = Store::open(":memory:", Mode::Live).unwrap();
+        store.with_test_connection(|c| c.execute_batch("CREATE TRIGGER fail_cooldown BEFORE INSERT ON exchange_cooldowns BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap());
+        let client = Binance::mock(base.clone()).with_store(store.clone());
+        client
+            .request(Method::GET, "/fapi/v1/order", vec![], false)
+            .await
+            .unwrap_err();
+        let error = client
+            .request(Method::POST, "/fapi/v1/order", vec![], false)
+            .await
+            .unwrap_err();
+        let error = error.downcast_ref::<ExchangeError>().unwrap();
+        assert!(matches!(error.kind, ExchangeErrorKind::CooldownPersistence));
+        assert!(!error.uncertain);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            client
+                .rate_limit_snapshot()
+                .await
+                .cooldown_persistence_pending
+        );
+        store.with_test_connection(|c| c.execute_batch("DROP TRIGGER fail_cooldown").unwrap());
+        let error = client
+            .request(Method::POST, "/fapi/v1/order", vec![], false)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ExchangeError>().unwrap().kind,
+            ExchangeErrorKind::Cooldown(_)
+        ));
+        assert!(store.load_cooldown(&base).unwrap().is_some());
+        assert!(
+            !client
+                .rate_limit_snapshot()
+                .await
+                .cooldown_persistence_pending
+        );
+        drop(client);
+        store.with_test_connection(|c| {
+            c.execute("UPDATE exchange_cooldowns SET body='invalid-json'", [])
+                .unwrap();
+        });
+        let restored = Binance::mock(base).with_store(store);
+        let error = restored
+            .request(Method::POST, "/fapi/v1/order", vec![], false)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ExchangeError>().unwrap().kind,
+            ExchangeErrorKind::CooldownPersistence
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.abort();
     }
     #[tokio::test]

@@ -48,7 +48,7 @@ async function withAdmin(fn){
   catch(err){toast(err.message,true);}
 }
 async function refresh(){
-  if(busy)return;busy=true;try{const previousMode=state?.mode;state=await api('/api/dashboard','GET',undefined,10000);render();if(previousMode!==state.mode){eventsMode=null;replaceRegion('events-body','<div class="empty">正在载入当前模式事件…</div>');loadEvents();}$('connection-label').textContent='● 本地控制台已连接';}catch(err){$('connection-label').textContent='○ 控制台连接中断';$('asset-sync').textContent='本地连接中断 · 数据未更新';$('asset-sync').className='subtle sync-delayed';}finally{busy=false;}
+  if(busy)return;busy=true;try{const previousMode=state?.mode;state=await api('/api/dashboard','GET',undefined,10000);render();if(previousMode!==state.mode){eventsMode=null;replaceRegion('events-body','<div class="empty">正在载入当前模式事件…</div>');loadEvents();}$('connection-label').textContent='● 本地控制台已连接';}catch(err){$('connection-label').textContent='○ 控制台连接中断';$('asset-sync').textContent='本地连接中断 · 数据未更新';$('asset-sync').className='subtle sync-delayed';$('monitor-state').textContent='控制台连接中断';$('monitor-state').className='monitor-state uncertain';$('monitor-freshness').textContent='连接中断 · 运行统计和账户数据等待刷新';}finally{busy=false;}
 }
 function renderAssets(){
   const s=state,a=s.account_assets,unit=a?.multi_assets_margin?'USD':'USDT';
@@ -81,6 +81,33 @@ function renderAssets(){
   $('asset-distribution-note').textContent=!valued?'估值暂不可用 · 展示原币余额，占比等待更新':s.mode==='paper'?'模拟 USDT 钱包 · 按 1 USDT ≈ 1 USD 展示':'按正钱包余额的 USD 估值计算占比';
   replaceRegion('asset-details-body',assets.length?assets.map(x=>'<tr><td>'+esc(x.asset)+'</td><td>'+native(x.wallet_balance)+'</td><td class="'+(assetsHidden?'':color(x.unrealized_profit))+'">'+native(x.unrealized_profit)+'</td><td>'+native(x.margin_balance)+'</td><td>'+(x.wallet_value_usd==null?'—':money(x.wallet_value_usd,2))+'</td></tr>').join(''):'<tr><td colspan="5">'+(a?'暂无非零余额资产':'等待账户同步')+'</td></tr>');
 }
+const duration=value=>value==null||!Number.isFinite(Number(value))?'—':Number(value)<1000?num(value,0)+' ms':num(Number(value)/1000,1)+' s';
+const count=value=>value==null||!Number.isFinite(Number(value))?'—':num(value,0);
+function renderMonitoring(){
+  const s=state,now=Date.now(),limit=s.exchange_rate_limit,stream=s.user_stream,market=s.market_stream;
+  const cycle=(title,value,target)=>{
+    if(!value)return '<label>'+title+'</label><strong>等待统计</strong><p>尚未获取运行数据</p>';
+    const status=value.running?'执行中':value.runs>0?'等待下一轮':'等待首轮';
+    return '<label>'+title+' <span>目标 '+target+' s</span></label><strong>'+status+'</strong><dl><div><dt>最近耗时 / 实际间隔</dt><dd>'+duration(value.last_duration_ms)+' / '+duration(value.last_start_interval_ms)+'</dd></div><div><dt>轮次 / 异常 / 超时</dt><dd>'+count(value.runs)+' / '+count(value.failed_runs)+' / '+count(value.slow_runs)+'</dd></div></dl><p>最长耗时 '+duration(value.max_duration_ms)+'</p>';
+  };
+  replaceRegion('monitor-scan',cycle('开仓扫描',s.runtime?.scan,10));
+  replaceRegion('monitor-position',cycle('持仓风控',s.runtime?.position_management,5));
+  const known=limit&&Number(limit.weight_limit)>0,ratio=known?Math.min(100,Math.max(0,Number(limit.estimated_used_weight)/Number(limit.weight_limit)*100)):0;
+  $('monitor-weight-value').textContent=known?count(limit.estimated_used_weight)+' / '+count(limit.weight_limit):'等待统计';
+  $('monitor-weight').value=Number.isFinite(ratio)?ratio:0;
+  $('monitor-weight').className=ratio>=90?'budget-high':'';
+  const cooldown=Number(limit?.cooldown_remaining_ms||0);
+  replaceRegion('monitor-budget-detail',known?'<dl><div><dt>普通 / 总剩余权重</dt><dd>'+count(limit.regular_remaining_weight)+' / '+count(limit.remaining_weight)+'</dd></div><div><dt>预算 / 退避拒绝次数</dt><dd>'+count(limit.budget_rejections)+' / '+count(limit.cooldown_rejections)+'</dd></div></dl><p class="'+(cooldown>0||limit.cooldown_persistence_pending?'uncertain':'')+'">'+(limit.cooldown_persistence_pending?'退避状态保存待重试 · 请求暂缓':cooldown>0?'限流退避 · 剩余 '+duration(cooldown):'下笔权重释放 '+duration(limit.next_weight_release_in_ms))+'</p>':'<p>尚未获取请求预算</p>');
+  const streamLabel=s.mode==='paper'?'本机模拟':!stream?'等待连接状态':!stream.enabled?'账户未配置':stream.connected?'已连接':'REST 兜底 · 重连中';
+  const marketLabel=!market?'等待行情连接状态':market.connected?'行情已连接 · '+count(market.subscriptions)+' 个订阅':market.last_error?'行情 REST 兜底 · 重连中':market.subscriptions===0?'行情等待订阅':'行情连接中';
+  replaceRegion('monitor-stream','<label>账户事件连接</label><strong class="'+(stream?.enabled&&!stream.connected?'uncertain':'')+'">'+streamLabel+'</strong><dl><div><dt>推送 / 重连次数</dt><dd>'+count(stream?.events)+' / '+count(stream?.reconnects)+'</dd></div><div><dt>最近账户事件</dt><dd>'+timestamp(stream?.last_event_at)+'</dd></div></dl><p>'+esc(s.mode==='paper'?'止盈与止损在本机轮询':stream?.last_error||'REST 对账持续运行')+'</p><p class="'+(market?.last_error?'uncertain':'')+'">'+esc(marketLabel)+'</p>');
+  const age=(at)=>!at?'尚未同步':now<Number(at)?'时间异常':duration(now-Number(at))+' 前';
+  const stale=!s.market_at||now-Number(s.market_at)>=15000||now<Number(s.market_at)||s.mode!=='paper'&&(!s.account_at||now-Number(s.account_at)>=15000||now<Number(s.account_at));
+  const status=s.account_sync_failed?'账户同步异常':s.account_update_pending?'账户对账中':stale?'数据待更新':s.paused?'新增开仓已暂停':'运行中';
+  $('monitor-state').textContent=limit?.cooldown_persistence_pending?'退避状态待保存':cooldown>0?'限流退避':status;
+  $('monitor-state').className='monitor-state'+(limit?.cooldown_persistence_pending||cooldown>0||s.account_sync_failed||stale?' uncertain':'');
+  $('monitor-freshness').textContent='行情 '+age(s.market_at)+' · '+(s.mode==='paper'?'模拟账户': '完整账户 '+age(s.account_at))+' · 异常轮次包含风控等待，累计次数在引擎重启后重置';
+}
 function render(){
   const s=state,c=s.config;
   auth=s.auth;renderAccess();
@@ -88,7 +115,7 @@ function render(){
   $('mode').textContent={paper:'PAPER · 模拟交易',testnet:'TESTNET · 币安测试网',live:'LIVE · 币安实盘'}[s.mode];
   $('mode').className='mode'+(s.mode==='live'?' live':'');$('health').textContent=s.health;
   $('run-btn').textContent=s.paused?'启动开仓扫描 ↗':'暂停新增开仓 Ⅱ';
-  renderAssets();
+  renderAssets();renderMonitoring();
   $('realized').textContent=num(s.realized_net);$('realized').className=color(s.realized_net);
   $('unrealized').textContent=num(s.unrealized);$('unrealized').className=color(s.unrealized);
   $('exposure').textContent=num(s.exposure_usdt);$('exposure-cap').textContent='上限 '+num(c.max_exposure_usdt)+' USDT + USDC';

@@ -1,5 +1,7 @@
+use crate::store::Store;
+use anyhow::{Result as AnyResult, ensure};
 use reqwest::Method;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -73,6 +75,8 @@ pub(crate) fn request_cost(
         ("GET", "/fapi/v1/positionSide/dual" | "/fapi/v1/income") => 30,
         ("GET", "/fapi/v1/commissionRate") => 20,
         ("POST", "/fapi/v1/order") => 0,
+        ("POST" | "PUT", "/fapi/v1/listenKey") => 1,
+        ("GET", "/ws") => 0,
         ("GET" | "DELETE", "/fapi/v1/order")
         | ("POST", "/fapi/v1/leverage" | "/fapi/v1/positionSide/dual") => 1,
         _ => 40, // Conservative fallback for any future, unmapped endpoint.
@@ -89,6 +93,8 @@ pub(crate) fn request_cost(
                 | "/fapi/v1/order"
                 | "/fapi/v1/userTrades"
         ) | ("DELETE", "/fapi/v1/order")
+            | ("GET", "/ws")
+            | ("POST" | "PUT", "/fapi/v1/listenKey")
     ) || (method == Method::POST
         && path == "/fapi/v1/order"
         && parameter("reduceOnly") == Some("true"));
@@ -105,6 +111,7 @@ pub struct RateLimitSnapshot {
     pub server_reported_used_weight: Option<u64>,
     pub next_weight_release_in_ms: u64,
     pub cooldown_remaining_ms: u64,
+    pub cooldown_persistence_pending: bool,
     pub last_limit_status: Option<u16>,
     pub last_limit_code: Option<i64>,
     pub admitted_requests: u64,
@@ -141,6 +148,17 @@ struct Block {
     status: u16,
     code: i64,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedCooldown {
+    pub until_ms: i64,
+    pub status: u16,
+    pub code: i64,
+    pub strikes: u32,
+}
+struct Persistence {
+    store: Store,
+    origin: String,
+}
 pub(crate) struct RequestThrottle {
     pub(crate) dispatch: Arc<Mutex<()>>,
     next: Instant,
@@ -155,6 +173,8 @@ pub(crate) struct RequestThrottle {
     budget_rejections: u64,
     cooldown_rejections: u64,
     rate_limit_responses: u64,
+    persistence: Option<Persistence>,
+    persistence_dirty: bool,
 }
 impl RequestThrottle {
     pub(crate) fn new(now: Instant) -> Self {
@@ -172,7 +192,92 @@ impl RequestThrottle {
             budget_rejections: 0,
             cooldown_rejections: 0,
             rate_limit_responses: 0,
+            persistence: None,
+            persistence_dirty: false,
         }
+    }
+    pub(crate) fn attach_store(
+        &mut self,
+        store: &Store,
+        origin: &str,
+        now: Instant,
+        wall_ms: i64,
+    ) -> AnyResult<()> {
+        if self.persistence.is_none() {
+            if let Some(saved) = store.load_cooldown(origin)? {
+                self.restore_cooldown(&saved, now, wall_ms)?;
+            }
+            self.persistence = Some(Persistence {
+                store: store.clone(),
+                origin: origin.into(),
+            });
+            // Also preserve an already active in-memory gate when attaching late.
+            self.persistence_dirty = self.blocked.is_some();
+        }
+        self.persist_cooldown(now, wall_ms)
+    }
+    fn restore_cooldown(
+        &mut self,
+        saved: &PersistedCooldown,
+        now: Instant,
+        wall_ms: i64,
+    ) -> AnyResult<()> {
+        ensure!(
+            saved.until_ms > 0
+                && saved.strikes > 0
+                && saved.strikes <= 18
+                && (100..=599).contains(&saved.status)
+                && (matches!(saved.status, 418 | 429) || matches!(saved.code, -1003 | -1015)),
+            "限流退避记录无效，禁止发送请求"
+        );
+        let elapsed = wall_ms.saturating_sub(saved.until_ms).max(0) as u64;
+        if elapsed >= RESET_AFTER.as_millis() as u64 {
+            return Ok(());
+        }
+        let remaining = saved.until_ms.saturating_sub(wall_ms).max(0) as u64;
+        let until = if remaining > 0 {
+            now + Duration::from_millis(remaining.min(MAX_BACKOFF.as_millis() as u64))
+        } else {
+            now.checked_sub(Duration::from_millis(elapsed))
+                .unwrap_or(now)
+        };
+        if self
+            .blocked
+            .as_ref()
+            .is_none_or(|block| until > block.until)
+        {
+            self.blocked = Some(Block {
+                until,
+                status: saved.status,
+                code: saved.code,
+            });
+        }
+        self.strikes = self.strikes.max(saved.strikes);
+        self.last_limit = Some(now);
+        Ok(())
+    }
+    pub(crate) fn persist_cooldown(&mut self, now: Instant, wall_ms: i64) -> AnyResult<()> {
+        if !self.persistence_dirty {
+            return Ok(());
+        }
+        if let (Some(persistence), Some(block)) = (&self.persistence, &self.blocked) {
+            let until_ms = if block.until >= now {
+                wall_ms.saturating_add(block.until.duration_since(now).as_millis() as i64)
+            } else {
+                wall_ms.saturating_sub(now.duration_since(block.until).as_millis() as i64)
+            };
+            persistence.store.save_cooldown(
+                &persistence.origin,
+                &PersistedCooldown {
+                    until_ms,
+                    status: block.status,
+                    code: block.code,
+                    strikes: self.strikes.min(18),
+                },
+            )?;
+        }
+        self.persistence_dirty = false;
+        Ok(())
     }
     /// None grants a slot; Some asks the caller to sleep without holding the mutex.
     pub(crate) fn reserve(
@@ -346,6 +451,7 @@ impl RequestThrottle {
                 .as_ref()
                 .map(|block| block.until.saturating_duration_since(now).as_millis() as u64)
                 .unwrap_or(0),
+            cooldown_persistence_pending: self.persistence_dirty,
             last_limit_status: self.blocked.as_ref().map(|block| block.status),
             last_limit_code: self.blocked.as_ref().map(|block| block.code),
             admitted_requests: self.admitted_requests,
@@ -399,6 +505,7 @@ impl RequestThrottle {
             status,
             code,
         });
+        self.persistence_dirty = self.persistence.is_some();
         until - now
     }
 }
@@ -432,6 +539,112 @@ pub(crate) fn retry_after(value: Option<&str>, now: SystemTime) -> Option<Durati
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persisted_cooldown_restores_remaining_time_origin_isolation_and_escalation() {
+        let store = Store::open(":memory:", crate::config::Mode::Paper).unwrap();
+        let now = Instant::now();
+        let wall = 1_000_000;
+        let mut gate = RequestThrottle::new(now);
+        gate.attach_store(&store, "origin-a", now, wall).unwrap();
+        gate.penalize(now, now, 429, 0, None);
+        gate.persist_cooldown(now, wall).unwrap();
+        let later = now + Duration::from_secs(10);
+        let mut restarted = RequestThrottle::new(later);
+        restarted
+            .attach_store(&store, "origin-a", later, wall + 10_000)
+            .unwrap();
+        assert_eq!(restarted.snapshot(later).cooldown_remaining_ms, 50_000);
+        assert!(matches!(
+            restarted.reserve(later, cost(0, true)),
+            Err(AdmissionError::Cooldown(_))
+        ));
+        let mut other = RequestThrottle::new(later);
+        other
+            .attach_store(&store, "origin-b", later, wall + 10_000)
+            .unwrap();
+        assert!(other.reserve(later, cost(1, false)).unwrap().is_none());
+        let expired = now + Duration::from_secs(61);
+        let mut resumed = RequestThrottle::new(expired);
+        resumed
+            .attach_store(&store, "origin-a", expired, wall + 61_000)
+            .unwrap();
+        assert!(resumed.reserve(expired, cost(1, false)).unwrap().is_none());
+        assert_eq!(
+            resumed.penalize(expired, expired, 429, 0, None),
+            Duration::from_secs(120)
+        );
+        let idle = now + Duration::from_secs(60 + 30 * 60);
+        let mut reset = RequestThrottle::new(idle);
+        reset
+            .attach_store(&store, "origin-a", idle, wall + (60 + 30 * 60) * 1000)
+            .unwrap();
+        assert_eq!(
+            reset.penalize(idle, idle, 429, 0, None),
+            Duration::from_secs(60)
+        );
+    }
+    #[test]
+    fn persistence_failures_keep_the_gate_dirty_until_the_record_is_saved() {
+        let store = Store::open(":memory:", crate::config::Mode::Live).unwrap();
+        let now = Instant::now();
+        let mut gate = RequestThrottle::new(now);
+        gate.attach_store(&store, "origin", now, 1_000_000).unwrap();
+        store.with_test_connection(|c|c.execute_batch("CREATE TRIGGER fail_cooldown BEFORE INSERT ON exchange_cooldowns BEGIN SELECT RAISE(ABORT,'local write failure'); END;").unwrap());
+        gate.penalize(now, now, 418, 0, Some(Duration::from_secs(90)));
+        assert!(gate.persist_cooldown(now, 1_000_000).is_err());
+        assert!(gate.snapshot(now).cooldown_persistence_pending);
+        assert!(store.load_cooldown("origin").unwrap().is_none());
+        assert!(gate.attach_store(&store, "origin", now, 1_000_000).is_err());
+        store.with_test_connection(|c| c.execute_batch("DROP TRIGGER fail_cooldown").unwrap());
+        gate.attach_store(&store, "origin", now, 1_000_000).unwrap();
+        assert!(!gate.snapshot(now).cooldown_persistence_pending);
+        assert_eq!(
+            store.load_cooldown("origin").unwrap().unwrap().until_ms,
+            1_090_000
+        );
+    }
+    #[test]
+    fn restored_bans_never_shorten_active_limits_and_invalid_records_fail_closed() {
+        let now = Instant::now();
+        let mut gate = RequestThrottle::new(now);
+        gate.penalize(now, now, 418, 0, Some(Duration::from_secs(100)));
+        let saved = PersistedCooldown {
+            until_ms: 1_050_000,
+            status: 429,
+            code: 0,
+            strikes: 1,
+        };
+        gate.restore_cooldown(&saved, now, 1_000_000).unwrap();
+        assert_eq!(gate.snapshot(now).cooldown_remaining_ms, 100_000);
+        assert!(
+            gate.restore_cooldown(
+                &PersistedCooldown {
+                    strikes: 0,
+                    ..saved
+                },
+                now,
+                1_000_000
+            )
+            .is_err()
+        );
+        let mut clock_rollback = RequestThrottle::new(now);
+        clock_rollback
+            .restore_cooldown(
+                &PersistedCooldown {
+                    until_ms: i64::MAX,
+                    status: 418,
+                    code: 0,
+                    strikes: 18,
+                },
+                now,
+                1_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            clock_rollback.snapshot(now).cooldown_remaining_ms,
+            MAX_BACKOFF.as_millis() as u64
+        );
+    }
     fn cost(weight: u64, protected: bool) -> RequestCost {
         RequestCost { weight, protected }
     }

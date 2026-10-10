@@ -69,11 +69,14 @@ pub struct Quote {
     pub ask: Decimal,
     pub bid_qty: Decimal,
     pub ask_qty: Decimal,
-    /// Local receipt time, used to detect interrupted polling.
+    /// Local receipt time, used to detect stale quotes.
     pub time: i64,
-    /// Exchange transaction time, used to identify repeated book snapshots.
+    /// Exchange transaction time, used to reject older quotes from either source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exchange_time: Option<i64>,
+    /// Book sequence shared by REST and streaming quotes; identifies consumed depth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_id: Option<u64>,
 }
 impl Quote {
     pub fn mid(&self) -> Decimal {
@@ -215,17 +218,23 @@ pub struct Book {
     pub pending: BTreeMap<String, PendingOrder>,
     pub last_bar: BTreeMap<String, i64>,
     pub cooldown_until: BTreeMap<String, i64>,
+    #[serde(default, skip_serializing)]
     pub closed_trades: Vec<ClosedTrade>,
     pub paper_cash: Decimal,
     pub funding_cursor: i64,
     #[serde(default)]
     pub funding_last_poll: i64,
+    #[serde(default, skip_serializing)]
     pub funding_ids: Vec<String>,
+    #[serde(skip)]
+    pub funding_income: Vec<FundingIncome>,
     pub sequence: u64,
     #[serde(default)]
     pub paper_match_times: BTreeMap<String, i64>,
     #[serde(default)]
     pub paper_match_exchange_times: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub paper_match_update_ids: BTreeMap<String, u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClosedTrade {
@@ -235,6 +244,14 @@ pub struct ClosedTrade {
     pub closed_at: i64,
     pub net_profit: Decimal,
     pub accounting_complete: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundingIncome {
+    pub id: String,
+    pub symbol: String,
+    pub asset: String,
+    pub time: i64,
+    pub amount: Decimal,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {

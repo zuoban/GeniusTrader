@@ -7,11 +7,13 @@ pub mod domain;
 pub mod engine;
 pub mod exchange;
 pub mod jev;
+pub mod market_stream;
 pub mod monitoring;
 mod rate_limit;
 pub mod settings;
 pub mod store;
 pub mod strategy;
+pub mod user_stream;
 
 #[cfg(test)]
 mod test_support;

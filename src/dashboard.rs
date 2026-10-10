@@ -215,6 +215,7 @@ mod tests {
                     ask_qty: Decimal::ONE,
                     time: now_ms(),
                     exchange_time: None,
+                    update_id: None,
                 },
             );
             inner

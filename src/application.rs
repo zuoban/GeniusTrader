@@ -172,7 +172,7 @@ impl Application {
         let mode = request.mode;
         let credentials = self.credentials_for_test(request).await?;
         // Use an isolated client: testing never replaces the active engine or saves settings.
-        let client = Binance::with_credentials(mode, &credentials)?;
+        let client = Binance::with_credentials(mode, &credentials)?.with_store(self.store.clone());
         let can_trade = client.verify_credentials().await?;
         Ok(CredentialTestResult {
             mode,

@@ -627,9 +627,16 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["paused"], true);
         assert_eq!(v["mode"], "paper");
+        assert_eq!(v["account_sync_failed"], false);
+        assert_eq!(v["account_update_pending"], false);
+        assert_eq!(v["user_stream"]["enabled"], false);
+        assert!(v["user_stream"].get("listenKey").is_none());
+        assert_eq!(v["market_stream"]["connected"], false);
+        assert_eq!(v["market_stream"]["subscriptions"], 0);
         assert!(v.get("api_key").is_none());
         let limiter = &v["exchange_rate_limit"];
         assert_eq!(limiter["weight_limit"], 2400);
+        assert_eq!(limiter["cooldown_persistence_pending"], false);
         assert_eq!(limiter["regular_weight_limit"], 2160);
         assert!(limiter["remaining_weight"].is_u64());
         assert!(limiter["cooldown_remaining_ms"].is_u64());
@@ -706,6 +713,10 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["auth"]["authenticated"], false);
+        assert_eq!(value["account_sync_failed"], false);
+        assert_eq!(value["account_update_pending"], false);
+        assert_eq!(value["user_stream"]["connected"], false);
+        assert_eq!(value["market_stream"]["subscriptions"], 0);
         assert!(value["exchange_rate_limit"]["estimated_used_weight"].is_u64());
         assert_eq!(
             value["watchlist"][0]["latest_decision"]["source"],

@@ -118,3 +118,44 @@ test('event requests coalesce and old responses cannot overwrite a newly selecte
   assert.equal(h.element('events-body').writes,1);assert.equal(h.timers.size,0);
   assert.equal(h.run('eventsLoading'),null);
 });
+
+test('monitoring displays zero counters, cooldowns and pending account reconciliation',async()=>{
+  const h=await dashboard();
+  h.run(`state={mode:'testnet',paused:false,account_sync_failed:false,account_update_pending:true,market_at:Date.now(),account_at:Date.now(),runtime:{scan:{running:false,runs:0,failed_runs:0,slow_runs:0,last_duration_ms:null,last_start_interval_ms:null,max_duration_ms:0},position_management:{running:true,runs:12,failed_runs:2,slow_runs:1,last_duration_ms:6200,last_start_interval_ms:5000,max_duration_ms:7000}},exchange_rate_limit:{weight_limit:2400,estimated_used_weight:2200,remaining_weight:200,regular_remaining_weight:0,budget_rejections:3,cooldown_rejections:4,cooldown_remaining_ms:60000,next_weight_release_in_ms:0},user_stream:{enabled:true,connected:false,events:5,reconnects:2,last_event_at:0,last_error:'<unsafe>'}};renderMonitoring();`);
+  assert.match(h.element('monitor-scan').innerHTML,/等待首轮/);
+  assert.match(h.element('monitor-scan').innerHTML,/0 \/ 0 \/ 0/);
+  assert.match(h.element('monitor-position').innerHTML,/执行中/);
+  assert.match(h.element('monitor-position').innerHTML,/6.2 s/);
+  assert.equal(h.element('monitor-state').textContent,'限流退避');
+  assert.match(h.element('monitor-budget-detail').innerHTML,/60.0 s/);
+  assert.match(h.element('monitor-stream').innerHTML,/REST 兜底/);
+  assert.match(h.element('monitor-stream').innerHTML,/&lt;unsafe&gt;/);
+  assert.ok(h.element('monitor-weight').value>90);
+  h.run('state.exchange_rate_limit.cooldown_remaining_ms=0;renderMonitoring();');
+  assert.equal(h.element('monitor-state').textContent,'账户对账中');
+  h.run('state.account_sync_failed=true;renderMonitoring();');
+  assert.equal(h.element('monitor-state').textContent,'账户同步异常');
+});
+
+test('monitoring handles absent metrics and paper mode without misleading values',async()=>{
+  const h=await dashboard();
+  h.run("state={mode:'paper',paused:true,market_at:0,account_at:0};renderMonitoring();");
+  assert.match(h.element('monitor-scan').innerHTML,/等待统计/);
+  assert.match(h.element('monitor-stream').innerHTML,/本机模拟/);
+  assert.equal(h.element('monitor-weight-value').textContent,'等待统计');
+  assert.equal(h.element('monitor-state').textContent,'数据待更新');
+  assert.doesNotMatch(h.element('monitor-budget-detail').innerHTML,/NaN|undefined/);
+  assert.match(h.element('monitor-freshness').textContent,/尚未同步/);
+});
+
+test('monitoring shows public market subscriptions and unsaved cooldowns',async()=>{
+  const h=await dashboard();
+  h.run("state={mode:'paper',paused:true,market_at:Date.now(),market_stream:{connected:true,subscriptions:3,last_error:null},exchange_rate_limit:{weight_limit:2400,estimated_used_weight:0,cooldown_remaining_ms:60000,cooldown_persistence_pending:true}};renderMonitoring();");
+  assert.match(h.element('monitor-stream').innerHTML,/行情已连接 · 3 个订阅/);
+  assert.match(h.element('monitor-budget-detail').innerHTML,/保存待重试/);
+  assert.equal(h.element('monitor-state').textContent,'退避状态待保存');
+  h.run("state.market_stream={connected:false,subscriptions:0,last_error:'<unsafe>'};state.exchange_rate_limit.cooldown_persistence_pending=false;renderMonitoring();");
+  assert.match(h.element('monitor-stream').innerHTML,/行情 REST 兜底/);
+  assert.doesNotMatch(h.element('monitor-stream').innerHTML,/<unsafe>/);
+  assert.equal(h.element('monitor-state').textContent,'限流退避');
+});

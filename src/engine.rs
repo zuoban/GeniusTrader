@@ -5,9 +5,11 @@ use crate::{
         AccountInfo, Binance, ExchangeError, ExchangeOrder, MarginBalances, RateLimitSnapshot,
     },
     jev::Jev,
+    market_stream::MarketStreamStatus,
     monitoring::{POSITION_INTERVAL, RuntimeMetrics, SCAN_INTERVAL},
     store::Store,
     strategy::{self, Decision},
+    user_stream::{StreamStatus, UserEvent},
 };
 use anyhow::{Context, Result, ensure};
 use futures_util::{StreamExt, stream};
@@ -15,11 +17,11 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 pub struct Engine {
     pub mode: Mode,
@@ -29,8 +31,21 @@ pub struct Engine {
     pub inner: Mutex<Inner>,
     runtime: Mutex<RuntimeMetrics>,
     pub(crate) reconcile_lock: Mutex<()>,
+    pub(crate) user_stream: Mutex<StreamStatus>,
+    pub(crate) account_notify: Notify,
+    pub(crate) market_stream: Mutex<MarketStreamStatus>,
 }
 pub struct EngineTasks(Vec<tokio::task::JoinHandle<()>>);
+#[derive(Clone, Copy)]
+enum ExitCheck {
+    Account,
+    Symbol,
+}
+struct ExitConfirmation {
+    quantity: Decimal,
+    side: Action,
+    started: Instant,
+}
 impl Drop for EngineTasks {
     fn drop(&mut self) {
         for task in &self.0 {
@@ -46,7 +61,11 @@ pub struct Inner {
     pub quotes: BTreeMap<String, Quote>,
     pub market_at: i64,
     pub account_at: i64,
+    pub account_sync_failed: bool,
+    pub account_update_pending: bool,
+    account_generation: u64,
     pub available: Decimal,
+    realized_net: Decimal,
     pub margin_balances: Option<MarginBalances>,
     pub account_assets: Option<AccountInfo>,
     pub account_assets_at: i64,
@@ -66,6 +85,8 @@ pub struct Snapshot {
     pub health: String,
     pub market_at: i64,
     pub account_at: i64,
+    pub account_sync_failed: bool,
+    pub account_update_pending: bool,
     pub available_usdt: Decimal,
     pub margin_balances: Option<MarginBalances>,
     pub account_assets: Option<AccountInfo>,
@@ -86,12 +107,52 @@ pub struct Snapshot {
     pub jev_available: bool,
     pub runtime: RuntimeMetrics,
     pub exchange_rate_limit: RateLimitSnapshot,
+    pub user_stream: StreamStatus,
+    pub market_stream: MarketStreamStatus,
 }
 impl Inner {
+    fn wants_market(&self, symbol: &str) -> bool {
+        self.book.pool.contains_key(symbol)
+            || self.book.positions.contains_key(symbol)
+            || self.book.pending.values().any(|o| o.symbol == symbol)
+    }
+    fn market_symbols(&self) -> BTreeSet<String> {
+        self.book
+            .pool
+            .keys()
+            .chain(self.book.positions.keys())
+            .chain(self.book.pending.values().map(|o| &o.symbol))
+            .cloned()
+            .collect()
+    }
+    fn market_health(&mut self, mode: Mode) {
+        let symbols = self.market_symbols();
+        self.quotes.retain(|symbol, _| symbols.contains(symbol));
+        self.market_at = if symbols.is_empty() {
+            now_ms()
+        } else {
+            symbols
+                .iter()
+                .map(|s| self.quotes.get(s).map_or(0, |q| q.time))
+                .min()
+                .unwrap_or(0)
+        };
+        if (0..15_000).contains(&(now_ms() - self.market_at))
+            && (mode == Mode::Paper
+                || (!self.account_sync_failed
+                    && !self.account_update_pending
+                    && (0..15_000).contains(&(now_ms() - self.account_at))))
+        {
+            self.health = "行情正常 · 5m 收盘决策 · 持仓风控管理中".into();
+        }
+    }
     fn scan_allowed(&self, mode: Mode, now: i64) -> bool {
         !self.paused
             && (0..15_000).contains(&(now - self.market_at))
-            && (mode == Mode::Paper || (0..15_000).contains(&(now - self.account_at)))
+            && (mode == Mode::Paper
+                || (!self.account_sync_failed
+                    && !self.account_update_pending
+                    && (0..15_000).contains(&(now - self.account_at))))
             && self.slots() < self.config.max_positions
             && self.exposure() < self.config.max_exposure_usdt
     }
@@ -232,7 +293,7 @@ impl Engine {
             book.pending
                 .retain(|_, o| o.role != OrderRole::Entry || o.status != "SUBMITTING");
         }
-        store.save(mode, &config, &book)?;
+        let realized_net = store.save(mode, &config, &book)?;
         let available = if mode == Mode::Paper {
             book.paper_cash
         } else {
@@ -244,6 +305,8 @@ impl Engine {
             "正在同步行情"
         }
         .into();
+        let stream_enabled = mode != Mode::Paper && exchange.configured();
+        let exchange = exchange.with_store(store.clone());
         Ok(Arc::new(Self {
             mode,
             store,
@@ -251,6 +314,12 @@ impl Engine {
             jev: RwLock::new(Arc::new(jev)),
             reconcile_lock: Mutex::new(()),
             runtime: Mutex::new(RuntimeMetrics::default()),
+            user_stream: Mutex::new(StreamStatus {
+                enabled: stream_enabled,
+                ..Default::default()
+            }),
+            account_notify: Notify::new(),
+            market_stream: Mutex::new(MarketStreamStatus::default()),
             inner: Mutex::new(Inner {
                 config,
                 book,
@@ -259,7 +328,11 @@ impl Engine {
                 quotes: BTreeMap::new(),
                 market_at: 0,
                 account_at: 0,
+                account_sync_failed: false,
+                account_update_pending: false,
+                account_generation: 0,
                 available,
+                realized_net,
                 margin_balances: None,
                 account_assets: None,
                 account_assets_at: 0,
@@ -278,7 +351,11 @@ impl Engine {
         // A failed save leaves memory ahead of SQLite. Even an unchanged later poll
         // must retry persistence before it can be treated as a no-op.
         i.persistence_pending = true;
-        self.store.save(self.mode, &i.config, &i.book)?;
+        i.realized_net = self.store.save(self.mode, &i.config, &i.book)?;
+        let remove = i.book.closed_trades.len().saturating_sub(100);
+        i.book.closed_trades.drain(..remove);
+        i.book.funding_ids.clear();
+        i.book.funding_income.clear();
         i.persistence_pending = false;
         Ok(())
     }
@@ -304,6 +381,8 @@ impl Engine {
         let jev_available = self.jev.read().await.available();
         let runtime = self.runtime.lock().await.clone();
         let exchange_rate_limit = self.exchange.rate_limit_snapshot().await;
+        let user_stream = self.user_stream.lock().await.clone();
+        let market_stream = self.market_stream.lock().await.clone();
         let i = self.inner.lock().await;
         let unrealized = i
             .book
@@ -324,6 +403,8 @@ impl Engine {
             health: i.health.clone(),
             market_at: i.market_at,
             account_at: i.account_at,
+            account_sync_failed: i.account_sync_failed,
+            account_update_pending: i.account_update_pending,
             available_usdt: i.available,
             margin_balances: i.margin_balances.clone(),
             account_assets: if self.mode == Mode::Paper {
@@ -357,12 +438,14 @@ impl Engine {
                 .collect(),
             external_positions: i.external_positions.clone(),
             external_orders: i.external_orders.clone(),
-            realized_net: i.book.closed_trades.iter().map(|t| t.net_profit).sum(),
+            realized_net: i.realized_net,
             unrealized,
             exposure_usdt: i.exposure(),
             jev_available,
             runtime,
             exchange_rate_limit,
+            user_stream,
+            market_stream,
         }
     }
     pub async fn configure(&self, c: Config) -> Result<()> {
@@ -375,7 +458,7 @@ impl Engine {
         if self.mode == Mode::Paper {
             book.paper_cash += c.paper_balance_usdt - i.config.paper_balance_usdt;
         }
-        self.store.save(self.mode, &c, &book)?;
+        i.realized_net = self.store.save(self.mode, &c, &book)?;
         i.config = c;
         i.book = book;
         i.persistence_pending = false;
@@ -399,7 +482,7 @@ impl Engine {
         );
         let mut book = i.book.clone();
         book.pool.insert(coin.symbol.clone(), coin);
-        self.store.save(self.mode, &i.config, &book)?;
+        i.realized_net = self.store.save(self.mode, &i.config, &book)?;
         i.book = book;
         i.persistence_pending = false;
         i.revision += 1;
@@ -410,7 +493,7 @@ impl Engine {
         let mut i = self.inner.lock().await;
         let mut book = i.book.clone();
         book.pool.remove(&symbol);
-        self.store.save(self.mode, &i.config, &book)?;
+        i.realized_net = self.store.save(self.mode, &i.config, &book)?;
         i.book = book;
         i.persistence_pending = false;
         i.revision += 1;
@@ -426,7 +509,10 @@ impl Engine {
             );
             ensure!(now_ms() - i.market_at < 15_000, "行情尚未同步或已过期");
             ensure!(
-                self.mode == Mode::Paper || now_ms() - i.account_at < 15_000,
+                self.mode == Mode::Paper
+                    || (!i.account_sync_failed
+                        && !i.account_update_pending
+                        && (0..15_000).contains(&(now_ms() - i.account_at))),
                 "账户尚未对账"
             );
             ensure!(
@@ -458,6 +544,16 @@ impl Engine {
     }
     pub fn spawn(self: &Arc<Self>) -> EngineTasks {
         let mut tasks = Vec::new();
+        let e = self.clone();
+        tasks.push(tokio::spawn(
+            async move { crate::market_stream::run(e).await },
+        ));
+        if self.mode != Mode::Paper && self.exchange.configured() {
+            let e = self.clone();
+            tasks.push(tokio::spawn(
+                async move { crate::user_stream::run(e).await },
+            ));
+        }
         let e = self.clone();
         tasks.push(tokio::spawn(async move {
             let mut t = tokio::time::interval(Duration::from_secs(10));
@@ -498,7 +594,13 @@ impl Engine {
             let mut t = tokio::time::interval(POSITION_INTERVAL);
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                t.tick().await;
+                tokio::select! {
+                    _ = t.tick() => {},
+                    _ = e.account_notify.notified() => {
+                        // Coalesce bursts; periodic REST reconciliation stays active.
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
                 if let Err(err) = e.manage_positions().await {
                     e.fault("持仓管理异常", err).await;
                 }
@@ -514,6 +616,83 @@ impl Engine {
             }
         }));
         EngineTasks(tasks)
+    }
+    pub(crate) async fn stream_gap(&self) {
+        {
+            let mut i = self.inner.lock().await;
+            i.account_sync_failed = true;
+            i.account_generation = i.account_generation.saturating_add(1);
+            i.paused = true;
+            i.revision += 1;
+            i.health = "账户推送中断，暂停新增开仓，REST 继续核对".into();
+        }
+        self.event("warn", None, "账户推送中断，等待重连与完整对账", json!({}));
+        self.account_notify.notify_one();
+    }
+    pub(crate) async fn handle_user_event(&self, event: UserEvent) -> Result<()> {
+        if matches!(event, UserEvent::Expired | UserEvent::Other) {
+            return Ok(());
+        }
+        self.mark_account_pending().await;
+        let _guard = self.reconcile_lock.lock().await;
+        // The previous lock owner may have reconciled the first invalidation
+        // while this event waited. Keep its effects dirty until a later read.
+        self.mark_account_pending().await;
+        match event {
+            UserEvent::Order { order, .. } => {
+                let local = self
+                    .inner
+                    .lock()
+                    .await
+                    .book
+                    .pending
+                    .get(&order.client_id)
+                    .cloned();
+                if let Some(local) = local {
+                    ensure!(
+                        order.position_side == "BOTH"
+                            && order.side
+                                == if local.role == OrderRole::Entry {
+                                    local.side.entry_side()
+                                } else {
+                                    local.side.exit_side()
+                                },
+                        "订单推送与委托方向不一致"
+                    );
+                    // A delayed nonterminal push must not undo terminal settlement.
+                    if local.status != "SETTLING" || order.report().terminal() {
+                        self.apply_order(order.report()).await?;
+                        self.finalize_closed().await?;
+                    }
+                } else if !order.report().terminal() {
+                    let mut i = self.inner.lock().await;
+                    if !i.external_orders.contains(&order.symbol) {
+                        i.external_orders.push(order.symbol);
+                    }
+                    i.paused = true;
+                    i.revision += 1;
+                    i.health = "收到外部订单推送，暂停新开仓，等待完整对账".into();
+                }
+            }
+            UserEvent::Risk => {
+                let mut i = self.inner.lock().await;
+                i.paused = true;
+                i.revision += 1;
+                i.health = "收到保证金风险推送，暂停新开仓，等待完整对账".into();
+            }
+            UserEvent::Account => {}
+            UserEvent::Expired | UserEvent::Other => return Ok(()),
+        }
+        // Pushes contain deltas rather than a complete margin/order snapshot.
+        // Prevent use of the old snapshot until REST has reconciled all fields.
+        Ok(())
+    }
+    async fn mark_account_pending(&self) {
+        let mut i = self.inner.lock().await;
+        i.account_update_pending = true;
+        i.account_generation = i.account_generation.saturating_add(1);
+        drop(i);
+        self.account_notify.notify_one();
     }
     pub(crate) async fn refresh_account_assets(&self) {
         if self.mode == Mode::Paper || !self.exchange.configured() {
@@ -539,30 +718,62 @@ impl Engine {
         i.paused = true;
         i.revision += 1;
     }
+    pub(crate) async fn market_symbols(&self) -> BTreeSet<String> {
+        self.inner.lock().await.market_symbols()
+    }
+    pub(crate) async fn apply_market_quote(&self, symbol: String, quote: Quote) -> bool {
+        let mut i = self.inner.lock().await;
+        if quote.validate().is_err()
+            || !i.wants_market(&symbol)
+            || i.quotes.get(&symbol).is_some_and(|previous| {
+                quote_is_older(&quote, previous)
+                    || quote
+                        .update_id
+                        .zip(previous.update_id)
+                        .is_some_and(|(new, old)| new == old)
+            })
+        {
+            return false;
+        }
+        i.quotes.insert(symbol, quote);
+        // Aggregate freshness is refreshed by the two-second supervisor, keeping
+        // high-frequency updates O(log N) rather than rescanning the entire pool.
+        true
+    }
     async fn refresh_market(&self) -> Result<()> {
         if self.inner.lock().await.catalog.is_empty() {
             self.exchange.sync_time().await?;
             let catalog = self.exchange.symbols().await?;
             self.inner.lock().await.catalog = catalog;
         }
-        let mut quotes = self.exchange.quotes().await?;
+        let connected = self.market_stream.lock().await.connected;
+        let symbols = {
+            let mut i = self.inner.lock().await;
+            i.market_health(self.mode);
+            i.market_symbols()
+                .into_iter()
+                .filter(|symbol| {
+                    !connected
+                        || i.quotes
+                            .get(symbol)
+                            .is_none_or(|q| !(0..8_000).contains(&(now_ms() - q.time)))
+                })
+                .collect::<Vec<_>>()
+        };
+        let quotes = self.exchange.quotes_for(&symbols).await?;
         let mut i = self.inner.lock().await;
-        for (symbol, quote) in &mut quotes {
-            if let Some(previous) = i.quotes.get(symbol)
-                && quote
-                    .exchange_time
-                    .zip(previous.exchange_time)
-                    .is_some_and(|(new, old)| new < old)
+        let required = i.market_symbols();
+        for (symbol, quote) in quotes {
+            if required.contains(&symbol)
+                && !i
+                    .quotes
+                    .get(&symbol)
+                    .is_some_and(|previous| quote_is_older(&quote, previous))
             {
-                // An older exchange snapshot must not refresh its local freshness either.
-                *quote = previous.clone();
+                i.quotes.insert(symbol, quote);
             }
         }
-        i.quotes = quotes;
-        i.market_at = now_ms();
-        if self.mode == Mode::Paper || now_ms() - i.account_at < 15_000 {
-            i.health = "行情正常 · 5m 收盘决策 · 持仓风控管理中".into();
-        }
+        i.market_health(self.mode);
         Ok(())
     }
     pub async fn refresh_catalog(&self) -> Result<()> {
@@ -717,7 +928,12 @@ impl Engine {
                 "决策已过期"
             );
             if self.mode != Mode::Paper {
-                ensure!(now_ms() - i.account_at < 15_000, "账户对账过期");
+                ensure!(
+                    !i.account_sync_failed
+                        && !i.account_update_pending
+                        && (0..15_000).contains(&(now_ms() - i.account_at)),
+                    "账户对账过期或同步失败"
+                );
             }
             ensure!(i.slots() < i.config.max_positions, "持仓名额已满");
             ensure!(
@@ -1026,13 +1242,13 @@ impl Engine {
             now_ms(),
             elapsed,
             POSITION_INTERVAL,
-            result.is_err(),
+            result.as_ref().map_or(true, |degraded| *degraded),
         );
         if elapsed > POSITION_INTERVAL {
             tracing::warn!(mode = ?self.mode, elapsed_ms = elapsed.as_millis() as u64,
                 target_ms = POSITION_INTERVAL.as_millis() as u64, "持仓管理周期超过目标间隔");
         }
-        result
+        result.map(|_| ())
     }
     async fn reconcile_pending(&self) -> Result<()> {
         let pending = self
@@ -1075,21 +1291,42 @@ impl Engine {
         }
         Ok(())
     }
-    async fn manage_positions_once(&self) -> Result<()> {
+    async fn manage_positions_once(&self) -> Result<bool> {
         let _guard = self.reconcile_lock.lock().await;
+        let mut degraded = false;
         if self.mode != Mode::Paper {
             if !self.exchange.configured() {
-                return Ok(());
+                return Ok(false);
             }
-            if self.inner.lock().await.account_at == 0 {
-                self.exchange.preflight().await?;
-            }
+            let startup = if self.inner.lock().await.account_at == 0 {
+                self.exchange.preflight().await.map(|_| ())
+            } else {
+                Ok(())
+            };
+            // Persistence/settlement failures still abort this cycle. An account
+            // read failure must not prevent confirmation of already sent orders.
             self.reconcile_pending().await?;
-            self.sync_account().await?;
-            if let Err(error) = self.sync_funding().await {
-                // Keep exits available using recorded funding if only the income endpoint fails.
-                self.fault("资金费同步失败，持仓风控使用已记录资金费", error)
-                    .await;
+            let account = match startup {
+                Ok(()) => self.sync_account().await,
+                Err(error) => Err(error),
+            };
+            match account {
+                Err(error) => {
+                    degraded = true;
+                    self.inner.lock().await.account_sync_failed = true;
+                    self.fault("账户同步失败，暂停新开仓；止损需按币对独立核对", error)
+                        .await;
+                }
+                // An event superseding a read is normal; block entries and new
+                // take-profit orders until the already queued reconciliation.
+                Ok(false) => degraded = true,
+                Ok(true) => {
+                    if let Err(error) = self.sync_funding().await {
+                        // Keep exits available using recorded funding if only the income endpoint fails.
+                        self.fault("资金费同步失败，持仓风控使用已记录资金费", error)
+                            .await;
+                    }
+                }
             }
         }
         self.finalize_closed().await?;
@@ -1104,7 +1341,12 @@ impl Engine {
             .cloned()
             .collect::<Vec<_>>();
         for p in positions {
-            match self.ensure_stop_loss(&p.symbol).await {
+            let check = if degraded {
+                ExitCheck::Symbol
+            } else {
+                ExitCheck::Account
+            };
+            match self.ensure_stop_loss(&p.symbol, check).await {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(error) => {
@@ -1116,6 +1358,9 @@ impl Engine {
                     );
                     continue;
                 }
+            }
+            if degraded {
+                continue;
             }
             if let Err(e) = self.ensure_tp(&p.symbol).await {
                 self.event(
@@ -1130,15 +1375,19 @@ impl Engine {
             self.paper_match().await?;
             self.finalize_closed().await?;
         }
-        Ok(())
+        Ok(degraded)
     }
-    async fn sync_account(&self) -> Result<()> {
+    async fn sync_account(&self) -> Result<bool> {
+        let generation = self.inner.lock().await.account_generation;
         let (remote, orders, balances) = tokio::try_join!(
             self.exchange.positions(),
             self.exchange.open_orders(),
             self.exchange.margin_balances(),
         )?;
         let mut i = self.inner.lock().await;
+        if generation != i.account_generation {
+            return Ok(false);
+        }
         let mut external = BTreeMap::new();
         let mut actual = BTreeMap::new();
         for p in remote {
@@ -1186,11 +1435,13 @@ impl Engine {
         };
         i.margin_balances = Some(balances);
         i.account_at = now_ms();
+        i.account_sync_failed = false;
+        i.account_update_pending = false;
         if !i.external_positions.is_empty() || !i.external_orders.is_empty() {
             i.paused = true;
             i.health = "账户与系统记录不一致，暂停新开仓，保留订单".into();
         }
-        Ok(())
+        Ok(true)
     }
     async fn sync_funding(&self) -> Result<()> {
         let cursor = {
@@ -1206,7 +1457,7 @@ impl Engine {
         let end = now_ms();
         for r in rows {
             let id = format!("{}:{}", r["tranId"], r["symbol"]);
-            if i.book.funding_ids.contains(&id) {
+            if i.book.funding_ids.contains(&id) || self.store.has_funding(&id)? {
                 continue;
             }
             let Some(symbol) = r["symbol"].as_str() else {
@@ -1215,9 +1466,7 @@ impl Engine {
             let amount = crate::exchange::decimal(&r["income"])?;
             let time = r["time"].as_i64().context("资金费时间无效")?;
             // Untracked contracts must not block funding reconciliation for our positions.
-            if !i.book.positions.contains_key(symbol)
-                && !i.book.closed_trades.iter().any(|t| t.symbol == symbol)
-            {
+            if !i.book.positions.contains_key(symbol) && !self.store.has_closed_symbol(symbol)? {
                 continue;
             }
             ensure!(
@@ -1235,6 +1484,13 @@ impl Engine {
                     t.net_profit += amount;
                 }
             }
+            i.book.funding_income.push(FundingIncome {
+                id: id.clone(),
+                symbol: symbol.into(),
+                asset: r["asset"].as_str().unwrap().into(),
+                time,
+                amount,
+            });
             i.book.funding_ids.push(id);
         }
         i.book.funding_cursor = end;
@@ -1242,7 +1498,7 @@ impl Engine {
         self.save(&mut i)?;
         Ok(())
     }
-    async fn ensure_stop_loss(&self, symbol: &str) -> Result<bool> {
+    async fn ensure_stop_loss(&self, symbol: &str, check: ExitCheck) -> Result<bool> {
         let detail = {
             let mut i = self.inner.lock().await;
             let Some(p) = i.book.positions.get(symbol) else {
@@ -1290,12 +1546,16 @@ impl Engine {
                 detail,
             );
         }
-        self.close_position(symbol, OrderRole::StopLoss).await?;
+        self.close_position(symbol, OrderRole::StopLoss, check)
+            .await?;
         Ok(true)
     }
     async fn ensure_tp(&self, symbol: &str) -> Result<()> {
         let cancel = {
             let i = self.inner.lock().await;
+            if self.mode != Mode::Paper && (i.account_sync_failed || i.account_update_pending) {
+                return Ok(());
+            }
             let p = i.book.positions.get(symbol).context("持仓不存在")?;
             if p.stop_loss_triggered {
                 return Ok(());
@@ -1333,6 +1593,7 @@ impl Engine {
                 i.book.pending.remove(&o.client_id);
                 i.book.paper_match_times.remove(&o.client_id);
                 i.book.paper_match_exchange_times.remove(&o.client_id);
+                i.book.paper_match_update_ids.remove(&o.client_id);
                 if let Some(p) = i.book.positions.get_mut(symbol) {
                     p.tp_client_id = None;
                     p.tp_price = None;
@@ -1345,6 +1606,9 @@ impl Engine {
         }
         let order = {
             let mut i = self.inner.lock().await;
+            if self.mode != Mode::Paper && (i.account_sync_failed || i.account_update_pending) {
+                return Ok(());
+            }
             if i.book
                 .pending
                 .values()
@@ -1364,6 +1628,7 @@ impl Engine {
             let quote = i.quotes.get(symbol).context("盘口缺失")?;
             ensure!(now_ms() - quote.time < 15_000, "盘口过期");
             let exchange_time = quote.exchange_time;
+            let update_id = quote.update_id;
             let target = p.target_price(rule.tick_size)?;
             let price = if p.side == Action::Long {
                 ceil_step(target.max(quote.ask), rule.tick_size)
@@ -1410,6 +1675,13 @@ impl Engine {
                     .paper_match_exchange_times
                     .insert(o.client_id.clone(), time);
             }
+            if self.mode == Mode::Paper
+                && let Some(id) = update_id
+            {
+                i.book
+                    .paper_match_update_ids
+                    .insert(o.client_id.clone(), id);
+            }
             self.save(&mut i)?;
             o
         };
@@ -1434,14 +1706,38 @@ impl Engine {
             };
             if q.time <= o.created_at
                 || !(0..15_000).contains(&(now_ms() - q.time))
-                || i.book
-                    .paper_match_times
-                    .get(id)
-                    .is_some_and(|time| *time >= q.time)
+                || (q.update_id.is_none()
+                    && i.book
+                        .paper_match_times
+                        .get(id)
+                        .is_some_and(|time| *time >= q.time))
             {
                 continue;
             }
-            if let Some(time) = q.exchange_time {
+            if q.exchange_time
+                .zip(i.book.paper_match_exchange_times.get(id).copied())
+                .is_some_and(|(new, old)| new < old)
+            {
+                continue;
+            }
+            if let Some(update_id) = q.update_id {
+                if let Some(previous) = i.book.paper_match_update_ids.get(id) {
+                    if update_id <= *previous {
+                        continue;
+                    }
+                } else {
+                    i.book.paper_match_update_ids.insert(id.clone(), update_id);
+                    if let Some(time) = q.exchange_time {
+                        i.book.paper_match_exchange_times.insert(id.clone(), time);
+                    }
+                    i.persistence_pending = true;
+                    changed = true;
+                    continue;
+                }
+            } else if i.book.paper_match_update_ids.contains_key(id) {
+                // Do not refill liquidity from an unidentifiable fallback quote.
+                continue;
+            } else if let Some(time) = q.exchange_time {
                 if let Some(previous) = i.book.paper_match_exchange_times.get(id) {
                     if time <= *previous {
                         continue;
@@ -1479,6 +1775,9 @@ impl Engine {
             }
             i.persistence_pending = true;
             i.book.paper_match_times.insert(id.clone(), q.time);
+            if let Some(update_id) = q.update_id {
+                i.book.paper_match_update_ids.insert(id.clone(), update_id);
+            }
             if let Some(time) = q.exchange_time {
                 i.book.paper_match_exchange_times.insert(id.clone(), time);
             }
@@ -1498,6 +1797,7 @@ impl Engine {
                 i.book.pending.remove(id);
                 i.book.paper_match_times.remove(id);
                 i.book.paper_match_exchange_times.remove(id);
+                i.book.paper_match_update_ids.remove(id);
                 if let Some(local) = i.book.positions.get_mut(&p.symbol) {
                     local.tp_client_id = None;
                     local.tp_price = None;
@@ -1550,10 +1850,71 @@ impl Engine {
     pub async fn manual_close(&self, symbol: &str) -> Result<()> {
         let symbol = normalize_symbol(symbol)?;
         let _guard = self.reconcile_lock.lock().await;
-        self.close_position(&symbol, OrderRole::ManualClose).await
+        self.close_position(&symbol, OrderRole::ManualClose, ExitCheck::Account)
+            .await
+    }
+    async fn confirm_exit(&self, symbol: &str) -> Result<ExitConfirmation> {
+        let started = Instant::now();
+        let (positions, orders) = tokio::try_join!(
+            self.exchange.positions_for(symbol),
+            self.exchange.open_orders_for(symbol),
+        )?;
+        let i = self.inner.lock().await;
+        ensure!(
+            !i.external_positions.contains_key(symbol)
+                && !i.external_orders.iter().any(|s| s == symbol),
+            "已发现外部持仓或订单，等待完整账户对账"
+        );
+        let p = i.book.positions.get(symbol).context("持仓不存在")?;
+        ensure!(positions.len() == 1, "止损持仓数量或持仓模式尚未确认");
+        let remote = &positions[0];
+        ensure!(
+            remote.symbol == symbol
+                && remote.position_side == "BOTH"
+                && remote.position_amt.abs() == p.quantity
+                && p.quantity > Decimal::ZERO
+                && (remote.position_amt > Decimal::ZERO) == (p.side == Action::Long),
+            "止损持仓与系统记录不一致，等待完整账户对账"
+        );
+        let pending: Vec<_> = i
+            .book
+            .pending
+            .values()
+            .filter(|o| o.symbol == symbol)
+            .collect();
+        ensure!(
+            pending.iter().all(|o| o.role == OrderRole::TakeProfit
+                && !matches!(o.status.as_str(), "UNKNOWN" | "SUBMITTING" | "SETTLING")),
+            "订单状态或费用尚未确认，止损意图已保留"
+        );
+        ensure!(
+            orders.len() == pending.len()
+                && pending.iter().all(|local| orders
+                    .iter()
+                    .filter(|remote| remote.client_order_id == local.client_id)
+                    .count()
+                    == 1)
+                && orders.iter().all(|remote| remote.symbol == symbol
+                    && matches!(remote.status.as_str(), "NEW" | "PARTIALLY_FILLED")
+                    && pending
+                        .iter()
+                        .any(|local| remote.client_order_id == local.client_id
+                            && remote.orig_qty == local.quantity
+                            && remote.executed_qty == local.accounted_quantity)),
+            "止损挂单与系统记录不一致，等待订单确认"
+        );
+        ensure!(
+            started.elapsed() < Duration::from_secs(15),
+            "止损独立核对已过期"
+        );
+        Ok(ExitConfirmation {
+            quantity: p.quantity,
+            side: p.side,
+            started,
+        })
     }
     // Caller holds reconcile_lock, shared with polling and manual closes.
-    async fn close_position(&self, symbol: &str, role: OrderRole) -> Result<()> {
+    async fn close_position(&self, symbol: &str, role: OrderRole, check: ExitCheck) -> Result<()> {
         let pending = self
             .inner
             .lock()
@@ -1577,18 +1938,50 @@ impl Engine {
                     .any(|o| matches!(o.status.as_str(), "UNKNOWN" | "SUBMITTING" | "SETTLING")),
                 "订单状态或费用尚未确认，止损意图已保留"
             );
+            let i = self.inner.lock().await;
+            ensure!(
+                !i.external_positions.contains_key(symbol)
+                    && !i.external_orders.iter().any(|s| s == symbol),
+                "外部持仓或订单变更，等待完整账户对账"
+            );
+            let q = i.quotes.get(symbol).context("止损盘口缺失")?;
+            q.validate()?;
+            ensure!((0..15_000).contains(&(now_ms() - q.time)), "止损盘口过期");
         }
+        let independently_checked = self.mode != Mode::Paper && matches!(check, ExitCheck::Symbol);
+        let mut confirmation = if independently_checked {
+            Some(self.confirm_exit(symbol).await?)
+        } else {
+            None
+        };
+        let cancelled = !pending.is_empty();
         for o in pending {
             if self.mode == Mode::Paper {
                 let mut i = self.inner.lock().await;
                 i.book.pending.remove(&o.client_id);
                 i.book.paper_match_times.remove(&o.client_id);
                 i.book.paper_match_exchange_times.remove(&o.client_id);
+                i.book.paper_match_update_ids.remove(&o.client_id);
                 i.persistence_pending = true;
             } else {
                 let r = self.exchange.cancel(symbol, &o.client_id).await?;
                 self.apply_order(r).await?;
             }
+        }
+        if independently_checked
+            && cancelled
+            && self
+                .inner
+                .lock()
+                .await
+                .book
+                .positions
+                .get(symbol)
+                .is_some_and(|p| p.quantity > Decimal::ZERO)
+        {
+            // Cancellation may report a partial fill. Verify the updated quantity
+            // and absence of orders before creating a reduce-only market intent.
+            confirmation = Some(self.confirm_exit(symbol).await?);
         }
         let order = {
             let mut i = self.inner.lock().await;
@@ -1625,10 +2018,22 @@ impl Engine {
                 self.save(&mut i)?;
                 None
             } else {
-                ensure!(
-                    now_ms() - i.account_at < 15_000 && !i.external_positions.contains_key(symbol),
-                    "账户未对账"
-                );
+                if let Some(confirmation) = confirmation {
+                    ensure!(
+                        confirmation.started.elapsed() < Duration::from_secs(15)
+                            && confirmation.quantity == p.quantity
+                            && confirmation.side == p.side,
+                        "止损独立核对已过期或持仓已变化"
+                    );
+                } else {
+                    ensure!(
+                        !i.account_sync_failed
+                            && !i.account_update_pending
+                            && (0..15_000).contains(&(now_ms() - i.account_at))
+                            && !i.external_positions.contains_key(symbol),
+                        "账户未对账"
+                    );
+                }
                 i.book.sequence += 1;
                 let o = PendingOrder {
                     client_id: format!(
@@ -1778,6 +2183,16 @@ pub fn normalize_symbol(raw: &str) -> Result<String> {
     );
     Ok(s)
 }
+fn quote_is_older(quote: &Quote, previous: &Quote) -> bool {
+    quote
+        .exchange_time
+        .zip(previous.exchange_time)
+        .is_some_and(|(new, old)| new < old)
+        || quote
+            .update_id
+            .zip(previous.update_id)
+            .is_some_and(|(new, old)| new < old)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1798,6 +2213,7 @@ mod tests {
             ask_qty: Decimal::ONE,
             time: now - 14_999,
             exchange_time: None,
+            update_id: None,
         };
         assert_eq!(quote.spread_bps(), d("10"));
         ensure_entry_quote(&quote, d("10"), now).unwrap();
@@ -1827,6 +2243,7 @@ mod tests {
             ask_qty: d("28418200.1"),
             time: now - 483,
             exchange_time: None,
+            update_id: None,
         };
         let error = ensure_entry_quote(&quote, d("10"), now).unwrap_err();
         let detail = waiting_detail(&error);
@@ -2200,6 +2617,14 @@ mod tests {
         )
         .unwrap();
         seed(&e).await;
+        e.inner.lock().await.book.pool.insert(
+            "XUSDT".into(),
+            PoolCoin {
+                symbol: "XUSDT".into(),
+                enabled: true,
+                config: None,
+            },
+        );
         e.refresh_market().await.unwrap();
         let old_receipt = now_ms() - 100;
         e.inner.lock().await.quotes.get_mut("XUSDT").unwrap().time = old_receipt;
@@ -2224,6 +2649,168 @@ mod tests {
         );
         assert_eq!(e.inner.lock().await.quotes["XUSDT"].bid, d("101"));
         server.abort();
+    }
+    #[tokio::test]
+    async fn connected_quotes_skip_rest_and_stale_symbols_are_recovered_without_erasing_other_quotes()
+     {
+        use axum::{Json, Router, extract::Query, routing::get};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let app=Router::new().route("/fapi/v1/ticker/bookTicker",get(move |Query(query):Query<BTreeMap<String,String>>| {
+            let observed=observed.clone();async move {
+                let symbol=query["symbol"].clone();observed.lock().await.push(symbol.clone());
+                Json(json!({"symbol":symbol,"bidPrice":"100","askPrice":"101","bidQty":"1","askQty":"1","time":101,"lastUpdateId":11}))
+            }
+        }));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Paper,
+            Store::open(":memory:", Mode::Paper).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        seed(&e).await;
+        {
+            let mut i = e.inner.lock().await;
+            for symbol in ["XUSDT", "YUSDC"] {
+                i.book.pool.insert(
+                    symbol.into(),
+                    PoolCoin {
+                        symbol: symbol.into(),
+                        enabled: true,
+                        config: None,
+                    },
+                );
+            }
+            let q = i.quotes.get_mut("XUSDT").unwrap();
+            q.exchange_time = Some(100);
+            q.update_id = Some(10);
+            let mut q = q.clone();
+            q.time = now_ms() - 16_000;
+            i.quotes.insert("YUSDC".into(), q);
+        }
+        e.market_stream.lock().await.connected = true;
+        e.refresh_market().await.unwrap();
+        assert_eq!(*calls.lock().await, vec!["YUSDC"]);
+        e.refresh_market().await.unwrap();
+        assert_eq!(calls.lock().await.len(), 1);
+        let mut quote = e.inner.lock().await.quotes["XUSDT"].clone();
+        assert!(!e.apply_market_quote("ZUSDT".into(), quote.clone()).await);
+        let old_receipt = quote.time;
+        quote.time = now_ms();
+        quote.bid = d("90");
+        assert!(!e.apply_market_quote("XUSDT".into(), quote.clone()).await);
+        assert_eq!(e.inner.lock().await.quotes["XUSDT"].time, old_receipt);
+        quote.update_id = Some(11);
+        assert!(e.apply_market_quote("XUSDT".into(), quote).await);
+        assert_eq!(e.inner.lock().await.quotes["XUSDT"].bid, d("90"));
+        e.inner.lock().await.quotes.get_mut("YUSDC").unwrap().time = now_ms() - 16_000;
+        e.inner.lock().await.market_health(Mode::Paper);
+        assert!(now_ms() - e.snapshot().await.market_at >= 15_000);
+        e.market_stream.lock().await.connected = false;
+        e.refresh_market().await.unwrap();
+        assert_eq!(*calls.lock().await, vec!["YUSDC", "XUSDT", "YUSDC"]);
+        assert_eq!(e.inner.lock().await.quotes.len(), 2);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn market_subscriptions_include_removed_positions_and_unknown_pending_orders() {
+        let e = paper();
+        seed(&e).await;
+        e.paper_entry(entry(Action::Long)).await.unwrap();
+        let mut pending = entry(Action::Short);
+        pending.symbol = "ZUSDC".into();
+        pending.status = "UNKNOWN".into();
+        {
+            let mut i = e.inner.lock().await;
+            i.book.pool.insert(
+                "YUSDT".into(),
+                PoolCoin {
+                    symbol: "YUSDT".into(),
+                    enabled: false,
+                    config: None,
+                },
+            );
+            i.book.pending.insert(pending.client_id.clone(), pending);
+        }
+        assert_eq!(
+            e.market_symbols().await,
+            BTreeSet::from(["XUSDT".into(), "YUSDT".into(), "ZUSDC".into()])
+        );
+    }
+    #[tokio::test]
+    async fn paper_book_update_ids_allow_same_millisecond_updates_without_refilling_after_restart()
+    {
+        let e = paper();
+        seed(&e).await;
+        {
+            let mut i = e.inner.lock().await;
+            let q = i.quotes.get_mut("XUSDT").unwrap();
+            q.exchange_time = Some(100);
+            q.update_id = Some(1);
+        }
+        e.paper_entry(entry(Action::Long)).await.unwrap();
+        e.ensure_tp("XUSDT").await.unwrap();
+        prepare_partial_quote(&e).await;
+        e.inner
+            .lock()
+            .await
+            .quotes
+            .get_mut("XUSDT")
+            .unwrap()
+            .update_id = Some(2);
+        e.paper_match().await.unwrap();
+        assert_eq!(
+            e.inner.lock().await.book.positions["XUSDT"].quantity,
+            d("0.6")
+        );
+        let restored = Engine::new(
+            Mode::Paper,
+            e.store.clone(),
+            config(),
+            Binance::new(Mode::Paper).unwrap(),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        seed(&restored).await;
+        prepare_partial_quote(&restored).await;
+        {
+            let mut i = restored.inner.lock().await;
+            let q = i.quotes.get_mut("XUSDT").unwrap();
+            q.exchange_time = Some(100);
+            q.update_id = Some(2);
+        }
+        restored.paper_match().await.unwrap();
+        assert_eq!(
+            restored.inner.lock().await.book.positions["XUSDT"].quantity,
+            d("0.6")
+        );
+        restored
+            .inner
+            .lock()
+            .await
+            .quotes
+            .get_mut("XUSDT")
+            .unwrap()
+            .update_id = Some(3);
+        restored.paper_match().await.unwrap();
+        assert_eq!(
+            restored.inner.lock().await.book.positions["XUSDT"].quantity,
+            d("0.2")
+        );
+        restored.manual_close("XUSDT").await.unwrap();
+        assert!(
+            restored
+                .store
+                .load()
+                .unwrap()
+                .unwrap()
+                .1
+                .paper_match_update_ids
+                .is_empty()
+        );
     }
     #[tokio::test]
     async fn unchanged_polling_skips_writes_but_partial_and_complete_fills_persist() {
@@ -2425,6 +3012,7 @@ mod tests {
                     ask_qty: 1.into(),
                     time: now_ms(),
                     exchange_time: None,
+                    update_id: None,
                 };
                 e.decide("XUSDT", &bars, &quote, &config()).await.unwrap()
             }
@@ -2503,6 +3091,7 @@ mod tests {
                 ask_qty: d("10"),
                 time: now_ms(),
                 exchange_time: None,
+                update_id: None,
             },
         );
         i.market_at = now_ms();
@@ -2589,7 +3178,11 @@ mod tests {
             q.ask = d("101");
             q.time = now_ms() - 15_001;
         }
-        assert!(!e.ensure_stop_loss("XUSDT").await.unwrap()); // Disabled by default.
+        assert!(
+            !e.ensure_stop_loss("XUSDT", ExitCheck::Account)
+                .await
+                .unwrap()
+        ); // Disabled by default.
         e.inner
             .lock()
             .await
@@ -2599,7 +3192,7 @@ mod tests {
             .unwrap()
             .stop_loss_usdt = d("0.6998");
         assert!(
-            e.ensure_stop_loss("XUSDT")
+            e.ensure_stop_loss("XUSDT", ExitCheck::Account)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -2607,9 +3200,17 @@ mod tests {
         );
         assert!(!e.inner.lock().await.book.positions["XUSDT"].stop_loss_triggered);
         e.inner.lock().await.quotes.get_mut("XUSDT").unwrap().time = now_ms() + 30_000;
-        assert!(e.ensure_stop_loss("XUSDT").await.is_err());
+        assert!(
+            e.ensure_stop_loss("XUSDT", ExitCheck::Account)
+                .await
+                .is_err()
+        );
         e.inner.lock().await.quotes.get_mut("XUSDT").unwrap().time = now_ms();
-        assert!(!e.ensure_stop_loss("XUSDT").await.unwrap());
+        assert!(
+            !e.ensure_stop_loss("XUSDT", ExitCheck::Account)
+                .await
+                .unwrap()
+        );
         e.inner
             .lock()
             .await
@@ -2618,7 +3219,11 @@ mod tests {
             .get_mut("XUSDT")
             .unwrap()
             .stop_loss_usdt = d("0.6997");
-        assert!(e.ensure_stop_loss("XUSDT").await.unwrap());
+        assert!(
+            e.ensure_stop_loss("XUSDT", ExitCheck::Account)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             e.inner.lock().await.book.closed_trades[0].net_profit,
             d("-0.6997")
@@ -2686,7 +3291,7 @@ mod tests {
                 q.bid = d("99");
                 q.ask = d("99");
             }
-            let result = e.ensure_stop_loss("XUSDT").await;
+            let result = e.ensure_stop_loss("XUSDT", ExitCheck::Account).await;
             if status == "NEW" {
                 assert!(result.unwrap_err().to_string().contains("未确认撤销"));
                 assert_eq!(submissions.load(Ordering::SeqCst), 0);
@@ -2721,7 +3326,7 @@ mod tests {
                 restored.inner.lock().await.account_at = now_ms();
                 assert!(
                     restored
-                        .ensure_stop_loss("XUSDT")
+                        .ensure_stop_loss("XUSDT", ExitCheck::Account)
                         .await
                         .unwrap_err()
                         .to_string()
@@ -2741,6 +3346,618 @@ mod tests {
             }
             server.abort();
         }
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ExitScenario {
+        BalanceError,
+        BalanceTimeout,
+        BalanceLimit,
+        ConfirmationTimeout,
+        ConfirmationLimit,
+        WrongQuantity,
+        WrongSide,
+        HedgeMode,
+        ExternalOrder,
+        UnknownOrder,
+        StaleQuote,
+        PartialCancel,
+        UnconfirmedCancel,
+        UnsettledCancel,
+        UnknownExit,
+        Startup,
+    }
+    struct ExitFixture {
+        scenario: ExitScenario,
+        side: Action,
+        submitted: Mutex<Vec<BTreeMap<String, String>>>,
+        confirmations: std::sync::atomic::AtomicUsize,
+        cancellations: std::sync::atomic::AtomicUsize,
+        cancelled: std::sync::atomic::AtomicBool,
+        recovered: std::sync::atomic::AtomicBool,
+        store: Store,
+    }
+    fn exit_tp_report(status: &str, filled: &str) -> Value {
+        json!({"symbol":"XUSDT","clientOrderId":"test-tp","orderId":42,
+            "status":status,"executedQty":filled,"avgPrice":"101","origQty":"1",
+            "cumQuote":(d(filled) * d("101")).to_string()})
+    }
+    async fn exit_fixture(
+        scenario: ExitScenario,
+        side: Action,
+    ) -> (Arc<Engine>, Arc<ExitFixture>, tokio::task::JoinHandle<()>) {
+        use axum::{
+            Json, Router,
+            extract::{Query, State},
+            http::StatusCode,
+            routing::get,
+        };
+        use std::sync::atomic::Ordering;
+        let fixture = Arc::new(ExitFixture {
+            scenario,
+            side,
+            submitted: Mutex::new(Vec::new()),
+            confirmations: 0.into(),
+            cancellations: 0.into(),
+            cancelled: false.into(),
+            recovered: false.into(),
+            store: Store::open(":memory:", Mode::Testnet).unwrap(),
+        });
+        async fn positions(
+            State(f): State<Arc<ExitFixture>>,
+            Query(q): Query<BTreeMap<String, String>>,
+        ) -> (StatusCode, Json<Value>) {
+            if let Some(symbol) = q.get("symbol") {
+                assert_eq!(symbol, "XUSDT");
+                assert!(q.contains_key("signature"));
+                f.confirmations.fetch_add(1, Ordering::SeqCst);
+                if f.scenario == ExitScenario::ConfirmationTimeout {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                if f.scenario == ExitScenario::ConfirmationLimit {
+                    return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"code":-1003})));
+                }
+            }
+            let quantity = if f.scenario == ExitScenario::WrongQuantity {
+                d("0.5")
+            } else if f.cancelled.load(Ordering::SeqCst)
+                && matches!(
+                    f.scenario,
+                    ExitScenario::PartialCancel | ExitScenario::UnsettledCancel
+                )
+            {
+                d("0.6")
+            } else {
+                Decimal::ONE
+            };
+            let sign = if f.scenario == ExitScenario::WrongSide {
+                -f.side.sign()
+            } else {
+                f.side.sign()
+            };
+            (
+                StatusCode::OK,
+                Json(
+                    json!([{"symbol":"XUSDT", "positionAmt":(sign * quantity).to_string(),
+                "entryPrice":"100", "positionSide":if f.scenario == ExitScenario::HedgeMode {"LONG"} else {"BOTH"}}]),
+                ),
+            )
+        }
+        async fn orders(
+            State(f): State<Arc<ExitFixture>>,
+            Query(q): Query<BTreeMap<String, String>>,
+        ) -> Json<Value> {
+            if let Some(symbol) = q.get("symbol") {
+                assert_eq!(symbol, "XUSDT");
+                assert!(q.contains_key("signature"));
+            }
+            let mut orders = Vec::new();
+            if !f.cancelled.load(Ordering::SeqCst)
+                && matches!(
+                    f.scenario,
+                    ExitScenario::UnknownOrder
+                        | ExitScenario::StaleQuote
+                        | ExitScenario::PartialCancel
+                        | ExitScenario::UnconfirmedCancel
+                        | ExitScenario::UnsettledCancel
+                )
+            {
+                orders.push(exit_tp_report("NEW", "0"));
+            }
+            if f.scenario == ExitScenario::ExternalOrder {
+                let mut external = exit_tp_report("NEW", "0");
+                external["clientOrderId"] = json!("external-order");
+                orders.push(external);
+            }
+            Json(json!(orders))
+        }
+        async fn balances(State(f): State<Arc<ExitFixture>>) -> (StatusCode, Json<Value>) {
+            if f.recovered.load(Ordering::SeqCst) {
+                return (
+                    StatusCode::OK,
+                    Json(
+                        json!({"multiAssetsMargin":false,"availableBalance":"1000","assets":[{"asset":"USDT","availableBalance":"1000"}]}),
+                    ),
+                );
+            }
+            if f.scenario == ExitScenario::BalanceTimeout {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            let limited = f.scenario == ExitScenario::BalanceLimit;
+            (
+                if limited {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                Json(json!({"code":if limited {-1003} else {-1000}})),
+            )
+        }
+        async fn cancel(
+            State(f): State<Arc<ExitFixture>>,
+            Query(q): Query<BTreeMap<String, String>>,
+        ) -> Json<Value> {
+            assert_eq!(q["symbol"], "XUSDT");
+            assert_eq!(q["origClientOrderId"], "test-tp");
+            f.cancellations.fetch_add(1, Ordering::SeqCst);
+            if f.scenario == ExitScenario::UnconfirmedCancel {
+                return Json(exit_tp_report("NEW", "0"));
+            }
+            f.cancelled.store(true, Ordering::SeqCst);
+            Json(exit_tp_report("CANCELED", "0.4"))
+        }
+        async fn submit(
+            State(f): State<Arc<ExitFixture>>,
+            body: String,
+        ) -> (StatusCode, Json<Value>) {
+            let form: BTreeMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect();
+            assert_eq!(form["reduceOnly"], "true");
+            assert_eq!(form["type"], "MARKET");
+            assert_eq!(form["positionSide"], "BOTH");
+            assert_eq!(form["side"], f.side.exit_side());
+            assert!(form["newClientOrderId"].starts_with("gt-s-"));
+            // The durable intent must exist before any POST reaches the exchange.
+            let book = f.store.load().unwrap().unwrap().1;
+            assert_eq!(book.pending[&form["newClientOrderId"]].status, "SUBMITTING");
+            f.submitted.lock().await.push(form.clone());
+            if f.scenario == ExitScenario::UnknownExit {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"code":-1007})));
+            }
+            (
+                StatusCode::OK,
+                Json(
+                    json!({"symbol":"XUSDT","clientOrderId":form["newClientOrderId"],"orderId":43,
+                "status":"NEW","executedQty":"0","avgPrice":"0","origQty":form["quantity"],"cumQuote":"0"}),
+                ),
+            )
+        }
+        let app = Router::new()
+            .route("/fapi/v3/positionRisk", get(positions))
+            .route("/fapi/v1/openOrders", get(orders))
+            .route("/fapi/v2/account", get(balances))
+            .route("/fapi/v3/balance", get(|| async { (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"code":-1000}))) }))
+            .route("/fapi/v1/time", get(|| async { Json(json!({"serverTime":now_ms()})) }))
+            .route("/fapi/v1/positionSide/dual", get(|| async { Json(json!({"dualSidePosition":false})) }))
+            .route("/fapi/v1/order", get(|| async { (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"code":-1000}))) }).delete(cancel).post(submit))
+            .route("/fapi/v1/userTrades", get(move || async move { Json(json!([{"id":1,"orderId":42,"qty":"0.4","price":"101",
+                "commission":"0.00808","commissionAsset":if scenario == ExitScenario::UnsettledCancel {"BNB"} else {"USDT"},"realizedPnl":(side.sign() * d("0.4")).to_string(),"time":1,"side":side.exit_side()}])) }))
+            .with_state(fixture.clone());
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Testnet,
+            fixture.store.clone(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        seed(&e).await;
+        let mut order = entry(side);
+        order.stop_loss_usdt = d("0.5");
+        e.paper_entry(order.clone()).await.unwrap();
+        {
+            let mut i = e.inner.lock().await;
+            i.account_at = if scenario == ExitScenario::Startup {
+                0
+            } else {
+                now_ms() - 60_000
+            };
+            i.available = d("321");
+            i.paused = false;
+            let q = i.quotes.get_mut("XUSDT").unwrap();
+            q.bid = if side == Action::Long {
+                d("99")
+            } else {
+                d("101")
+            };
+            q.ask = q.bid;
+            if matches!(
+                scenario,
+                ExitScenario::UnknownOrder
+                    | ExitScenario::StaleQuote
+                    | ExitScenario::PartialCancel
+                    | ExitScenario::UnconfirmedCancel
+                    | ExitScenario::UnsettledCancel
+            ) {
+                order.client_id = "test-tp".into();
+                order.role = OrderRole::TakeProfit;
+                order.price = Some(d("101"));
+                order.status = if scenario == ExitScenario::UnknownOrder {
+                    "UNKNOWN"
+                } else {
+                    "NEW"
+                }
+                .into();
+                i.book.pending.insert(order.client_id.clone(), order);
+                let p = i.book.positions.get_mut("XUSDT").unwrap();
+                p.tp_client_id = Some("test-tp".into());
+                p.tp_price = Some(d("101"));
+            }
+            if scenario == ExitScenario::StaleQuote {
+                i.book
+                    .positions
+                    .get_mut("XUSDT")
+                    .unwrap()
+                    .stop_loss_triggered = true;
+                i.quotes.get_mut("XUSDT").unwrap().time = now_ms() - 16_000;
+            }
+            e.save(&mut i).unwrap();
+        }
+        (e, fixture, server)
+    }
+    #[tokio::test]
+    async fn stop_loss_survives_balance_errors_timeouts_and_startup_without_refreshing_account() {
+        use std::sync::atomic::Ordering;
+        for side in [Action::Long, Action::Short] {
+            for scenario in [
+                ExitScenario::BalanceError,
+                ExitScenario::BalanceTimeout,
+                ExitScenario::Startup,
+            ] {
+                let (e, fixture, server) = exit_fixture(scenario, side).await;
+                let account_at = e.snapshot().await.account_at;
+                e.manage_positions().await.unwrap();
+                let snapshot = e.snapshot().await;
+                assert_eq!(fixture.submitted.lock().await.len(), 1);
+                assert_eq!(fixture.submitted.lock().await[0]["quantity"], "1");
+                assert_eq!(fixture.confirmations.load(Ordering::SeqCst), 1);
+                assert!(snapshot.paused && snapshot.account_sync_failed);
+                assert!(snapshot.health.contains("账户同步失败"));
+                assert_eq!(snapshot.account_at, account_at);
+                assert_eq!(snapshot.available_usdt, d("321"));
+                assert_eq!(snapshot.runtime.position_management.failed_runs, 1);
+                assert_eq!(snapshot.pending[0].role, OrderRole::StopLoss);
+                assert!(e.set_running(true).await.is_err());
+                server.abort();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn degraded_stop_loss_blocks_limits_failed_confirmations_and_account_mismatches() {
+        use std::sync::atomic::Ordering;
+        for scenario in [
+            ExitScenario::BalanceLimit,
+            ExitScenario::ConfirmationLimit,
+            ExitScenario::ConfirmationTimeout,
+            ExitScenario::WrongQuantity,
+            ExitScenario::WrongSide,
+            ExitScenario::HedgeMode,
+            ExitScenario::ExternalOrder,
+            ExitScenario::UnknownOrder,
+            ExitScenario::StaleQuote,
+        ] {
+            let (e, fixture, server) = exit_fixture(scenario, Action::Long).await;
+            e.manage_positions().await.unwrap();
+            assert!(fixture.submitted.lock().await.is_empty());
+            assert_eq!(fixture.cancellations.load(Ordering::SeqCst), 0);
+            let saved = e.store.load().unwrap().unwrap().1;
+            assert_eq!(saved.positions["XUSDT"].quantity, Decimal::ONE);
+            assert!(saved.positions["XUSDT"].stop_loss_triggered);
+            assert!(
+                !saved
+                    .pending
+                    .values()
+                    .any(|o| o.role == OrderRole::StopLoss)
+            );
+            if scenario == ExitScenario::UnknownOrder {
+                assert_eq!(saved.pending["test-tp"].status, "UNKNOWN");
+            }
+            if matches!(
+                scenario,
+                ExitScenario::BalanceLimit | ExitScenario::ConfirmationLimit
+            ) {
+                assert!(e.exchange.rate_limit_snapshot().await.cooldown_remaining_ms > 0);
+            }
+            assert!(e.snapshot().await.account_sync_failed);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn degraded_stop_loss_reconfirms_partial_cancellation_and_waits_for_unconfirmed_cancels()
+    {
+        use std::sync::atomic::Ordering;
+        for scenario in [
+            ExitScenario::PartialCancel,
+            ExitScenario::UnconfirmedCancel,
+            ExitScenario::UnsettledCancel,
+        ] {
+            let (e, fixture, server) = exit_fixture(scenario, Action::Long).await;
+            let account_at = e.snapshot().await.account_at;
+            e.manage_positions().await.unwrap();
+            assert_eq!(fixture.cancellations.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.confirmations.load(Ordering::SeqCst), 2);
+            if scenario == ExitScenario::PartialCancel {
+                assert_eq!(fixture.submitted.lock().await[0]["quantity"], "0.6");
+                let book = e.store.load().unwrap().unwrap().1;
+                assert_eq!(book.positions["XUSDT"].quantity, d("0.6"));
+                assert!(!book.pending.contains_key("test-tp"));
+                assert_eq!(
+                    book.pending.values().next().unwrap().role,
+                    OrderRole::StopLoss
+                );
+            } else if scenario == ExitScenario::UnconfirmedCancel {
+                assert!(fixture.submitted.lock().await.is_empty());
+                assert_eq!(
+                    e.store.load().unwrap().unwrap().1.pending["test-tp"].status,
+                    "NEW"
+                );
+            } else {
+                assert!(fixture.submitted.lock().await.is_empty());
+                let book = e.store.load().unwrap().unwrap().1;
+                assert_eq!(book.pending["test-tp"].status, "SETTLING");
+                assert_eq!(book.positions["XUSDT"].quantity, d("0.6"));
+                assert!(!book.positions["XUSDT"].accounting_complete);
+            }
+            assert_eq!(e.snapshot().await.account_at, account_at);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn degraded_stop_loss_preserves_uncertain_orders_and_known_external_changes() {
+        use std::sync::atomic::Ordering;
+        for status in ["SUBMITTING", "SETTLING"] {
+            let (e, fixture, server) = exit_fixture(ExitScenario::UnknownOrder, Action::Long).await;
+            {
+                let mut i = e.inner.lock().await;
+                i.book.pending.get_mut("test-tp").unwrap().status = status.into();
+                e.save(&mut i).unwrap();
+            }
+            e.manage_positions().await.unwrap();
+            assert!(fixture.submitted.lock().await.is_empty());
+            assert_eq!(fixture.cancellations.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                e.store.load().unwrap().unwrap().1.pending["test-tp"].status,
+                status
+            );
+            server.abort();
+        }
+        for external_position in [true, false] {
+            let (e, fixture, server) = exit_fixture(ExitScenario::BalanceError, Action::Long).await;
+            {
+                let mut i = e.inner.lock().await;
+                if external_position {
+                    i.external_positions.insert("XUSDT".into(), d("0.5"));
+                } else {
+                    i.external_orders.push("XUSDT".into());
+                }
+            }
+            e.manage_positions().await.unwrap();
+            assert!(fixture.submitted.lock().await.is_empty());
+            assert_eq!(fixture.cancellations.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.confirmations.load(Ordering::SeqCst), 0);
+            assert!(e.store.load().unwrap().unwrap().1.positions["XUSDT"].stop_loss_triggered);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn degraded_unknown_exit_is_not_resubmitted_and_survives_restart() {
+        let (e, fixture, server) = exit_fixture(ExitScenario::UnknownExit, Action::Long).await;
+        e.manage_positions().await.unwrap();
+        assert_eq!(fixture.submitted.lock().await.len(), 1);
+        let (config, book) = e.store.load().unwrap().unwrap();
+        assert_eq!(book.pending.values().next().unwrap().status, "UNKNOWN");
+        e.manage_positions().await.unwrap();
+        let restored = Engine::new(
+            Mode::Testnet,
+            fixture.store.clone(),
+            config,
+            Binance::mock(e.exchange.base.clone()),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        seed(&restored).await;
+        restored.manage_positions().await.unwrap();
+        assert_eq!(fixture.submitted.lock().await.len(), 1);
+        assert_eq!(
+            fixture
+                .store
+                .load()
+                .unwrap()
+                .unwrap()
+                .1
+                .pending
+                .values()
+                .next()
+                .unwrap()
+                .status,
+            "UNKNOWN"
+        );
+        assert!(restored.snapshot().await.positions[0].stop_loss_triggered);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn only_complete_account_recovery_clears_failure_and_does_not_resume_entries() {
+        use std::sync::atomic::Ordering;
+        let (e, fixture, server) = exit_fixture(ExitScenario::BalanceError, Action::Long).await;
+        {
+            let mut i = e.inner.lock().await;
+            i.account_at = now_ms();
+            let q = i.quotes.get_mut("XUSDT").unwrap();
+            q.bid = d("100");
+            q.ask = q.bid;
+        }
+        e.manage_positions().await.unwrap();
+        assert!(fixture.submitted.lock().await.is_empty());
+        assert!(e.snapshot().await.account_sync_failed);
+        assert_eq!(
+            e.set_running(true).await.unwrap_err().to_string(),
+            "账户尚未对账"
+        );
+        assert!(e.inner.lock().await.book.pending.is_empty()); // No new TP during degradation.
+        assert!(!e.snapshot().await.positions[0].stop_loss_triggered);
+        e.exchange.sync_time().await.unwrap();
+        assert!(e.snapshot().await.account_sync_failed);
+        fixture.recovered.store(true, Ordering::SeqCst);
+        e.sync_account().await.unwrap();
+        let snapshot = e.snapshot().await;
+        assert!(!snapshot.account_sync_failed);
+        assert!(snapshot.paused);
+        assert_eq!(snapshot.available_usdt, d("1000"));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn user_order_events_settle_once_and_preserve_uncertain_terminal_orders() {
+        let (e, fixture, server) = exit_fixture(ExitScenario::UnknownOrder, Action::Long).await;
+        let push = |status: &str, filled: &str, side: &str| {
+            crate::user_stream::parse_event(json!({"e":"ORDER_TRADE_UPDATE","E":2,"T":1,"o":{
+            "s":"XUSDT","c":"test-tp","i":42,"q":"1","z":filled,"ap":"101","X":status,"S":side,"ps":"BOTH"}})).unwrap()
+        };
+        e.handle_user_event(push("PARTIALLY_FILLED", "0.4", "SELL"))
+            .await
+            .unwrap();
+        e.handle_user_event(push("PARTIALLY_FILLED", "0.4", "SELL"))
+            .await
+            .unwrap();
+        e.handle_user_event(push("NEW", "0", "SELL")).await.unwrap();
+        {
+            let i = e.inner.lock().await;
+            let p = &i.book.positions["XUSDT"];
+            assert_eq!(p.quantity, d("0.6"));
+            assert_eq!(p.exit_fee, d("0.00808"));
+            assert_eq!(p.observed_trade_ids, vec![1]);
+            assert_eq!(i.book.pending["test-tp"].status, "PARTIALLY_FILLED");
+            assert!(i.account_update_pending);
+            assert_eq!(i.available, d("321"));
+        }
+        // Repricing must wait for the account read, even after partial fills
+        // have been accounted from a push.
+        e.inner
+            .lock()
+            .await
+            .book
+            .pending
+            .get_mut("test-tp")
+            .unwrap()
+            .price = Some(d("99"));
+        e.ensure_tp("XUSDT").await.unwrap();
+        assert_eq!(
+            fixture
+                .cancellations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(
+            e.handle_user_event(push("PARTIALLY_FILLED", "0.4", "BUY"))
+                .await
+                .is_err()
+        );
+        e.inner
+            .lock()
+            .await
+            .book
+            .pending
+            .get_mut("test-tp")
+            .unwrap()
+            .status = "SETTLING".into();
+        e.handle_user_event(push("PARTIALLY_FILLED", "0.4", "SELL"))
+            .await
+            .unwrap();
+        assert_eq!(
+            e.inner.lock().await.book.pending["test-tp"].status,
+            "SETTLING"
+        );
+        assert!(fixture.submitted.lock().await.is_empty());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn account_push_during_rest_read_prevents_publication_of_a_stale_snapshot() {
+        use axum::{Json, Router, routing::get};
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let begin = started.clone();
+        let finish = release.clone();
+        let app=Router::new()
+            .route("/fapi/v3/positionRisk",get(move || {let begin=begin.clone();let finish=finish.clone();async move {
+                begin.notify_one();finish.notified().await;Json(json!([]))
+            }}))
+            .route("/fapi/v1/openOrders",get(||async{Json(json!([]))}))
+            .route("/fapi/v2/account",get(||async{Json(json!({"multiAssetsMargin":false,"availableBalance":"1000","assets":[{"asset":"USDT","availableBalance":"1000"}]}))}));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Testnet,
+            Store::open(":memory:", Mode::Testnet).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        let original_account_at = now_ms() - 1_000;
+        {
+            let mut i = e.inner.lock().await;
+            i.available = d("321");
+            i.account_at = original_account_at;
+            i.book.funding_last_poll = now_ms();
+            i.paused = false;
+        }
+        let reader = e.clone();
+        let task = tokio::spawn(async move { reader.manage_positions().await });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        let writer = e.clone();
+        let push = tokio::spawn(async move { writer.handle_user_event(UserEvent::Account).await });
+        tokio::time::timeout(Duration::from_secs(1), e.account_notify.notified())
+            .await
+            .unwrap();
+        assert!(e.snapshot().await.account_update_pending);
+        release.notify_one();
+        task.await.unwrap().unwrap();
+        push.await.unwrap().unwrap();
+        let snapshot = e.snapshot().await;
+        assert!(snapshot.account_update_pending);
+        assert!(!snapshot.account_sync_failed);
+        assert!(!snapshot.paused);
+        assert_eq!(snapshot.account_at, original_account_at);
+        assert_eq!(snapshot.available_usdt, d("321"));
+
+        release.notify_one();
+        e.manage_positions().await.unwrap();
+        let snapshot = e.snapshot().await;
+        assert!(!snapshot.account_update_pending);
+        assert!(!snapshot.account_sync_failed);
+        assert!(!snapshot.paused);
+        assert_eq!(snapshot.available_usdt, d("1000"));
+
+        // A push queued before a REST read must also invalidate the successful
+        // read after acquiring the lock, and schedule another reconciliation.
+        let guard = e.reconcile_lock.lock().await;
+        e.account_notify.notified().await; // Consume the last push's wakeup.
+        let writer = e.clone();
+        let push = tokio::spawn(async move { writer.handle_user_event(UserEvent::Account).await });
+        tokio::time::timeout(Duration::from_secs(1), e.account_notify.notified())
+            .await
+            .unwrap();
+        release.notify_one();
+        assert!(e.sync_account().await.unwrap());
+        assert!(!e.snapshot().await.account_update_pending);
+        drop(guard);
+        push.await.unwrap().unwrap();
+        assert!(e.snapshot().await.account_update_pending);
+        tokio::time::timeout(Duration::from_secs(1), e.account_notify.notified())
+            .await
+            .unwrap();
+        server.abort();
     }
     #[tokio::test]
     async fn stop_loss_remains_available_when_only_funding_sync_fails() {
@@ -2819,7 +4036,7 @@ mod tests {
             i.quotes.get_mut("XUSDT").unwrap().bid = d("99");
         }
         assert!(
-            e.ensure_stop_loss("XUSDT")
+            e.ensure_stop_loss("XUSDT", ExitCheck::Account)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -2831,7 +4048,11 @@ mod tests {
         e.inner.lock().await.book.pending.remove("unknown-tp");
         // A confirmed cancellation clears the obstruction; the intent remains even at a profit.
         e.inner.lock().await.quotes.get_mut("XUSDT").unwrap().bid = d("100");
-        assert!(e.ensure_stop_loss("XUSDT").await.unwrap());
+        assert!(
+            e.ensure_stop_loss("XUSDT", ExitCheck::Account)
+                .await
+                .unwrap()
+        );
         assert!(e.inner.lock().await.book.positions.is_empty());
     }
     #[tokio::test]
