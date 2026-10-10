@@ -61,11 +61,17 @@ def main(image):
         state = ready(base)
         assert state["mode"] == "paper" and state["paused"] is True, state
         assert state["auth"]["initialized"] is False, state["auth"]
+        assert state["user_stream"]["enabled"] is False, state["user_stream"]
+        assert state["market_stream"]["subscriptions"] == 0, state["market_stream"]
+        assert state["exchange_rate_limit"]["cooldown_persistence_pending"] is False
         page = request(base, "/")
         assert b"Genius" in page
         assert b'id="watchlist"' in page and b'id="decisions-body"' in page
+        assert b'id="monitor-title"' in page and b'id="monitor-stream"' in page
         dashboard = json.loads(request(base, "/api/dashboard"))
         assert dashboard["mode"] == "paper" and dashboard["paused"] is True
+        assert dashboard["market_stream"]["subscriptions"] == 0
+        assert dashboard["user_stream"]["enabled"] is False
         for field in ("watchlist", "position_views", "open_orders", "recent_decisions"):
             assert dashboard[field] == [], (field, dashboard[field])
         assert json.loads(request(base, "/api/decisions?limit=30")) == []
