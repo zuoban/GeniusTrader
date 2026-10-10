@@ -46,6 +46,25 @@ struct ExitConfirmation {
     side: Action,
     started: Instant,
 }
+#[derive(Default)]
+struct EntryAccounting {
+    entry_quantity: Decimal,
+    exit_quantity: Decimal,
+    entry_quote: Decimal,
+    entry_fee: Decimal,
+    exit_fee: Decimal,
+    realized_gross: Decimal,
+    trade_ids: BTreeSet<i64>,
+    order_ids: BTreeSet<i64>,
+}
+#[derive(Debug)]
+struct IncompleteOrderHistory(String);
+impl std::fmt::Display for IncompleteOrderHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for IncompleteOrderHistory {}
 impl Drop for EngineTasks {
     fn drop(&mut self) {
         for task in &self.0 {
@@ -1213,15 +1232,100 @@ impl Engine {
             }
         }
     }
+    async fn entry_accounting(
+        &self,
+        order: &PendingOrder,
+        remote: &ExchangeOrder,
+        fills: &[Fill],
+        position: Option<&Position>,
+    ) -> Result<EntryAccounting> {
+        let mut accounting = EntryAccounting::default();
+        ensure!(
+            fills
+                .iter()
+                .all(|fill| fill.side == order.side.entry_side()),
+            "开仓成交方向与持久化委托不一致"
+        );
+        accounting.add(order.side, remote.order_id, fills)?;
+        if let Some(position) = position {
+            ensure!(position.side == order.side, "开仓方向与现有持仓不一致");
+            ensure!(
+                !position.owned_order_ids.is_empty() || order.accounted_quantity > Decimal::ZERO,
+                "持仓缺少归属委托记录，无法重建成交数量"
+            );
+            // Only reconstruct orders that are already recorded as ours. The
+            // account's total position may contain manual trades and is not proof.
+            for id in position
+                .owned_order_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+            {
+                if id == remote.order_id {
+                    continue;
+                }
+                let report = self.exchange.order_by_id(&order.symbol, id).await?;
+                ensure!(
+                    report.order_id == id
+                        && report.symbol == order.symbol
+                        && report.executed_qty >= Decimal::ZERO
+                        && report.executed_qty <= report.orig_qty,
+                    "历史归属委托回报不一致（{id}）"
+                );
+                if let Some(pending) = self
+                    .inner
+                    .lock()
+                    .await
+                    .book
+                    .pending
+                    .get(&report.client_order_id)
+                {
+                    ensure!(
+                        pending.symbol == report.symbol && pending.quantity == report.orig_qty,
+                        "历史归属委托与持久化委托不一致（{id}）"
+                    );
+                    if pending.accounted_quantity != report.executed_qty {
+                        return Err(IncompleteOrderHistory(format!(
+                            "其他委托成交尚未入账，等待核对（{id}）"
+                        ))
+                        .into());
+                    }
+                } else {
+                    ensure!(report.terminal(), "历史归属委托状态尚未确认（{id}）");
+                }
+                let trades = self.exchange.fills(&order.symbol, id).await?;
+                if let (Some(issue), incomplete) = fill_settlement_issue(&trades, &report, order) {
+                    let reason = format!("历史归属委托尚未核实（{id}）：{issue}");
+                    if incomplete {
+                        return Err(IncompleteOrderHistory(reason).into());
+                    }
+                    anyhow::bail!(reason);
+                }
+                accounting.add(order.side, id, &trades)?;
+            }
+            if !position
+                .observed_trade_ids
+                .iter()
+                .all(|id| accounting.trade_ids.contains(id))
+            {
+                return Err(
+                    IncompleteOrderHistory("历史成交明细不完整，等待重新查询".into()).into(),
+                );
+            }
+        }
+        ensure!(
+            accounting.entry_quantity > Decimal::ZERO
+                && accounting.exit_quantity <= accounting.entry_quantity,
+            "归属成交的开平仓数量不一致"
+        );
+        Ok(accounting)
+    }
     async fn apply_order(&self, remote: ExchangeOrder) -> Result<()> {
-        let (pending, legacy_unsettled) = {
+        let (pending, position) = {
             let i = self.inner.lock().await;
             (
                 i.book.pending.get(&remote.client_order_id).cloned(),
-                i.book
-                    .positions
-                    .get(&remote.symbol)
-                    .is_some_and(|p| !p.accounting_complete),
+                i.book.positions.get(&remote.symbol).cloned(),
             )
         };
         let Some(o) = pending else {
@@ -1236,19 +1340,39 @@ impl Engine {
                 && remote.cum_quote >= Decimal::ZERO,
             "订单回报与已持久化委托不一致"
         );
+        if remote.executed_qty < o.accounted_quantity {
+            return Ok(());
+        }
         let fetch = remote.executed_qty > o.accounted_quantity
             || remote.executed_qty > Decimal::ZERO
-                && (remote.terminal() || o.settlement_issue.is_some() || legacy_unsettled);
+                && (remote.terminal()
+                    || o.settlement_issue.is_some()
+                    || position.as_ref().is_some_and(|p| !p.accounting_complete));
         let fills = if fetch {
             Some(self.exchange.fills(&o.symbol, remote.order_id).await)
         } else {
             None
         };
-        let (settlement_issue, incomplete_fills) = match &fills {
+        let (mut settlement_issue, mut incomplete_fills) = match &fills {
             Some(Ok(fills)) => fill_settlement_issue(fills, &remote, &o),
             Some(Err(error)) => (Some(format!("成交明细查询失败：{error}")), false),
             None => (None, false),
         };
+        let accounting = if o.role == OrderRole::Entry
+            && settlement_issue.is_none()
+            && let Some(Ok(fills)) = &fills
+        {
+            Some(
+                self.entry_accounting(&o, &remote, fills, position.as_ref())
+                    .await,
+            )
+        } else {
+            None
+        };
+        if let Some(Err(error)) = &accounting {
+            settlement_issue = Some(format!("持仓成交核对未完成：{error}"));
+            incomplete_fills = error.downcast_ref::<IncompleteOrderHistory>().is_some();
+        }
         let mut i = self.inner.lock().await;
         let Some(current) = i.book.pending.get(&o.client_id).cloned() else {
             return Ok(());
@@ -1264,7 +1388,9 @@ impl Engine {
             return self.save_if_changed(&mut i, false);
         }
         let delta = (remote.executed_qty - current.accounted_quantity).max(Decimal::ZERO);
-        if o.role == OrderRole::Entry && delta > Decimal::ZERO {
+        if o.role == OrderRole::Entry
+            && (delta > Decimal::ZERO || accounting.as_ref().is_some_and(|r| r.is_ok()))
+        {
             let avg = if remote.avg_price > Decimal::ZERO {
                 remote.avg_price
             } else if remote.cum_quote > Decimal::ZERO {
@@ -1341,20 +1467,31 @@ impl Engine {
             }
         }
         let mut settled = remote.executed_qty == Decimal::ZERO;
+        let mut corrected_quantity = None;
         if let Some(Ok(fills)) = &fills
             && settlement_issue.is_none()
         {
             if let Some(p) = i.book.positions.get_mut(&o.symbol) {
-                if o.role == OrderRole::Entry {
-                    p.entry_fee = fills.iter().map(|f| f.commission).sum();
-                }
-                for f in fills {
-                    if !p.observed_trade_ids.contains(&f.id) {
-                        if o.role != OrderRole::Entry {
+                if let Some(Ok(accounting)) = &accounting {
+                    let quantity = accounting.entry_quantity - accounting.exit_quantity;
+                    if p.quantity != quantity {
+                        corrected_quantity = Some((p.quantity, quantity));
+                    }
+                    p.quantity = quantity;
+                    p.original_quantity = accounting.entry_quantity;
+                    p.entry_price = accounting.entry_quote / accounting.entry_quantity;
+                    p.entry_fee = accounting.entry_fee;
+                    p.exit_fee = accounting.exit_fee;
+                    p.realized_gross = accounting.realized_gross;
+                    p.observed_trade_ids = accounting.trade_ids.iter().copied().collect();
+                    p.owned_order_ids = accounting.order_ids.iter().copied().collect();
+                } else {
+                    for f in fills {
+                        if !p.observed_trade_ids.contains(&f.id) {
                             p.exit_fee += f.commission;
                             p.realized_gross += f.realized_pnl;
+                            p.observed_trade_ids.push(f.id);
                         }
-                        p.observed_trade_ids.push(f.id);
                     }
                 }
             }
@@ -1388,14 +1525,32 @@ impl Engine {
         }
         self.save(&mut i)?;
         drop(i);
+        if let Some((old, quantity)) = corrected_quantity {
+            self.event(
+                "info",
+                Some(&o.symbol),
+                "持仓数量已按完整成交明细校正",
+                json!({"client_id":o.client_id,"order_id":remote.order_id,
+                    "previous_quantity":old,"quantity":quantity}),
+            );
+        }
         if fetch && !settled {
-            let budget_wait = fills.as_ref().and_then(|result| {
-                result.as_ref().err().and_then(|error| {
-                    error
-                        .downcast_ref::<ExchangeError>()
-                        .and_then(ExchangeError::budget_retry_after)
+            let budget_wait = fills
+                .as_ref()
+                .and_then(|result| {
+                    result.as_ref().err().and_then(|error| {
+                        error
+                            .downcast_ref::<ExchangeError>()
+                            .and_then(ExchangeError::budget_retry_after)
+                    })
                 })
-            });
+                .or_else(|| {
+                    accounting
+                        .as_ref()
+                        .and_then(|result| result.as_ref().err())
+                        .and_then(|error| error.downcast_ref::<ExchangeError>())
+                        .and_then(ExchangeError::budget_retry_after)
+                });
             let mut i = self.inner.lock().await;
             if budget_wait.is_none() && !incomplete_fills {
                 i.paused = true;
@@ -1477,11 +1632,15 @@ impl Engine {
                     let partial = o.role == OrderRole::Entry
                         && remote.executed_qty > Decimal::ZERO
                         && !remote.terminal();
-                    self.apply_order(remote).await?;
+                    if let Err(error) = self.apply_order(remote).await {
+                        self.record_order_apply_error(&o, error).await?;
+                        continue;
+                    }
                     if partial
                         && let Ok(cancelled) = self.exchange.cancel(&o.symbol, &o.client_id).await
+                        && let Err(error) = self.apply_order(cancelled).await
                     {
-                        self.apply_order(cancelled).await?;
+                        self.record_order_apply_error(&o, error).await?;
                     }
                 }
                 Err(e) => self.event(
@@ -1492,6 +1651,32 @@ impl Engine {
                 ),
             }
         }
+        Ok(())
+    }
+    async fn record_order_apply_error(
+        &self,
+        order: &PendingOrder,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        let reason = format!("订单回报处理失败：{error}");
+        let mut i = self.inner.lock().await;
+        if let Some(pending) = i.book.pending.get_mut(&order.client_id) {
+            pending.settlement_issue = Some(reason.clone());
+            if let Some(position) = i.book.positions.get_mut(&order.symbol) {
+                position.accounting_complete = false;
+            }
+            // A persistence failure still aborts reconciliation. A bad report for
+            // one order must not prevent the full account read or other orders.
+            self.save(&mut i)?;
+        }
+        i.health = format!("{} {reason}", order.symbol);
+        drop(i);
+        self.event(
+            "warn",
+            Some(&order.symbol),
+            "订单回报核对失败，保留委托并继续对账",
+            json!({"client_id":order.client_id,"reason":reason}),
+        );
         Ok(())
     }
     async fn manage_positions_once(&self) -> Result<bool> {
@@ -2320,6 +2505,38 @@ impl std::fmt::Display for EntryQuoteError {
     }
 }
 impl std::error::Error for EntryQuoteError {}
+impl EntryAccounting {
+    fn add(&mut self, side: Action, order_id: i64, fills: &[Fill]) -> Result<()> {
+        let entry = fills
+            .first()
+            .is_some_and(|fill| fill.side == side.entry_side());
+        ensure!(
+            fills.iter().all(|fill| {
+                fill.side
+                    == if entry {
+                        side.entry_side()
+                    } else {
+                        side.exit_side()
+                    }
+                    && self.trade_ids.insert(fill.id)
+            }),
+            "归属成交的方向或成交标识不一致"
+        );
+        self.order_ids.insert(order_id);
+        for fill in fills {
+            if entry {
+                self.entry_quantity += fill.qty;
+                self.entry_quote += fill.qty * fill.price;
+                self.entry_fee += fill.commission;
+            } else {
+                self.exit_quantity += fill.qty;
+                self.exit_fee += fill.commission;
+                self.realized_gross += fill.realized_pnl;
+            }
+        }
+        Ok(())
+    }
+}
 fn fill_settlement_issue(
     fills: &[Fill],
     remote: &ExchangeOrder,
@@ -4976,6 +5193,301 @@ mod tests {
         assert_eq!(i.book.positions["XUSDT"].entry_fee, d("0.05"));
         assert!(i.book.positions["XUSDT"].accounting_complete);
         assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn legacy_split_entry_rebuilds_quantity_fees_and_average_after_restart() {
+        use axum::{Json, Router, routing::get};
+        for (accounted, original) in [
+            ("987.3", "987.3"),
+            ("1775.8", "987.3"),
+            ("1775.8", "1775.8"),
+        ] {
+            let app = Router::new()
+                .route("/fapi/v1/order", get(|| async { Json(split_report("FILLED", "1775.8")) }))
+                .route("/fapi/v1/userTrades", get(|| async { Json(split_fills(true)) }))
+                .route("/fapi/v3/positionRisk", get(|| async { Json(json!([{"symbol":"WLDUSDC",
+                    "positionAmt":"1775.8","entryPrice":"0.5632","positionSide":"BOTH"}])) }))
+                .route("/fapi/v1/openOrders", get(|| async { Json(json!([])) }))
+                .route("/fapi/v2/account", get(|| async { Json(json!({"multiAssetsMargin":false,
+                    "availableBalance":"1000","assets":[{"asset":"USDC","availableBalance":"1000"}]})) }));
+            let (base, server) = crate::test_support::mock_server(app).await;
+            let (config, book) = legacy_split_book(accounted, original).await;
+            let store = Store::open(":memory:", Mode::Live).unwrap();
+            store.save(Mode::Live, &config, &book).unwrap();
+            let e = Engine::new(
+                Mode::Live,
+                store,
+                config,
+                Binance::mock(base.clone()),
+                Jev::mock(base),
+            )
+            .unwrap();
+            assert!(!e.inner.lock().await.entry_data_ready());
+            e.reconcile_pending().await.unwrap();
+            e.reconcile_pending().await.unwrap();
+            assert!(e.sync_account().await.unwrap());
+            let (_, saved) = e.store.load().unwrap().unwrap();
+            let p = &saved.positions["WLDUSDC"];
+            assert_eq!(p.quantity, d("1775.8"));
+            assert_eq!(p.original_quantity, d("1775.8"));
+            assert_eq!(
+                p.entry_price,
+                (d("987.3") * d("0.5631") + d("788.5") * d("0.5633")) / d("1775.8")
+            );
+            assert_eq!(p.entry_fee, d("0.199"));
+            assert_eq!(p.funding_cost, d("0.01"));
+            assert_eq!(p.stop_loss_usdt, d("10"));
+            assert_eq!(p.observed_trade_ids, vec![1, 2]);
+            assert_eq!(p.owned_order_ids, vec![42]);
+            assert!(p.accounting_complete);
+            assert!(saved.pending.is_empty());
+            assert!(e.snapshot().await.entry_blockers.is_empty());
+            assert!(e.snapshot().await.paused);
+            e.inner.lock().await.market_at = now_ms();
+            e.set_running(true).await.unwrap();
+            assert!(!e.snapshot().await.paused);
+            server.abort();
+        }
+    }
+    fn split_report(status: &str, executed: &str) -> Value {
+        // Binance responses may omit price fields. Full fills are the price proof.
+        json!({"symbol":"WLDUSDC","clientOrderId":"gt-e-1791657599999-9","orderId":42,
+            "status":status,"executedQty":executed,"origQty":"1775.8"})
+    }
+    fn split_fills(complete: bool) -> Value {
+        let mut fills = vec![json!({"id":1,"orderId":42,"qty":"987.3","price":"0.5631",
+            "commission":"0.111","commissionAsset":"USDC","realizedPnl":"0","time":1,"side":"BUY"})];
+        if complete {
+            fills.push(json!({"id":2,"orderId":42,"qty":"788.5","price":"0.5633",
+                "commission":"0.088","commissionAsset":"USDC","realizedPnl":"0","time":2,"side":"BUY"}));
+        }
+        json!(fills)
+    }
+    async fn legacy_split_book(accounted: &str, original: &str) -> (Config, Book) {
+        let old = paper();
+        seed(&old).await;
+        old.paper_entry(entry(Action::Long)).await.unwrap();
+        let (config, mut book) = old.store.load().unwrap().unwrap();
+        let mut p = book.positions.remove("XUSDT").unwrap();
+        p.symbol = "WLDUSDC".into();
+        p.quantity = d("987.3");
+        p.original_quantity = d(original);
+        p.entry_price = d("0.5631");
+        p.entry_fee = d("0.111");
+        p.funding_cost = d("0.01");
+        p.stop_loss_usdt = d("10");
+        p.owned_order_ids = vec![42];
+        p.observed_trade_ids = vec![1];
+        p.accounting_complete = false;
+        book.positions.insert(p.symbol.clone(), p);
+        let mut order = entry(Action::Long);
+        order.client_id = "gt-e-1791657599999-9".into();
+        order.symbol = "WLDUSDC".into();
+        order.quantity = d("1775.8");
+        order.status = "SETTLING".into();
+        order.accounted_quantity = d(accounted);
+        book.pending.insert(order.client_id.clone(), order);
+        (config, book)
+    }
+    #[tokio::test]
+    async fn split_entry_partial_and_full_reports_are_idempotent_and_reject_older_pushes() {
+        use axum::{Json, Router, routing::get};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let complete = Arc::new(AtomicBool::new(false));
+        let state = complete.clone();
+        let app = Router::new().route(
+            "/fapi/v1/userTrades",
+            get(move || {
+                let state = state.clone();
+                async move { Json(split_fills(state.load(Ordering::SeqCst))) }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Live,
+            Store::open(":memory:", Mode::Live).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        let (_, mut book) = legacy_split_book("0", "0").await;
+        book.positions.clear();
+        e.inner.lock().await.book = book;
+        let partial: ExchangeOrder =
+            serde_json::from_value(split_report("PARTIALLY_FILLED", "987.3")).unwrap();
+        e.apply_order(partial.clone()).await.unwrap();
+        e.apply_order(partial.clone()).await.unwrap();
+        assert_eq!(e.snapshot().await.positions[0].quantity, d("987.3"));
+        complete.store(true, Ordering::SeqCst);
+        let cumulative: ExchangeOrder =
+            serde_json::from_value(split_report("PARTIALLY_FILLED", "1775.8")).unwrap();
+        e.apply_order(cumulative.clone()).await.unwrap();
+        e.apply_order(cumulative).await.unwrap();
+        e.apply_order(partial).await.unwrap();
+        let full: ExchangeOrder = serde_json::from_value(split_report("FILLED", "1775.8")).unwrap();
+        e.apply_order(full.clone()).await.unwrap();
+        e.apply_order(full).await.unwrap();
+        let p = &e.snapshot().await.positions[0];
+        assert_eq!(p.quantity, d("1775.8"));
+        assert_eq!(p.entry_fee, d("0.199"));
+        assert_eq!(p.observed_trade_ids, vec![1, 2]);
+        assert!(p.accounting_complete);
+        assert!(e.snapshot().await.pending.is_empty());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn split_entry_recovery_preserves_confirmed_exits_and_waits_for_complete_history() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let complete = Arc::new(AtomicBool::new(false));
+        let state = complete.clone();
+        let app = Router::new()
+            .route(
+                "/fapi/v1/order",
+                get(|Query(query): Query<BTreeMap<String, String>>| async move {
+                    assert_eq!(query["orderId"], "43");
+                    Json(
+                        json!({"symbol":"WLDUSDC","clientOrderId":"old-tp","orderId":43,
+                    "status":"CANCELED","executedQty":"100","origQty":"987.3"}),
+                    )
+                }),
+            )
+            .route(
+                "/fapi/v1/userTrades",
+                get(move |Query(query): Query<BTreeMap<String, String>>| {
+                    let state = state.clone();
+                    async move {
+                        Json(if query["orderId"] == "42" {
+                            split_fills(true)
+                        } else if state.load(Ordering::SeqCst) {
+                            json!([{"id":3,"orderId":43,"qty":"100",
+                            "price":"0.57","commission":"0.02","commissionAsset":"USDC",
+                            "realizedPnl":"0.67","time":3,"side":"SELL"}])
+                        } else {
+                            json!([])
+                        })
+                    }
+                }),
+            );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let (config, mut book) = legacy_split_book("1775.8", "987.3").await;
+        let p = book.positions.get_mut("WLDUSDC").unwrap();
+        p.quantity -= d("100");
+        p.owned_order_ids.push(43);
+        p.observed_trade_ids.push(3);
+        p.exit_fee = d("0.02");
+        p.realized_gross = d("0.67");
+        let store = Store::open(":memory:", Mode::Live).unwrap();
+        store.save(Mode::Live, &config, &book).unwrap();
+        let e = Engine::new(
+            Mode::Live,
+            store,
+            config,
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        let full: ExchangeOrder = serde_json::from_value(split_report("FILLED", "1775.8")).unwrap();
+        e.inner.lock().await.paused = false;
+        e.apply_order(full.clone()).await.unwrap();
+        assert!(!e.inner.lock().await.entry_data_ready());
+        assert!(!e.snapshot().await.paused);
+        assert_eq!(e.snapshot().await.positions[0].quantity, d("887.3"));
+        assert!(e.snapshot().await.entry_blockers[0].contains("历史归属委托"));
+        complete.store(true, Ordering::SeqCst);
+        e.apply_order(full.clone()).await.unwrap();
+        e.apply_order(full).await.unwrap();
+        let p = &e.snapshot().await.positions[0];
+        assert_eq!(p.quantity, d("1675.8"));
+        assert_eq!(p.original_quantity, d("1775.8"));
+        assert_eq!(p.entry_fee, d("0.199"));
+        assert_eq!(p.exit_fee, d("0.02"));
+        assert_eq!(p.realized_gross, d("0.67"));
+        assert_eq!(p.funding_cost, d("0.01"));
+        assert_eq!(p.observed_trade_ids, vec![1, 2, 3]);
+        assert!(e.inner.lock().await.entry_data_ready());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn split_entry_incomplete_or_foreign_fee_records_never_clear_the_entry_gate() {
+        use axum::{Json, Router, routing::get};
+        for foreign_fee in [false, true] {
+            let app = Router::new().route(
+                "/fapi/v1/userTrades",
+                get(move || async move {
+                    let mut value = split_fills(foreign_fee);
+                    if foreign_fee {
+                        value[1]["commissionAsset"] = json!("BNB");
+                    }
+                    Json(value)
+                }),
+            );
+            let (base, server) = crate::test_support::mock_server(app).await;
+            let (config, book) = legacy_split_book("1775.8", "1775.8").await;
+            let store = Store::open(":memory:", Mode::Live).unwrap();
+            store.save(Mode::Live, &config, &book).unwrap();
+            let e = Engine::new(
+                Mode::Live,
+                store,
+                config,
+                Binance::mock(base),
+                Jev::new().unwrap(),
+            )
+            .unwrap();
+            e.apply_order(serde_json::from_value(split_report("FILLED", "1775.8")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(e.snapshot().await.positions[0].quantity, d("987.3"));
+            assert!(!e.inner.lock().await.entry_data_ready());
+            assert!(e.set_running(true).await.is_err());
+            assert!(
+                e.snapshot().await.entry_blockers[0].contains(if foreign_fee {
+                    "BNB"
+                } else {
+                    "已查询 987.3"
+                })
+            );
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn rejected_order_report_keeps_a_reason_and_does_not_abort_other_reconciliation() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        let app = Router::new().route("/fapi/v1/order", get(|Query(query): Query<BTreeMap<String,String>>| async move {
+            Json(json!({"symbol":"XUSDT","clientOrderId":query["origClientOrderId"],"orderId":42,
+                "status":"NEW","executedQty":"0","origQty":if query["origClientOrderId"] == "bad" { "2" } else { "1" }}))
+        }));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Live,
+            Store::open(":memory:", Mode::Live).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        for id in ["bad", "good"] {
+            let mut o = entry(Action::Long);
+            o.client_id = id.into();
+            e.inner.lock().await.book.pending.insert(id.into(), o);
+        }
+        e.reconcile_pending().await.unwrap();
+        let (_, book) = e.store.load().unwrap().unwrap();
+        assert!(
+            book.pending["bad"]
+                .settlement_issue
+                .as_ref()
+                .unwrap()
+                .contains("持久化委托不一致")
+        );
+        assert_eq!(book.pending["good"].status, "NEW");
+        assert!(!e.inner.lock().await.entry_data_ready());
+        assert_eq!(
+            e.store.events(1).unwrap()[0].message,
+            "订单回报核对失败，保留委托并继续对账"
+        );
         server.abort();
     }
     #[tokio::test]

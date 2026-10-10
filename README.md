@@ -38,14 +38,14 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 ## GitHub Packages 容器
 
-镜像：`ghcr.io/zuoban/geniustrader:0.1.9`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
+镜像：`ghcr.io/zuoban/geniustrader:0.1.10`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
 
 ```sh
-rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.9
+rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.10
 rtk proxy docker run -d --name genius-trader \
   --publish 8787:8787 \
   --mount type=volume,source=genius-trader-data,target=/app/data \
-  ghcr.io/zuoban/geniustrader:0.1.9
+  ghcr.io/zuoban/geniustrader:0.1.10
 ```
 
 本机打开 http://127.0.0.1:8787，服务器部署则打开 `http://服务器IPv4:8787`，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
@@ -76,7 +76,7 @@ rtk proxy docker compose up -d
 rtk proxy docker compose ps
 ```
 
-`compose.yaml` 使用已发布的 `0.1.9` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
+`compose.yaml` 使用已发布的 `0.1.10` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
 
 打开 `http://服务器IPv4:8787`（本机部署使用 http://127.0.0.1:8787），首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"8877:8787"`，再访问 `http://服务器IPv4:8877`；容器端口仍为 8787。
 
@@ -196,6 +196,8 @@ flowchart TD
 资金费与成交费用核对因本地请求权重不足而等待时，同样保留扫描启动状态，但禁止新增开仓和手动绕过核对。资金费核对完成且已有持仓费用全部确认后自动继续；其他费用错误仍暂停新增开仓。`funding_sync_pending` 标识资金费同步等待，`entry_data_pending` 标识资金费或成交费用待核实，控制台分别显示「资金费核对中」与「成交费用核对中」。手动暂停、外部账户差异、账户推送中断及服务端限流退避仍要求手动重新启动。
 
 部分成交后的费用查询失败或明细暂时不完整时，即使后续成交数量不变，也会继续查询；待核实原因随委托持久化，旧版本留下的未核实持仓会在重启后继续核对。明细暂缺时保留扫描启动状态，核对完成前仍禁止新开仓。`entry_blockers`、启动失败提示和委托列表显示具体币对及原因；运行事件记录查询错误、订单成交数量、明细数量和各实际手续费币种金额。某一委托费用确认不会解除同币对其他委托的费用等待。
+
+同一开仓委托分多次成交时，按全部已核实的成交明细合计数量、加权均价和费用。旧记录即使已标为累计成交数量入账，也会在开仓费用核对时校正漏记的持仓数量；已有平仓成交按本系统保存的订单归属重新核实并扣减，保留资金费、止损和止盈目标。恢复过程不使用账户总仓位直接覆盖本地仓位，明细暂缺或非零手续费币种不匹配时继续锁定。订单回报不一致会保存具体原因并记录事件，其他委托和完整账户对账继续运行。
 
 币安[下单与撤单响应](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade)可能不包含 `avgPrice` 和 `cumQuote`。未成交订单允许缺少这两个字段；已成交开仓按有效均价、累计成交金额或已确认成交明细取得真实均价。成交明细数量与订单不一致、价格缺失或费用未确认时继续保留委托并查询，不使用限价或当前盘口虚构成交价格，不重复提交订单。
 

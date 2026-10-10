@@ -1154,6 +1154,20 @@ impl Binance {
             .await?,
         )?)
     }
+    pub async fn order_by_id(&self, symbol: &str, id: i64) -> Result<ExchangeOrder> {
+        Ok(serde_json::from_value(
+            self.request(
+                Method::GET,
+                "/fapi/v1/order",
+                vec![
+                    ("symbol".into(), symbol.into()),
+                    ("orderId".into(), id.to_string()),
+                ],
+                true,
+            )
+            .await?,
+        )?)
+    }
     pub async fn cancel(&self, symbol: &str, id: &str) -> Result<ExchangeOrder> {
         Ok(serde_json::from_value(
             self.request(
