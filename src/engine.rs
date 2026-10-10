@@ -477,7 +477,7 @@ impl Engine {
         i.quotes = quotes;
         i.market_at = now_ms();
         if self.mode == Mode::Paper || now_ms() - i.account_at < 15_000 {
-            i.health = "行情正常 · 5m 收盘决策 · 无自动止损".into();
+            i.health = "行情正常 · 5m 收盘决策 · 持仓风控管理中".into();
         }
         Ok(())
     }
@@ -654,6 +654,7 @@ impl Engine {
                 created_at: now_ms(),
                 signal_time: bar,
                 target_profit: c.profit_usdt,
+                stop_loss_usdt: c.stop_loss_usdt,
                 maker_fee,
                 taker_fee,
                 status: "SUBMITTING".into(),
@@ -687,11 +688,14 @@ impl Engine {
             opened_at: now_ms(),
             signal_time: o.signal_time,
             target_profit: o.target_profit,
+            stop_loss_usdt: o.stop_loss_usdt,
+            stop_loss_triggered: false,
             entry_fee: fee,
             exit_fee: Decimal::ZERO,
             realized_gross: Decimal::ZERO,
             funding_cost: Decimal::ZERO,
             maker_fee: o.maker_fee,
+            taker_fee: o.taker_fee,
             tp_price: None,
             tp_client_id: None,
             observed_trade_ids: vec![],
@@ -801,11 +805,14 @@ impl Engine {
                     opened_at: o.created_at,
                     signal_time: o.signal_time,
                     target_profit: o.target_profit,
+                    stop_loss_usdt: o.stop_loss_usdt,
+                    stop_loss_triggered: false,
                     entry_fee: Decimal::ZERO,
                     exit_fee: Decimal::ZERO,
                     realized_gross: Decimal::ZERO,
                     funding_cost: Decimal::ZERO,
                     maker_fee: o.maker_fee,
+                    taker_fee: o.taker_fee,
                     tp_price: None,
                     tp_client_id: None,
                     observed_trade_ids: vec![],
@@ -930,7 +937,11 @@ impl Engine {
                 }
             }
             self.sync_account().await?;
-            self.sync_funding().await?;
+            if let Err(error) = self.sync_funding().await {
+                // Keep exits available using recorded funding if only the income endpoint fails.
+                self.fault("资金费同步失败，持仓风控使用已记录资金费", error)
+                    .await;
+            }
         }
         self.finalize_closed().await?;
         let positions = self
@@ -944,6 +955,19 @@ impl Engine {
             .cloned()
             .collect::<Vec<_>>();
         for p in positions {
+            match self.ensure_stop_loss(&p.symbol).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    self.event(
+                        "warn",
+                        Some(&p.symbol),
+                        "止损管理等待",
+                        json!({"error": error.to_string()}),
+                    );
+                    continue;
+                }
+            }
             if let Err(e) = self.ensure_tp(&p.symbol).await {
                 self.event(
                     "warn",
@@ -1066,10 +1090,64 @@ impl Engine {
         self.save(&i)?;
         Ok(())
     }
+    async fn ensure_stop_loss(&self, symbol: &str) -> Result<bool> {
+        let detail = {
+            let mut i = self.inner.lock().await;
+            let Some(p) = i.book.positions.get(symbol) else {
+                return Ok(false);
+            };
+            if p.quantity <= Decimal::ZERO
+                || !p.stop_loss_triggered && p.stop_loss_usdt == Decimal::ZERO
+            {
+                return Ok(false);
+            }
+            if p.stop_loss_triggered {
+                None
+            } else {
+                let quote = i.quotes.get(symbol).context("止损盘口缺失")?;
+                quote.validate()?;
+                ensure!(
+                    (0..15_000).contains(&(now_ms() - quote.time)),
+                    "止损盘口过期"
+                );
+                let exit_price = if p.side == Action::Long {
+                    quote.bid
+                } else {
+                    quote.ask
+                };
+                let estimated_net = p.estimated_exit_net(exit_price);
+                if estimated_net > -p.stop_loss_usdt {
+                    return Ok(false);
+                }
+                let detail = json!({"estimated_net": estimated_net, "stop_loss_usdt": p.stop_loss_usdt,
+                    "exit_price": exit_price, "quote_time": quote.time, "settlement_asset": settlement_asset(symbol)});
+                i.book
+                    .positions
+                    .get_mut(symbol)
+                    .unwrap()
+                    .stop_loss_triggered = true;
+                self.save(&i)?;
+                Some(detail)
+            }
+        };
+        if let Some(detail) = detail {
+            self.event(
+                "risk",
+                Some(symbol),
+                "已触发净亏损止损，确认撤单后市价减仓",
+                detail,
+            );
+        }
+        self.close_position(symbol, OrderRole::StopLoss).await?;
+        Ok(true)
+    }
     async fn ensure_tp(&self, symbol: &str) -> Result<()> {
         let cancel = {
             let i = self.inner.lock().await;
             let p = i.book.positions.get(symbol).context("持仓不存在")?;
+            if p.stop_loss_triggered {
+                return Ok(());
+            }
             let rule = i.catalog.get(symbol).context("交易规则未就绪")?;
             let target = p.target_price(rule.tick_size)?;
             if let Some(id) = &p.tp_client_id {
@@ -1154,8 +1232,9 @@ impl Engine {
                 created_at: now_ms(),
                 signal_time: p.signal_time,
                 target_profit: p.target_profit,
+                stop_loss_usdt: p.stop_loss_usdt,
                 maker_fee: p.maker_fee,
-                taker_fee: i.config.taker_fee,
+                taker_fee: p.taker_fee,
                 status: if self.mode == Mode::Paper {
                     "NEW"
                 } else {
@@ -1273,8 +1352,8 @@ impl Engine {
             self.event(
                 "trade",
                 Some(&p.symbol),
-                "已完成平仓，等待新信号",
-                json!({"net_profit": p.net_realized()}),
+                if p.stop_loss_triggered { "已完成止损平仓，等待新信号" } else { "已完成平仓，等待新信号" },
+                json!({"net_profit": p.net_realized(), "stop_loss_triggered": p.stop_loss_triggered}),
             );
         }
         self.save(&i)?;
@@ -1283,6 +1362,10 @@ impl Engine {
     pub async fn manual_close(&self, symbol: &str) -> Result<()> {
         let symbol = normalize_symbol(symbol)?;
         let _guard = self.reconcile_lock.lock().await;
+        self.close_position(&symbol, OrderRole::ManualClose).await
+    }
+    // Caller holds reconcile_lock, shared with polling and manual closes.
+    async fn close_position(&self, symbol: &str, role: OrderRole) -> Result<()> {
         let pending = self
             .inner
             .lock()
@@ -1293,11 +1376,27 @@ impl Engine {
             .filter(|o| o.symbol == symbol)
             .cloned()
             .collect::<Vec<_>>();
+        ensure!(
+            !pending
+                .iter()
+                .any(|o| matches!(o.role, OrderRole::ManualClose | OrderRole::StopLoss)),
+            "已有平仓委托，继续查询原订单"
+        );
+        if role == OrderRole::StopLoss {
+            ensure!(
+                !pending
+                    .iter()
+                    .any(|o| matches!(o.status.as_str(), "UNKNOWN" | "SUBMITTING" | "SETTLING")),
+                "订单状态或费用尚未确认，止损意图已保留"
+            );
+        }
         for o in pending {
             if self.mode == Mode::Paper {
-                self.inner.lock().await.book.pending.remove(&o.client_id);
+                let mut i = self.inner.lock().await;
+                i.book.pending.remove(&o.client_id);
+                i.book.paper_match_times.remove(&o.client_id);
             } else {
-                let r = self.exchange.cancel(&symbol, &o.client_id).await?;
+                let r = self.exchange.cancel(symbol, &o.client_id).await?;
                 self.apply_order(r).await?;
             }
         }
@@ -1307,41 +1406,62 @@ impl Engine {
                 !i.book.pending.values().any(|o| o.symbol == symbol),
                 "订单未确认撤销"
             );
-            let p = i.book.positions.get(&symbol).context("持仓不存在")?.clone();
-            ensure!(p.quantity > Decimal::ZERO, "持仓正在结算");
-            let q = i.quotes.get(&symbol).context("盘口缺失")?.clone();
-            ensure!(now_ms() - q.time < 15_000, "盘口过期");
+            let p = i.book.positions.get(symbol).context("持仓不存在")?.clone();
+            if p.quantity == Decimal::ZERO {
+                drop(i);
+                self.finalize_closed().await?;
+                return Ok(());
+            }
+            let q = i.quotes.get(symbol).context("盘口缺失")?.clone();
+            q.validate()?;
+            ensure!((0..15_000).contains(&(now_ms() - q.time)), "盘口过期");
+            let taker_fee = if role == OrderRole::StopLoss {
+                p.taker_fee
+            } else {
+                i.config.taker_fee
+            };
             if self.mode == Mode::Paper {
                 let price = if p.side == Action::Long { q.bid } else { q.ask };
                 let gross = p.side.sign() * p.quantity * (price - p.entry_price);
-                let fee = p.quantity * price * i.config.taker_fee;
-                let local = i.book.positions.get_mut(&symbol).unwrap();
+                let fee = p.quantity * price * taker_fee;
+                let local = i.book.positions.get_mut(symbol).unwrap();
                 local.quantity = Decimal::ZERO;
                 local.realized_gross += gross;
                 local.exit_fee += fee;
                 local.tp_client_id = None;
                 local.tp_price = None;
                 i.book.paper_cash += gross - fee;
+                i.available = paper_available(&i);
                 self.save(&i)?;
                 None
             } else {
                 ensure!(
-                    now_ms() - i.account_at < 15_000 && !i.external_positions.contains_key(&symbol),
+                    now_ms() - i.account_at < 15_000 && !i.external_positions.contains_key(symbol),
                     "账户未对账"
                 );
                 i.book.sequence += 1;
                 let o = PendingOrder {
-                    client_id: format!("gt-c-{}-{}", now_ms(), i.book.sequence),
-                    symbol: symbol.clone(),
+                    client_id: format!(
+                        "gt-{}-{}-{}",
+                        if role == OrderRole::StopLoss {
+                            "s"
+                        } else {
+                            "c"
+                        },
+                        now_ms(),
+                        i.book.sequence
+                    ),
+                    symbol: symbol.into(),
                     side: p.side,
-                    role: OrderRole::ManualClose,
+                    role,
                     quantity: p.quantity,
                     price: None,
                     created_at: now_ms(),
                     signal_time: p.signal_time,
                     target_profit: p.target_profit,
+                    stop_loss_usdt: p.stop_loss_usdt,
                     maker_fee: p.maker_fee,
-                    taker_fee: i.config.taker_fee,
+                    taker_fee,
                     status: "SUBMITTING".into(),
                     accounted_quantity: Decimal::ZERO,
                     leverage: p.leverage,
@@ -1551,6 +1671,7 @@ mod tests {
             created_at: now_ms(),
             signal_time: now_ms() / BAR_MS * BAR_MS - 1,
             target_profit: d("0.5"),
+            stop_loss_usdt: Decimal::ZERO,
             maker_fee: d("0.0002"),
             taker_fee: d("0.0005"),
             status: "SUBMITTING".into(),
@@ -1587,6 +1708,333 @@ mod tests {
             },
         );
         i.market_at = now_ms();
+    }
+    #[tokio::test]
+    async fn paper_stop_loss_closes_long_short_and_both_assets_while_paused_and_removed() {
+        for side in [Action::Long, Action::Short] {
+            for symbol in ["XUSDT", "XUSDC"] {
+                let e = paper();
+                seed(&e).await;
+                if symbol == "XUSDC" {
+                    let mut i = e.inner.lock().await;
+                    let mut rule = i.catalog.remove("XUSDT").unwrap();
+                    rule.symbol = symbol.into();
+                    i.catalog.insert(symbol.into(), rule);
+                    let quote = i.quotes.remove("XUSDT").unwrap();
+                    i.quotes.insert(symbol.into(), quote);
+                }
+                e.set_pool(PoolCoin {
+                    symbol: symbol.into(),
+                    enabled: true,
+                    config: None,
+                })
+                .await
+                .unwrap();
+                let mut order = entry(side);
+                order.symbol = symbol.into();
+                order.stop_loss_usdt = d("0.5");
+                e.paper_entry(order).await.unwrap();
+                e.ensure_tp(symbol).await.unwrap();
+                let mut changed = config();
+                changed.stop_loss_usdt = d("10");
+                changed.taker_fee = d("0.01");
+                e.configure(changed).await.unwrap();
+                let expected = {
+                    let mut i = e.inner.lock().await;
+                    let p = i.book.positions.get_mut(symbol).unwrap();
+                    // The remainder after an earlier partial exit still belongs to the same trade.
+                    p.quantity = d("0.4");
+                    p.realized_gross = d("0.3");
+                    p.exit_fee = d("0.012");
+                    p.funding_cost = d("0.07");
+                    assert_eq!(p.stop_loss_usdt, d("0.5"));
+                    assert_eq!(p.taker_fee, d("0.0005"));
+                    let price = if side == Action::Long {
+                        d("98")
+                    } else {
+                        d("102")
+                    };
+                    let expected = p.estimated_exit_net(price);
+                    let quote = i.quotes.get_mut(symbol).unwrap();
+                    quote.bid = if side == Action::Long { price } else { d("99") };
+                    quote.ask = if side == Action::Short {
+                        price
+                    } else {
+                        d("101")
+                    };
+                    quote.time = now_ms();
+                    expected
+                };
+                e.remove_coin(symbol).await.unwrap();
+                e.set_running(false).await.unwrap();
+                e.manage_positions().await.unwrap();
+                e.manage_positions().await.unwrap();
+                let i = e.inner.lock().await;
+                assert!(i.book.positions.is_empty());
+                assert!(i.book.pending.is_empty());
+                assert_eq!(i.book.closed_trades.len(), 1);
+                assert_eq!(i.book.closed_trades[0].net_profit, expected);
+                assert!(i.paused);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn stop_loss_requires_fresh_quotes_and_triggers_at_the_exact_net_boundary() {
+        let e = paper();
+        seed(&e).await;
+        e.paper_entry(entry(Action::Long)).await.unwrap();
+        {
+            let mut i = e.inner.lock().await;
+            let q = i.quotes.get_mut("XUSDT").unwrap();
+            // Mid-price suggests profit; the executable bid and closing fee produce a loss.
+            q.bid = d("99.4");
+            q.ask = d("101");
+            q.time = now_ms() - 15_001;
+        }
+        assert!(!e.ensure_stop_loss("XUSDT").await.unwrap()); // Disabled by default.
+        e.inner
+            .lock()
+            .await
+            .book
+            .positions
+            .get_mut("XUSDT")
+            .unwrap()
+            .stop_loss_usdt = d("0.6998");
+        assert!(
+            e.ensure_stop_loss("XUSDT")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("盘口过期")
+        );
+        assert!(!e.inner.lock().await.book.positions["XUSDT"].stop_loss_triggered);
+        e.inner.lock().await.quotes.get_mut("XUSDT").unwrap().time = now_ms() + 30_000;
+        assert!(e.ensure_stop_loss("XUSDT").await.is_err());
+        e.inner.lock().await.quotes.get_mut("XUSDT").unwrap().time = now_ms();
+        assert!(!e.ensure_stop_loss("XUSDT").await.unwrap());
+        e.inner
+            .lock()
+            .await
+            .book
+            .positions
+            .get_mut("XUSDT")
+            .unwrap()
+            .stop_loss_usdt = d("0.6997");
+        assert!(e.ensure_stop_loss("XUSDT").await.unwrap());
+        assert_eq!(
+            e.inner.lock().await.book.closed_trades[0].net_profit,
+            d("-0.6997")
+        );
+    }
+    #[tokio::test]
+    async fn live_stop_loss_confirms_cancellation_and_handles_partial_or_full_fill_races() {
+        use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (status, filled) in [("NEW", "0"), ("CANCELED", "0.4"), ("FILLED", "1")] {
+            let submissions = Arc::new(AtomicUsize::new(0));
+            let counter = submissions.clone();
+            let app = Router::new()
+                .route("/fapi/v1/order", get(|| async { Json(json!({})) })
+                    .delete(move || async move { Json(json!({"symbol":"XUSDT","clientOrderId":"test-tp","orderId":42,"status":status,"executedQty":filled,"avgPrice":"101","origQty":"1","cumQuote":"101"})) })
+                    .post(move |body: String| {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            let form: HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes()).into_owned().collect();
+                            assert_eq!(form["type"], "MARKET");
+                            assert_eq!(form["side"], "SELL");
+                            assert_eq!(form["positionSide"], "BOTH");
+                            assert_eq!(form["reduceOnly"], "true");
+                            assert_eq!(form["quantity"], "0.6");
+                            assert!(form["newClientOrderId"].starts_with("gt-s-"));
+                            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"code":-1007,"msg":"unknown execution"})))
+                        }
+                    }))
+                .route("/fapi/v1/userTrades", get(move |Query(q): Query<HashMap<String, String>>| async move {
+                    let stop = q["orderId"] == "43";
+                    Json(json!([{"id":if stop {2} else {1},"orderId":if stop {43} else {42},
+                        "qty":if stop {"0.6"} else {filled}, "price":if stop {"98"} else {"101"},
+                        "commission":if stop {"0.0294"} else if filled == "1" {"0.0202"} else {"0.00808"},
+                        "commissionAsset":"USDT","realizedPnl":if stop {"-1.2"} else if filled == "1" {"1"} else {"0.4"},
+                        "time":1,"side":"SELL"}]))
+                }));
+            let (url, server) = crate::test_support::mock_server(app).await;
+            let e = Engine::new(
+                Mode::Testnet,
+                Store::open(":memory:", Mode::Testnet).unwrap(),
+                config(),
+                Binance::mock(url.clone()),
+                Jev::new().unwrap(),
+            )
+            .unwrap();
+            seed(&e).await;
+            let mut order = entry(Action::Long);
+            order.stop_loss_usdt = d("0.5");
+            // Seed a local position; all exchange requests in this test use the mock server.
+            e.paper_entry(order.clone()).await.unwrap();
+            {
+                let mut i = e.inner.lock().await;
+                order.client_id = "test-tp".into();
+                order.role = OrderRole::TakeProfit;
+                order.price = Some(d("101"));
+                order.status = "NEW".into();
+                i.book.pending.insert(order.client_id.clone(), order);
+                let p = i.book.positions.get_mut("XUSDT").unwrap();
+                p.tp_client_id = Some("test-tp".into());
+                p.tp_price = Some(d("101"));
+                i.account_at = now_ms();
+                let q = i.quotes.get_mut("XUSDT").unwrap();
+                q.bid = d("99");
+                q.ask = d("99");
+            }
+            let result = e.ensure_stop_loss("XUSDT").await;
+            if status == "NEW" {
+                assert!(result.unwrap_err().to_string().contains("未确认撤销"));
+                assert_eq!(submissions.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    e.inner.lock().await.book.positions["XUSDT"].quantity,
+                    Decimal::ONE
+                );
+                assert!(e.inner.lock().await.book.positions["XUSDT"].stop_loss_triggered);
+            } else if filled == "1" {
+                assert!(result.unwrap());
+                assert_eq!(submissions.load(Ordering::SeqCst), 0);
+                assert!(e.inner.lock().await.book.positions.is_empty());
+            } else {
+                assert!(result.unwrap());
+                let (config, book) = e.store.load().unwrap().unwrap();
+                let close = book.pending.values().next().unwrap().clone();
+                assert_eq!(close.role, OrderRole::StopLoss);
+                assert_eq!(close.quantity, d("0.6"));
+                assert_eq!(close.status, "UNKNOWN");
+                assert!(book.positions["XUSDT"].stop_loss_triggered);
+                let store = Store::open(":memory:", Mode::Testnet).unwrap();
+                store.save(Mode::Testnet, &config, &book).unwrap();
+                let restored = Engine::new(
+                    Mode::Testnet,
+                    store,
+                    config,
+                    Binance::mock(url),
+                    Jev::new().unwrap(),
+                )
+                .unwrap();
+                seed(&restored).await; // Price rebounds above the stop; latch must survive.
+                restored.inner.lock().await.account_at = now_ms();
+                assert!(
+                    restored
+                        .ensure_stop_loss("XUSDT")
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("已有平仓委托")
+                );
+                assert!(restored.manual_close("XUSDT").await.is_err());
+                restored.ensure_tp("XUSDT").await.unwrap();
+                assert_eq!(submissions.load(Ordering::SeqCst), 1);
+                let remote: ExchangeOrder = serde_json::from_value(json!({"symbol":"XUSDT","clientOrderId":close.client_id,"orderId":43,"status":"FILLED","executedQty":"0.6","avgPrice":"98","origQty":"0.6","cumQuote":"58.8"})).unwrap();
+                restored.apply_order(remote.clone()).await.unwrap();
+                restored.apply_order(remote).await.unwrap();
+                restored.finalize_closed().await.unwrap();
+                let i = restored.inner.lock().await;
+                assert!(i.book.positions.is_empty());
+                assert!(i.book.pending.is_empty());
+                assert_eq!(i.book.closed_trades[0].net_profit, d("-0.88748"));
+            }
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn stop_loss_remains_available_when_only_funding_sync_fails() {
+        use axum::{
+            Json, Router,
+            http::StatusCode,
+            routing::{get, post},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let counter = submissions.clone();
+        let app = Router::new()
+            .route("/fapi/v3/positionRisk", get(|| async { Json(json!([
+                {"symbol":"XUSDT","positionAmt":"1","entryPrice":"100","positionSide":"BOTH"}
+            ])) }))
+            .route("/fapi/v1/openOrders", get(|| async { Json(json!([])) }))
+            .route("/fapi/v2/account", get(|| async { Json(json!({
+                "multiAssetsMargin":false,"availableBalance":"1000","assets":[{"asset":"USDT","availableBalance":"1000"}]
+            })) }))
+            .route("/fapi/v1/income", get(|| async { (StatusCode::BAD_REQUEST, Json(json!({"code":-1000,"msg":"local funding outage"}))) }))
+            .route("/fapi/v1/order", post(move |body: String| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let form: std::collections::HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes()).into_owned().collect();
+                    Json(json!({"symbol":"XUSDT","clientOrderId":form["newClientOrderId"],"orderId":43,
+                        "status":"NEW","executedQty":"0","avgPrice":"0","origQty":"1","cumQuote":"0"}))
+                }
+            }));
+        let (url, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Testnet,
+            Store::open(":memory:", Mode::Testnet).unwrap(),
+            config(),
+            Binance::mock(url),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        seed(&e).await;
+        let mut order = entry(Action::Long);
+        order.stop_loss_usdt = d("0.5");
+        e.paper_entry(order).await.unwrap();
+        {
+            let mut i = e.inner.lock().await;
+            i.account_at = now_ms(); // Preflight already completed.
+            i.book.funding_last_poll = 0;
+            let q = i.quotes.get_mut("XUSDT").unwrap();
+            q.bid = d("99");
+            q.ask = d("99");
+        }
+        e.manage_positions().await.unwrap();
+        let i = e.inner.lock().await;
+        assert!(i.paused);
+        assert!(i.health.contains("资金费同步失败"));
+        assert!(i.book.positions["XUSDT"].stop_loss_triggered);
+        assert_eq!(
+            i.book.pending.values().next().unwrap().role,
+            OrderRole::StopLoss
+        );
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn stop_loss_latches_but_does_not_cancel_an_unknown_order() {
+        let e = paper();
+        seed(&e).await;
+        let mut order = entry(Action::Long);
+        order.stop_loss_usdt = d("0.5");
+        e.paper_entry(order.clone()).await.unwrap();
+        order.role = OrderRole::TakeProfit;
+        order.client_id = "unknown-tp".into();
+        order.status = "UNKNOWN".into();
+        {
+            let mut i = e.inner.lock().await;
+            i.book.pending.insert(order.client_id.clone(), order);
+            i.quotes.get_mut("XUSDT").unwrap().bid = d("99");
+        }
+        assert!(
+            e.ensure_stop_loss("XUSDT")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("尚未确认")
+        );
+        let (_, book) = e.store.load().unwrap().unwrap();
+        assert!(book.pending.contains_key("unknown-tp"));
+        assert!(book.positions["XUSDT"].stop_loss_triggered);
+        e.inner.lock().await.book.pending.remove("unknown-tp");
+        // A confirmed cancellation clears the obstruction; the intent remains even at a profit.
+        e.inner.lock().await.quotes.get_mut("XUSDT").unwrap().bid = d("100");
+        assert!(e.ensure_stop_loss("XUSDT").await.unwrap());
+        assert!(e.inner.lock().await.book.positions.is_empty());
     }
     #[tokio::test]
     async fn scanning_requires_jev_credentials_even_in_paper_mode() {
@@ -1917,6 +2365,7 @@ mod tests {
             created_at: 0,
             signal_time: 0,
             target_profit: Decimal::ONE,
+            stop_loss_usdt: Decimal::ZERO,
             maker_fee: Decimal::ZERO,
             taker_fee: Decimal::ZERO,
             status: "UNKNOWN".into(),

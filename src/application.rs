@@ -355,6 +355,7 @@ mod tests {
                     created_at: now_ms(),
                     signal_time: 0,
                     target_profit: 1.into(),
+                    stop_loss_usdt: rust_decimal::Decimal::ZERO,
                     maker_fee: rust_decimal::Decimal::ZERO,
                     taker_fee: rust_decimal::Decimal::ZERO,
                     status: "UNKNOWN".into(),

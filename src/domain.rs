@@ -106,11 +106,17 @@ pub struct Position {
     pub opened_at: i64,
     pub signal_time: i64,
     pub target_profit: Decimal,
+    #[serde(default)]
+    pub stop_loss_usdt: Decimal,
+    #[serde(default)]
+    pub stop_loss_triggered: bool,
     pub entry_fee: Decimal,
     pub exit_fee: Decimal,
     pub realized_gross: Decimal,
     pub funding_cost: Decimal,
     pub maker_fee: Decimal,
+    #[serde(default = "default_taker_fee")]
+    pub taker_fee: Decimal,
     pub tp_price: Option<Decimal>,
     pub tp_client_id: Option<String>,
     pub observed_trade_ids: Vec<i64>,
@@ -122,6 +128,9 @@ pub struct Position {
 }
 fn default_leverage() -> u8 {
     2
+}
+fn default_taker_fee() -> Decimal {
+    Decimal::new(5, 4)
 }
 impl Position {
     /// Exact inverse of net PnL, including closing commission at the exit price.
@@ -156,6 +165,9 @@ impl Position {
     pub fn unrealized(&self, mark: Decimal) -> Decimal {
         self.side.sign() * self.quantity * (mark - self.entry_price)
     }
+    pub fn estimated_exit_net(&self, price: Decimal) -> Decimal {
+        self.net_realized() + self.unrealized(price) - self.quantity * price * self.taker_fee
+    }
 }
 pub fn floor_step(v: Decimal, step: Decimal) -> Decimal {
     (v / step).floor() * step
@@ -169,6 +181,7 @@ pub fn ceil_step(v: Decimal, step: Decimal) -> Decimal {
 pub enum OrderRole {
     Entry,
     TakeProfit,
+    StopLoss,
     ManualClose,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +195,8 @@ pub struct PendingOrder {
     pub created_at: i64,
     pub signal_time: i64,
     pub target_profit: Decimal,
+    #[serde(default)]
+    pub stop_loss_usdt: Decimal,
     pub maker_fee: Decimal,
     pub taker_fee: Decimal,
     pub status: String,
@@ -240,11 +255,14 @@ mod tests {
             opened_at: 0,
             signal_time: 0,
             target_profit: d("0.5"),
+            stop_loss_usdt: Decimal::ZERO,
+            stop_loss_triggered: false,
             entry_fee: d("0.05"),
             exit_fee: Decimal::ZERO,
             realized_gross: Decimal::ZERO,
             funding_cost: Decimal::ZERO,
             maker_fee: d("0.0002"),
+            taker_fee: d("0.0005"),
             tp_price: None,
             tp_client_id: None,
             observed_trade_ids: vec![],
@@ -279,5 +297,32 @@ mod tests {
             - p.funding_cost
             - exit * p.quantity * p.maker_fee;
         assert!(net >= p.target_profit);
+    }
+    #[test]
+    fn estimated_market_exit_includes_partial_realizations_and_all_costs() {
+        for (side, price, expected) in [
+            (Action::Long, d("98"), d("-0.6516")),
+            (Action::Short, d("102"), d("-0.6524")),
+        ] {
+            let mut p = position(side);
+            p.quantity = d("0.4");
+            p.realized_gross = d("0.3");
+            p.exit_fee = d("0.012");
+            p.funding_cost = d("0.07");
+            assert_eq!(p.estimated_exit_net(price), expected);
+            p.funding_cost = d("-0.07");
+            assert_eq!(p.estimated_exit_net(price), expected + d("0.14"));
+        }
+    }
+    #[test]
+    fn old_positions_restore_with_stop_loss_disabled() {
+        let mut value = serde_json::to_value(position(Action::Long)).unwrap();
+        for field in ["stop_loss_usdt", "stop_loss_triggered", "taker_fee"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        let p: Position = serde_json::from_value(value).unwrap();
+        assert_eq!(p.stop_loss_usdt, Decimal::ZERO);
+        assert!(!p.stop_loss_triggered);
+        assert_eq!(p.taker_fee, d("0.0005"));
     }
 }

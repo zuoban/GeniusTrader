@@ -88,7 +88,7 @@ function render(){
   const slots=new Set(s.positions.map(p=>p.symbol).concat(s.pending.filter(o=>o.role==='entry').map(o=>o.symbol))).size;
   $('slot-count').textContent=slots+' / '+c.max_positions;$('available').textContent=s.mode!=='paper'&&!s.account_at?'账户尚未连接':s.mode==='paper'?'模拟可用 '+num(s.available_usdt)+' USDT':s.margin_balances?.multi_assets_margin?'可用保证金 '+num(s.margin_balances.available_balance)+' USD':'可用 '+['USDT','USDC'].map(asset=>num(s.margin_balances?.assets.find(b=>b.asset===asset)?.available_balance)+' '+asset).join(' / ');
   $('strategy-label').textContent='JEV';
-  $('notional-label').textContent=price(c.notional_usdt)+' 计价币';$('profit-label').textContent=price(c.profit_usdt)+' 计价币';
+  $('notional-label').textContent=price(c.notional_usdt)+' 计价币';$('profit-label').textContent=price(c.profit_usdt)+' 计价币';$('stop-loss-label').textContent=stopLossLabel(c.stop_loss_usdt,'计价币');
   renderPositions();renderOrders();renderWatchlist();renderDecisions();
   const externalPositions=Object.entries(s.external_positions).map(([symbol,quantity])=>symbol+' ('+price(quantity)+')');
   const externalOrders=s.external_orders;
@@ -97,8 +97,9 @@ function render(){
   $('update-time').textContent='SYNC '+new Date(s.updated_at).toLocaleTimeString('zh-CN',{hour12:false});
 }
 const actionLabel=action=>({LONG:'做多',SHORT:'做空',WAIT:'等待'}[action]||action);
-const roleLabel=role=>({entry:'开仓',take_profit:'Maker 止盈',manual_close:'手动平仓'}[role]||role);
+const roleLabel=role=>({entry:'开仓',take_profit:'Maker 止盈',stop_loss:'止损平仓',manual_close:'手动平仓'}[role]||role);
 const statusLabel=status=>({NEW:'已挂单',PARTIALLY_FILLED:'部分成交',FILLED:'已成交',SUBMITTING:'提交中',UNKNOWN:'状态待确认',SETTLING:'费用结算中',CANCELED:'已撤销',EXPIRED:'已过期',REJECTED:'已拒绝'}[status]||status);
+const stopLossLabel=(value,asset)=>Number(value)>0?'最大净亏 '+price(value)+' '+asset:'未启用';
 const sideClass=action=>action==='LONG'?'long':action==='SHORT'?'short':'wait';
 const actionBadge=action=>'<span class="decision-badge '+sideClass(action)+'">'+esc(actionLabel(action))+'</span>';
 const timestamp=value=>value?new Date(value).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}):'—';
@@ -114,7 +115,7 @@ function replaceRegion(id,html){
 function renderPositions(){
   const positions=state.position_views;
   $('position-count').textContent=positions.length;$('positions-empty').hidden=positions.length>0;
-  replaceRegion('positions-body',positions.map(p=>'<tr><td><b>'+esc(p.symbol)+'</b><small>'+actionBadge(p.side)+' '+p.leverage+'× · '+Math.max(0,Math.floor((Date.now()-p.opened_at)/60000))+' 分钟</small></td><td>'+price(p.quantity)+'<small>@ '+price(p.entry_price)+'</small></td><td class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' '+quoteAsset(p.symbol)+'<small>'+(p.quote_stale?'报价待更新':'目标净赚 '+price(p.target_profit)+' '+quoteAsset(p.symbol))+'</small></td><td>'+price(p.tp_price)+'<small>'+(p.tp_client_id?'GTX · 只减仓':'等待挂单')+'</small></td><td class="status">'+(Number(p.quantity)===0?'结算中':p.accounting_complete?'管理中':'费用核对中')+'</td><td><button class="text-btn" data-action="close" data-symbol="'+esc(p.symbol)+'" data-focus-key="close:'+esc(p.symbol)+'">平仓</button></td></tr>').join(''));
+  replaceRegion('positions-body',positions.map(p=>'<tr><td><b>'+esc(p.symbol)+'</b><small>'+actionBadge(p.side)+' '+p.leverage+'× · '+Math.max(0,Math.floor((Date.now()-p.opened_at)/60000))+' 分钟</small></td><td>'+price(p.quantity)+'<small>@ '+price(p.entry_price)+'</small></td><td class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' '+quoteAsset(p.symbol)+'<small>'+(p.quote_stale?'报价待更新':'目标净赚 '+price(p.target_profit)+' '+quoteAsset(p.symbol))+'</small></td><td>'+price(p.tp_price)+'<small>'+(p.tp_client_id?'GTX · 只减仓':'等待挂单')+'</small><small>止损：'+stopLossLabel(p.stop_loss_usdt,quoteAsset(p.symbol))+'</small></td><td class="status">'+(p.stop_loss_triggered?'止损处理中':Number(p.quantity)===0?'结算中':p.accounting_complete?'管理中':'费用核对中')+'</td><td><button class="text-btn" data-action="close" data-symbol="'+esc(p.symbol)+'" data-focus-key="close:'+esc(p.symbol)+'">平仓</button></td></tr>').join(''));
 }
 function renderOrders(){
   const orders=state.open_orders;
@@ -130,9 +131,9 @@ function renderWatchlist(){
   replaceRegion('pool-body',visible.map(coin=>{
     const asset=quoteAsset(coin.symbol),base=baseAsset(coin.symbol);
     const p=coin.position,d=coin.latest_decision,hasExternal=coin.external_position!=null||coin.external_order;
-    const status=hasExternal?'账户差异':p?'持仓管理中':coin.orders.length?'委托跟踪中':!coin.enabled?'已停用':state.paused?'扫描已暂停':'等待收盘评估';
+    const status=hasExternal?'账户差异':p?.stop_loss_triggered?'止损处理中':p?'持仓管理中':coin.orders.length?'委托跟踪中':!coin.enabled?'已停用':state.paused?'扫描已暂停':'等待收盘评估';
     const btn=(action,label,glyph)=>'<button type="button" class="icon-btn" data-action="'+action+'" data-symbol="'+esc(coin.symbol)+'" data-focus-key="'+esc(coin.symbol)+':'+action+'" aria-label="'+label+' '+esc(coin.symbol)+'" title="'+label+'">'+glyph+'</button>';
-    const position=p?'<div class="card-position"><div class="card-section-label"><span>持仓 '+actionBadge(p.side)+' <b>'+p.leverage+'×</b></span><strong class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' <small>'+asset+'</small></strong></div><div class="card-stats"><span>数量<b>'+price(p.quantity)+'</b></span><span>开仓均价<b>'+price(p.entry_price)+'</b></span><span>止盈价<b>'+price(p.tp_price)+'</b></span></div></div>':'<div class="card-flat"><span>当前空仓</span><span>单币 '+price(coin.notional_usdt)+' / 止盈 '+price(coin.profit_usdt)+' '+asset+'</span></div>';
+    const position=p?'<div class="card-position"><div class="card-section-label"><span>持仓 '+actionBadge(p.side)+' <b>'+p.leverage+'×</b></span><strong class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' <small>'+asset+'</small></strong></div><div class="card-stats"><span>数量<b>'+price(p.quantity)+'</b></span><span>开仓均价<b>'+price(p.entry_price)+'</b></span><span>止盈价<b>'+price(p.tp_price)+'</b></span></div><div class="card-stop-loss">止损：'+stopLossLabel(p.stop_loss_usdt,asset)+'</div></div>':'<div class="card-flat"><span>当前空仓</span><span>单币 '+price(coin.notional_usdt)+' / 止盈 '+price(coin.profit_usdt)+' '+asset+'</span><span>止损：'+stopLossLabel(coin.stop_loss_usdt,asset)+'</span></div>';
     const orders=coin.orders.length?coin.orders.map(o=>'<div class="card-order"><span>'+esc(roleLabel(o.role))+' · '+(o.order_side==='BUY'?'买':'卖')+'</span><b>'+(o.price==null?'市价':price(o.price))+'</b><small>'+esc(statusLabel(o.status))+' · 剩余 '+price(o.remaining_quantity)+'</small></div>').join(''):'<div class="card-no-order">暂无挂单</div>';
     const decision=d?'<div class="card-decision-heading"><span>最近决策</span><time>'+timestamp(d.time)+'</time></div><div class="card-decision-result">'+actionBadge(d.action)+'<span>'+confidence(d.confidence)+'</span><small title="'+esc(d.model||d.source)+'">'+esc(d.model||'JEV')+'</small></div><p class="card-decision-source" title="'+esc(decisionReason(d))+'">'+esc(decisionReason(d))+'</p>':'<div class="card-decision-heading"><span>最近决策</span><span>尚未评估</span></div><p class="card-decision-source">等待启用扫描与新的收盘信号</p>';
     return '<article class="watch-card'+(!coin.enabled?' disabled':'')+'"><div class="watch-card-head"><div class="symbol-identity"><span class="coin-code">'+esc(base.slice(0,3))+'</span><div><h3>'+esc(base)+'<span> / '+asset+'</span></h3><small class="coin-state'+(hasExternal?' uncertain':'')+'"><i class="state-dot'+(!coin.enabled?' off':'')+'"></i>'+status+'</small></div></div><div class="coin-actions">'+btn('toggle',coin.enabled?'停用扫描':'启用扫描',coin.enabled?'Ⅱ':'▷')+btn('edit','单币配置','⚙')+btn('remove','移出自选','×')+'</div></div><div class="card-quote"><strong>'+price(coin.price)+'</strong><span class="quote-state'+(coin.quote_stale?' delayed':'')+'">'+(coin.quote_stale?'报价待更新':coin.quote?'点差 '+num((Number(coin.quote.ask)-Number(coin.quote.bid))/Number(coin.price)*10000,2)+' bps':'暂无报价')+'</span></div>'+position+'<div class="card-orders"><div class="card-section-label">挂单 <span>'+coin.orders.length+'</span></div>'+orders+'</div><div class="card-decision">'+decision+'</div>'+(hasExternal?'<p class="card-external">'+(coin.external_position!=null?'外部持仓 '+price(coin.external_position)+' ':'')+(coin.external_order?'存在外部挂单':'')+' · 待核对</p>':'')+'</article>';
@@ -173,15 +174,16 @@ const numeric=(key,label,value,min,max,step='1')=>input(key,label,value,'type="n
 function showSettings(){
   if(!state)return;const c=state.config,s=c.strategy,j=c.jev;
   $('settings-fields').innerHTML=
-    section('仓位与止盈',[
+    section('仓位与风控',[
       numeric('notional_usdt','单币名义金额 / 计价币',c.notional_usdt,1,100000,'0.01'),
       numeric('profit_usdt','单笔净止盈 / 计价币',c.profit_usdt,.01,100000,'0.01'),
+      numeric('stop_loss_usdt','最大净亏损 / 计价币（0 关闭）',c.stop_loss_usdt??'0',0,100000,'0.01'),
       numeric('max_positions','最大同时持仓数',c.max_positions,1,50),
       numeric('max_exposure_usdt','总仓位上限 / USDT + USDC',c.max_exposure_usdt,1,10000000,'0.01'),
       numeric('leverage','杠杆',c.leverage,1,20),numeric('cooldown_bars','平仓后冷却 / K 线根数',c.cooldown_bars,0,288),
       select('allowed_direction','允许方向',c.allowed_direction,{both:'做多与做空',long:'仅做多',short:'仅做空'}),
       numeric('max_spread_bps','点差上限 / bps',c.max_spread_bps,.1,1000,'.1')
-    ],'金额与净止盈使用币对的计价币（USDT 或 USDC）；总敞口按两种稳定币 1:1 合并。名义金额不再乘杠杆。退出采用 Maker 止盈或手动平仓。')+
+    ],'金额、净止盈和最大净亏损使用币对的计价币（USDT 或 USDC）；总敞口按两种稳定币 1:1 合并。止损为每笔交易的累计净亏损，计入已记录手续费、资金费及部分平仓盈亏，并预估剩余仓位的 Taker 平仓费用。达到阈值后确认撤销止盈单，再只减仓市价平仓。0 关闭；设置仅影响后续新开仓。服务运行时约每 5 秒检查一次，暂停扫描仍继续管理；滑点或网络延迟可能使实际亏损超过阈值。')+
     section('JEV 行情指标 · 固定 5 分钟',[
       numeric('fast','快线周期',s.fast,2,149),numeric('slow','慢线周期',s.slow,3,150),
       numeric('signal','MACD 信号周期',s.signal,2,100),numeric('period','RSI / 布林带周期',s.period,2,150),
@@ -246,7 +248,8 @@ function showCoin(coin){
   $('coin-fields').innerHTML=section('覆盖配置',[
     input('notional','名义金额 / 留空继承',o.notional_usdt||'','type="number" min="1" step=".01"'),
     input('profit','净止盈 / 留空继承',o.profit_usdt||'','type="number" min=".01" step=".01"'),
-  ],'金额与净止盈单位为 '+quoteAsset(coin.symbol)+'。决策统一使用 JEV。单币指标参数可通过 /api/pool 配置。');
+    input('stop_loss','最大净亏损 / 留空继承，0 关闭',o.stop_loss_usdt??'','type="number" min="0" step=".01"'),
+  ],'金额、净止盈和最大净亏损单位为 '+quoteAsset(coin.symbol)+'。止损留空继承全局设置，填 0 单独关闭；仅影响新仓位。止损由运行中的服务检查并市价平仓。决策统一使用 JEV。单币指标参数可通过 /api/pool 配置。');
   $('coin-dialog').showModal();
 }
 const addCoin=symbol=>{
@@ -272,7 +275,7 @@ $('pool-body').addEventListener('click',e=>{
 });
 $('coin-form').addEventListener('submit',e=>{
   e.preventDefault();act(async()=>{const f=e.target;
-    await api('/api/pool','POST',{...editing,config:{notional_usdt:f.elements.notional.value||null,profit_usdt:f.elements.profit.value||null,strategy:editing.config?.strategy||null,decision_mode:null,allowed_direction:editing.config?.allowed_direction||null}});
+    await api('/api/pool','POST',{...editing,config:{notional_usdt:f.elements.notional.value||null,profit_usdt:f.elements.profit.value||null,stop_loss_usdt:f.elements.stop_loss.value||null,strategy:editing.config?.strategy||null,decision_mode:null,allowed_direction:editing.config?.allowed_direction||null}});
     $('coin-dialog').close();toast('单币配置已保存');
   });
 });
@@ -285,7 +288,7 @@ $('settings-form').addEventListener('click',e=>{
 });
 $('settings-form').addEventListener('submit',e=>{
   e.preventDefault();act(async()=>{const c=structuredClone(state.config),f=e.target;
-    ['notional_usdt','profit_usdt','max_exposure_usdt','maker_fee','taker_fee','max_spread_bps','paper_balance_usdt'].forEach(k=>{c[k]=f.elements[k].value;});
+    ['notional_usdt','profit_usdt','stop_loss_usdt','max_exposure_usdt','maker_fee','taker_fee','max_spread_bps','paper_balance_usdt'].forEach(k=>{c[k]=f.elements[k].value;});
     ['max_positions','leverage','cooldown_bars','signal_max_age_seconds'].forEach(k=>{c[k]=Number(f.elements[k].value);});
     c.decision_mode='jev';c.allowed_direction=f.elements.allowed_direction.value;
     ['fast','slow','signal','period','lower','upper','deviations'].forEach(k=>{c.strategy[k]=Number(f.elements[k].value);});

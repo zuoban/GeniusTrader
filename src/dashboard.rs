@@ -33,6 +33,7 @@ pub struct WatchlistCard {
     pub quote_stale: bool,
     pub notional_usdt: Decimal,
     pub profit_usdt: Decimal,
+    pub stop_loss_usdt: Decimal,
     pub position: Option<PositionView>,
     pub orders: Vec<OrderView>,
     pub latest_decision: Option<DecisionRecord>,
@@ -101,6 +102,7 @@ pub fn build(
                 quote_stale: stale(quote),
                 notional_usdt: config.notional_usdt,
                 profit_usdt: config.profit_usdt,
+                stop_loss_usdt: config.stop_loss_usdt,
                 position: position_views
                     .iter()
                     .find(|p| p.position.symbol == coin.symbol)
@@ -167,6 +169,7 @@ mod tests {
                     config: Some(CoinConfig {
                         notional_usdt: Some(Decimal::from(250)),
                         profit_usdt: Some(Decimal::ONE),
+                        stop_loss_usdt: None,
                         strategy: None,
                         decision_mode: None,
                         allowed_direction: None,

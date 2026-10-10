@@ -49,6 +49,8 @@ pub struct JevConfig {
 pub struct Config {
     pub notional_usdt: Decimal,
     pub profit_usdt: Decimal,
+    #[serde(default)]
+    pub stop_loss_usdt: Decimal,
     pub max_positions: usize,
     pub max_exposure_usdt: Decimal,
     pub leverage: u8,
@@ -68,6 +70,7 @@ pub struct Config {
 pub struct CoinConfig {
     pub notional_usdt: Option<Decimal>,
     pub profit_usdt: Option<Decimal>,
+    pub stop_loss_usdt: Option<Decimal>,
     pub strategy: Option<StrategyConfig>,
     pub decision_mode: Option<DecisionMode>,
     pub allowed_direction: Option<Direction>,
@@ -77,6 +80,7 @@ impl Default for Config {
         Self {
             notional_usdt: Decimal::from(100),
             profit_usdt: Decimal::new(5, 1),
+            stop_loss_usdt: Decimal::ZERO,
             max_positions: 10,
             max_exposure_usdt: Decimal::from(1000),
             leverage: 2,
@@ -114,6 +118,10 @@ impl Config {
         ensure!(
             self.notional_usdt > Decimal::ZERO && self.profit_usdt > Decimal::ZERO,
             "金额和净止盈目标必须大于零"
+        );
+        ensure!(
+            self.stop_loss_usdt >= Decimal::ZERO,
+            "最大净亏损不能为负数，0 表示关闭止损"
         );
         ensure!(
             self.max_positions > 0
@@ -166,6 +174,9 @@ impl Config {
             if let Some(v) = o.profit_usdt {
                 c.profit_usdt = v;
             }
+            if let Some(v) = o.stop_loss_usdt {
+                c.stop_loss_usdt = v;
+            }
             if let Some(v) = &o.strategy {
                 c.strategy = v.clone();
             }
@@ -178,5 +189,49 @@ impl Config {
         }
         c.validate()?;
         Ok(c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::PoolCoin;
+
+    #[test]
+    fn stop_loss_is_optional_in_old_configs_and_coin_overrides_can_disable_it() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value.as_object_mut().unwrap().remove("stop_loss_usdt");
+        let mut config: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(config.stop_loss_usdt, Decimal::ZERO);
+        config.validate().unwrap();
+        config.stop_loss_usdt = Decimal::from(2);
+        let mut coin: PoolCoin = serde_json::from_value(serde_json::json!({
+            "symbol": "BTCUSDC", "enabled": true, "config": {}
+        }))
+        .unwrap();
+        assert_eq!(
+            config.for_coin(&coin).unwrap().stop_loss_usdt,
+            Decimal::from(2)
+        );
+        coin.config.as_mut().unwrap().stop_loss_usdt = Some(Decimal::ZERO);
+        assert_eq!(
+            config.for_coin(&coin).unwrap().stop_loss_usdt,
+            Decimal::ZERO
+        );
+        coin.config.as_mut().unwrap().stop_loss_usdt = Some(Decimal::from(3));
+        assert_eq!(
+            config.for_coin(&coin).unwrap().stop_loss_usdt,
+            Decimal::from(3)
+        );
+        coin.config.as_mut().unwrap().stop_loss_usdt = Some(-Decimal::ONE);
+        assert!(config.for_coin(&coin).is_err());
+        config.stop_loss_usdt = -Decimal::ONE;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("最大净亏损")
+        );
     }
 }
