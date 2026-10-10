@@ -3,7 +3,8 @@ const $=id=>document.getElementById(id);
 let state=null,markets=[],selected=new Set(),editing=null,closing=null,busy=false;
 let auth={initialized:false,authenticated:false},pendingAdmin=null,setupPrompted=false;
 let assetsHidden=false,watchlistFilter='all';
-let eventsMode=null;
+let eventsMode=null,eventsLoading=null;
+const renderedRegions=new WeakMap();
 const credentialTestRevision={testnet:0,live:0,jev:0};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=(v,d=2)=>Number(v||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
@@ -12,11 +13,17 @@ const quoteAsset=symbol=>symbol.endsWith('USDC')?'USDC':'USDT';
 const baseAsset=symbol=>symbol.replace(/(?:USDT|USDC)$/,'');
 const color=v=>Number(v)>0?'positive':Number(v)<0?'negative':'';
 function toast(message,error=false){$('toast').textContent=message;$('toast').className='toast'+(error?' error':'');$('toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>{$('toast').hidden=true;},6000);}
-async function api(path,method='GET',body){
+async function api(path,method='GET',body,timeoutMs=45000){
   const headers={'x-genius-request':'1'};if(body!==undefined)headers['content-type']='application/json';
-  const r=await fetch(path,{method,headers,credentials:'same-origin',body:body===undefined?undefined:JSON.stringify(body)});
-  const data=await r.json().catch(()=>({error:'服务返回格式错误'}));
-  if(!r.ok){const error=new Error(data.error||'请求失败 '+r.status);error.status=r.status;throw error;}return data;
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);
+  try{
+    const r=await fetch(path,{method,headers,credentials:'same-origin',signal:controller.signal,body:body===undefined?undefined:JSON.stringify(body)});
+    const data=await r.json().catch(err=>{if(controller.signal.aborted)throw err;return {error:'服务返回格式错误'};});
+    if(!r.ok){const error=new Error(data.error||'请求失败 '+r.status);error.status=r.status;throw error;}return data;
+  }catch(err){
+    if(controller.signal.aborted)throw new Error(method==='GET'?'请求超时，请稍后重试':'请求超时，操作结果待确认，请刷新状态后核对');
+    throw err;
+  }finally{clearTimeout(timer);}
 }
 async function act(fn){try{await fn();await refresh();}catch(err){if(err.status===401){await refresh();showAuth(null,err.message);}else toast(err.message,true);}}
 function renderAccess(){
@@ -41,7 +48,7 @@ async function withAdmin(fn){
   catch(err){toast(err.message,true);}
 }
 async function refresh(){
-  if(busy)return;busy=true;try{const previousMode=state?.mode;state=await api('/api/dashboard');render();if(previousMode!==state.mode){eventsMode=null;$('events-body').innerHTML='<div class="empty">正在载入当前模式事件…</div>';loadEvents();}$('connection-label').textContent='● 本地控制台已连接';}catch(err){$('connection-label').textContent='○ 控制台连接中断';$('asset-sync').textContent='本地连接中断 · 数据未更新';$('asset-sync').className='subtle sync-delayed';}finally{busy=false;}
+  if(busy)return;busy=true;try{const previousMode=state?.mode;state=await api('/api/dashboard','GET',undefined,10000);render();if(previousMode!==state.mode){eventsMode=null;replaceRegion('events-body','<div class="empty">正在载入当前模式事件…</div>');loadEvents();}$('connection-label').textContent='● 本地控制台已连接';}catch(err){$('connection-label').textContent='○ 控制台连接中断';$('asset-sync').textContent='本地连接中断 · 数据未更新';$('asset-sync').className='subtle sync-delayed';}finally{busy=false;}
 }
 function renderAssets(){
   const s=state,a=s.account_assets,unit=a?.multi_assets_margin?'USD':'USDT';
@@ -69,10 +76,10 @@ function renderAssets(){
   $('asset-count').textContent=a?String(assets.length):'—';
   const shares=assets.map(x=>total>0&&Number(x.wallet_balance)>0?num(Number(x.wallet_value_usd)/total*100)+'%':'—');
   $('asset-donut').setAttribute('aria-label',total>0?'钱包资产分布：'+assets.map((x,i)=>x.asset+' '+shares[i]).join('，'):!a?'资产分布等待账户同步':!valued?'资产估值暂不可用':'暂无正余额资产');
-  $('asset-legend').innerHTML=assets.length?assets.map((x,i)=>'<li><div><i class="asset-dot" aria-hidden="true"></i><b>'+esc(x.asset)+'</b><span class="asset-share">'+shares[i]+'</span></div><small>'+native(x.wallet_balance)+' '+esc(x.asset)+'</small></li>').join(''):'<li class="asset-empty">'+(a?'暂无非零余额资产':'连接账户后展示资产分布')+'</li>';
+  replaceRegion('asset-legend',assets.length?assets.map((x,i)=>'<li><div><i class="asset-dot" aria-hidden="true"></i><b>'+esc(x.asset)+'</b><span class="asset-share">'+shares[i]+'</span></div><small>'+native(x.wallet_balance)+' '+esc(x.asset)+'</small></li>').join(''):'<li class="asset-empty">'+(a?'暂无非零余额资产':'连接账户后展示资产分布')+'</li>');
   $('asset-legend').querySelectorAll('.asset-dot').forEach((dot,i)=>{dot.style.background=swatches.get(assets[i].asset);});
   $('asset-distribution-note').textContent=!valued?'估值暂不可用 · 展示原币余额，占比等待更新':s.mode==='paper'?'模拟 USDT 钱包 · 按 1 USDT ≈ 1 USD 展示':'按正钱包余额的 USD 估值计算占比';
-  $('asset-details-body').innerHTML=assets.length?assets.map(x=>'<tr><td>'+esc(x.asset)+'</td><td>'+native(x.wallet_balance)+'</td><td class="'+(assetsHidden?'':color(x.unrealized_profit))+'">'+native(x.unrealized_profit)+'</td><td>'+native(x.margin_balance)+'</td><td>'+(x.wallet_value_usd==null?'—':money(x.wallet_value_usd,2))+'</td></tr>').join(''):'<tr><td colspan="5">'+(a?'暂无非零余额资产':'等待账户同步')+'</td></tr>';
+  replaceRegion('asset-details-body',assets.length?assets.map(x=>'<tr><td>'+esc(x.asset)+'</td><td>'+native(x.wallet_balance)+'</td><td class="'+(assetsHidden?'':color(x.unrealized_profit))+'">'+native(x.unrealized_profit)+'</td><td>'+native(x.margin_balance)+'</td><td>'+(x.wallet_value_usd==null?'—':money(x.wallet_value_usd,2))+'</td></tr>').join(''):'<tr><td colspan="5">'+(a?'暂无非零余额资产':'等待账户同步')+'</td></tr>');
 }
 function render(){
   const s=state,c=s.config;
@@ -106,9 +113,12 @@ const timestamp=value=>value?new Date(value).toLocaleString('zh-CN',{month:'2-di
 const confidence=value=>value==null?'未返回置信度':num(Number(value)*100,1)+'% 置信度';
 const decisionReason=d=>d.reason||d.source;
 function replaceRegion(id,html){
-  const region=$(id),open=new Set([...region.querySelectorAll('details[open][data-key]')].map(d=>d.dataset.key));
+  const region=$(id);
+  if(renderedRegions.get(region)===html)return;
+  const open=new Set([...region.querySelectorAll('details[open][data-key]')].map(d=>d.dataset.key));
   const focused=region.contains(document.activeElement)?document.activeElement.dataset.focusKey:null;
   region.innerHTML=html;
+  renderedRegions.set(region,html);
   for(const detail of region.querySelectorAll('details[data-key]'))detail.open=open.has(detail.dataset.key);
   if(focused)[...region.querySelectorAll('[data-focus-key]')].find(el=>el.dataset.focusKey===focused)?.focus({preventScroll:true});
 }
@@ -151,13 +161,16 @@ function renderDecisions(){
 
 async function loadEvents(){
   const mode=state?.mode;if(!mode)return;
+  if(eventsLoading?.mode===mode)return;
+  const request={mode};eventsLoading=request;
   try{
-    const events=await api('/api/events?exclude_decisions=true');if(state.mode!==mode)return;
+    const events=await api('/api/events?exclude_decisions=true','GET',undefined,10000);if(state.mode!==mode||eventsLoading!==request)return;
     const signature=mode+JSON.stringify(events.map(e=>[e.time,e.level,e.symbol,e.message]));
     if(eventsMode===signature)return;eventsMode=signature;
     const logs=events.filter(e=>e.level!=='decision');
     replaceRegion('events-body',logs.length?logs.map((e,i)=>'<div class="event '+esc(e.level)+'"><time>'+timestamp(e.time)+'</time><span class="event-symbol">'+esc(e.symbol||'SYSTEM')+'</span><div class="event-message">'+esc(e.message)+'<details data-key="event:'+mode+':'+e.time+':'+i+'"><summary>查看详情</summary><pre>'+esc(JSON.stringify(e.detail,null,2))+'</pre></details></div></div>').join(''):'<div class="empty">尚无运行事件。</div>');
-  }catch(err){toast(err.message,true);}
+  }catch(err){if(eventsLoading===request&&state?.mode===mode)toast(err.message,true);}
+  finally{if(eventsLoading===request)eventsLoading=null;}
 }
 
 async function openMarkets(){selected=new Set();$('market-search').value='';$('market-dialog').showModal();await loadMarkets();}
@@ -400,4 +413,7 @@ function renderNavigation(){
   });
 }
 window.addEventListener('hashchange',renderNavigation);
-renderNavigation();refresh();setInterval(refresh,2500);setInterval(loadEvents,15000);
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){refresh();loadEvents();}});
+renderNavigation();refresh();
+setInterval(()=>{if(document.visibilityState==='visible')refresh();},2500);
+setInterval(()=>{if(document.visibilityState==='visible')loadEvents();},15000);

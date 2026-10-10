@@ -1,8 +1,11 @@
 use crate::{
     config::*,
     domain::*,
-    exchange::{AccountInfo, Binance, ExchangeError, ExchangeOrder, MarginBalances},
+    exchange::{
+        AccountInfo, Binance, ExchangeError, ExchangeOrder, MarginBalances, RateLimitSnapshot,
+    },
     jev::Jev,
+    monitoring::{POSITION_INTERVAL, RuntimeMetrics, SCAN_INTERVAL},
     store::Store,
     strategy::{self, Decision},
 };
@@ -11,7 +14,11 @@ use futures_util::{StreamExt, stream};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{Mutex, RwLock};
 
 pub struct Engine {
@@ -20,6 +27,7 @@ pub struct Engine {
     pub exchange: Binance,
     pub jev: RwLock<Arc<Jev>>,
     pub inner: Mutex<Inner>,
+    runtime: Mutex<RuntimeMetrics>,
     pub(crate) reconcile_lock: Mutex<()>,
 }
 pub struct EngineTasks(Vec<tokio::task::JoinHandle<()>>);
@@ -48,6 +56,8 @@ pub struct Inner {
     pub decisions: BTreeMap<String, Decision>,
     pub revision: u64,
     pub health: String,
+    persistence_pending: bool,
+    scan_cursor: Option<String>,
 }
 #[derive(Serialize)]
 pub struct Snapshot {
@@ -74,8 +84,48 @@ pub struct Snapshot {
     pub unrealized: Decimal,
     pub exposure_usdt: Decimal,
     pub jev_available: bool,
+    pub runtime: RuntimeMetrics,
+    pub exchange_rate_limit: RateLimitSnapshot,
 }
 impl Inner {
+    fn scan_allowed(&self, mode: Mode, now: i64) -> bool {
+        !self.paused
+            && (0..15_000).contains(&(now - self.market_at))
+            && (mode == Mode::Paper || (0..15_000).contains(&(now - self.account_at)))
+            && self.slots() < self.config.max_positions
+            && self.exposure() < self.config.max_exposure_usdt
+    }
+    fn scan_ready(&self, coin: &PoolCoin, now: i64) -> bool {
+        let bar = now / BAR_MS * BAR_MS - 1;
+        coin.enabled
+            && !self.occupied(&coin.symbol)
+            && now - bar <= self.config.signal_max_age_seconds as i64 * 1000
+            && !self
+                .book
+                .last_bar
+                .get(&coin.symbol)
+                .is_some_and(|last| *last >= bar)
+            && !self
+                .book
+                .cooldown_until
+                .get(&coin.symbol)
+                .is_some_and(|until| *until > bar)
+    }
+    fn scan_work(&self, now: i64) -> Vec<(PoolCoin, u64)> {
+        let mut work: Vec<_> = self
+            .book
+            .pool
+            .values()
+            .filter(|coin| self.scan_ready(coin, now))
+            .cloned()
+            .map(|coin| (coin, self.revision))
+            .collect();
+        if let Some(cursor) = &self.scan_cursor {
+            let next = work.partition_point(|(coin, _)| coin.symbol <= *cursor);
+            work.rotate_left(next);
+        }
+        work
+    }
     fn available_for_entry(&self, symbol: &str, mode: Mode) -> Result<Decimal> {
         if mode == Mode::Paper {
             return Ok(paper_available(self));
@@ -200,6 +250,7 @@ impl Engine {
             exchange,
             jev: RwLock::new(Arc::new(jev)),
             reconcile_lock: Mutex::new(()),
+            runtime: Mutex::new(RuntimeMetrics::default()),
             inner: Mutex::new(Inner {
                 config,
                 book,
@@ -218,11 +269,24 @@ impl Engine {
                 decisions: BTreeMap::new(),
                 revision: 0,
                 health,
+                persistence_pending: false,
+                scan_cursor: None,
             }),
         }))
     }
-    fn save(&self, i: &Inner) -> Result<()> {
-        self.store.save(self.mode, &i.config, &i.book)
+    fn save(&self, i: &mut Inner) -> Result<()> {
+        // A failed save leaves memory ahead of SQLite. Even an unchanged later poll
+        // must retry persistence before it can be treated as a no-op.
+        i.persistence_pending = true;
+        self.store.save(self.mode, &i.config, &i.book)?;
+        i.persistence_pending = false;
+        Ok(())
+    }
+    fn save_if_changed(&self, i: &mut Inner, changed: bool) -> Result<()> {
+        if changed || i.persistence_pending {
+            self.save(i)?;
+        }
+        Ok(())
     }
     pub fn event(&self, level: &str, symbol: Option<&str>, message: &str, detail: Value) {
         let e = Event {
@@ -237,6 +301,9 @@ impl Engine {
         }
     }
     pub async fn snapshot(&self) -> Snapshot {
+        let jev_available = self.jev.read().await.available();
+        let runtime = self.runtime.lock().await.clone();
+        let exchange_rate_limit = self.exchange.rate_limit_snapshot().await;
         let i = self.inner.lock().await;
         let unrealized = i
             .book
@@ -293,7 +360,9 @@ impl Engine {
             realized_net: i.book.closed_trades.iter().map(|t| t.net_profit).sum(),
             unrealized,
             exposure_usdt: i.exposure(),
-            jev_available: self.jev.read().await.available(),
+            jev_available,
+            runtime,
+            exchange_rate_limit,
         }
     }
     pub async fn configure(&self, c: Config) -> Result<()> {
@@ -309,6 +378,7 @@ impl Engine {
         self.store.save(self.mode, &c, &book)?;
         i.config = c;
         i.book = book;
+        i.persistence_pending = false;
         if self.mode == Mode::Paper {
             i.available = paper_available(&i);
         }
@@ -331,6 +401,7 @@ impl Engine {
         book.pool.insert(coin.symbol.clone(), coin);
         self.store.save(self.mode, &i.config, &book)?;
         i.book = book;
+        i.persistence_pending = false;
         i.revision += 1;
         Ok(())
     }
@@ -341,10 +412,12 @@ impl Engine {
         book.pool.remove(&symbol);
         self.store.save(self.mode, &i.config, &book)?;
         i.book = book;
+        i.persistence_pending = false;
         i.revision += 1;
         Ok(())
     }
     pub async fn set_running(&self, run: bool) -> Result<()> {
+        let jev_available = !run || self.jev.read().await.available();
         let mut i = self.inner.lock().await;
         if run {
             ensure!(
@@ -361,7 +434,7 @@ impl Engine {
                 "存在外部持仓或订单，请先处理"
             );
             ensure!(
-                self.jev.read().await.available(),
+                jev_available,
                 "请在账户与连接中配置 Jev API Key 后再启动扫描"
             );
             for coin in i.book.pool.values().filter(|c| c.enabled) {
@@ -422,7 +495,7 @@ impl Engine {
         }));
         let e = self.clone();
         tasks.push(tokio::spawn(async move {
-            let mut t = tokio::time::interval(Duration::from_secs(5));
+            let mut t = tokio::time::interval(POSITION_INTERVAL);
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 t.tick().await;
@@ -433,7 +506,7 @@ impl Engine {
         }));
         let e = self.clone();
         tasks.push(tokio::spawn(async move {
-            let mut t = tokio::time::interval(Duration::from_secs(10));
+            let mut t = tokio::time::interval(SCAN_INTERVAL);
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 t.tick().await;
@@ -472,8 +545,19 @@ impl Engine {
             let catalog = self.exchange.symbols().await?;
             self.inner.lock().await.catalog = catalog;
         }
-        let quotes = self.exchange.quotes().await?;
+        let mut quotes = self.exchange.quotes().await?;
         let mut i = self.inner.lock().await;
+        for (symbol, quote) in &mut quotes {
+            if let Some(previous) = i.quotes.get(symbol)
+                && quote
+                    .exchange_time
+                    .zip(previous.exchange_time)
+                    .is_some_and(|(new, old)| new < old)
+            {
+                // An older exchange snapshot must not refresh its local freshness either.
+                *quote = previous.clone();
+            }
+        }
         i.quotes = quotes;
         i.market_at = now_ms();
         if self.mode == Mode::Paper || now_ms() - i.account_at < 15_000 {
@@ -487,34 +571,65 @@ impl Engine {
         Ok(())
     }
     async fn scan(self: &Arc<Self>) {
+        let started = Instant::now();
+        self.runtime.lock().await.scan.start(now_ms(), started);
+        let failed = self.scan_once().await;
+        let elapsed = started.elapsed();
+        self.runtime
+            .lock()
+            .await
+            .scan
+            .finish(now_ms(), elapsed, SCAN_INTERVAL, failed);
+        if elapsed > SCAN_INTERVAL {
+            tracing::warn!(mode = ?self.mode, elapsed_ms = elapsed.as_millis() as u64,
+                target_ms = SCAN_INTERVAL.as_millis() as u64, "扫描周期超过目标间隔");
+        }
+    }
+    async fn scan_once(self: &Arc<Self>) -> bool {
         let work = {
             let i = self.inner.lock().await;
-            if i.paused
-                || now_ms() - i.market_at > 15_000
-                || self.mode != Mode::Paper && now_ms() - i.account_at > 15_000
-                || i.slots() >= i.config.max_positions
-                || i.exposure() >= i.config.max_exposure_usdt
-            {
-                return;
+            if !i.scan_allowed(self.mode, now_ms()) {
+                return false;
             }
-            i.book
-                .pool
-                .values()
-                .filter(|c| c.enabled && !i.occupied(&c.symbol))
-                .cloned()
-                .map(|coin| (coin, i.revision))
-                .collect::<Vec<_>>()
+            i.scan_work(now_ms())
         };
+        let failed = std::sync::atomic::AtomicBool::new(false);
         stream::iter(work)
             .for_each_concurrent(4, |(coin, revision)| {
                 let e = self.clone();
+                let failed = &failed;
                 async move {
+                    {
+                        let mut i = e.inner.lock().await;
+                        // Recheck queued candidates after each slow request. Only dispatched
+                        // work advances the cursor, so the next bar starts with unserved coins.
+                        let now = now_ms();
+                        if !i.scan_allowed(e.mode, now)
+                            || i.revision != revision
+                            || !i.scan_ready(&coin, now)
+                        {
+                            return;
+                        }
+                        i.scan_cursor = Some(coin.symbol.clone());
+                    }
                     if let Err(err) = e.evaluate_coin(coin.clone(), revision).await {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
                         e.event("warn", Some(&coin.symbol), "本轮等待", waiting_detail(&err));
                     }
                 }
             })
             .await;
+        failed.into_inner()
+    }
+    async fn decide(
+        &self,
+        symbol: &str,
+        bars: &[Candle],
+        quote: &Quote,
+        c: &Config,
+    ) -> Result<Decision> {
+        let jev = self.jev.read().await.clone();
+        jev.decide(symbol, bars, quote, c).await
     }
     async fn evaluate_coin(&self, coin: PoolCoin, revision: u64) -> Result<()> {
         let mut c = self.inner.lock().await.config.for_coin(&coin)?;
@@ -563,7 +678,7 @@ impl Engine {
             let quote = i.quotes.get(&coin.symbol).context("无盘口")?.clone();
             ensure_entry_quote(&quote, c.max_spread_bps, now_ms())?;
             i.book.last_bar.insert(coin.symbol.clone(), bar);
-            self.save(&i)?;
+            self.save(&mut i)?;
             quote
         };
         let (maker_fee, taker_fee) = if self.mode == Mode::Paper {
@@ -573,12 +688,7 @@ impl Engine {
         };
         c.maker_fee = maker_fee;
         c.taker_fee = taker_fee;
-        let decision = self
-            .jev
-            .read()
-            .await
-            .decide(&coin.symbol, &bars, &quote, &c)
-            .await?;
+        let decision = self.decide(&coin.symbol, &bars, &quote, &c).await?;
         self.event("decision", Some(&coin.symbol), "5 分钟收盘决策",
             json!({"bar_close": bar, "config": c, "quote": quote, "candles": bars, "decision": decision}));
         self.inner
@@ -664,7 +774,7 @@ impl Engine {
             i.book
                 .pending
                 .insert(order.client_id.clone(), order.clone());
-            self.save(&i)?;
+            self.save(&mut i)?;
             order
         };
         if self.mode == Mode::Paper {
@@ -707,7 +817,7 @@ impl Engine {
         i.book.positions.insert(o.symbol.clone(), p);
         i.book.pending.remove(&o.client_id);
         i.available = paper_available(&i);
-        self.save(&i)?;
+        self.save(&mut i)?;
         drop(i);
         self.event(
             "order",
@@ -736,7 +846,7 @@ impl Engine {
                 } else if let Some(p) = i.book.pending.get_mut(&o.client_id) {
                     p.status = "UNKNOWN".into();
                 }
-                self.save(&i)?;
+                self.save(&mut i)?;
                 drop(i);
                 self.event(
                     "error",
@@ -784,6 +894,13 @@ impl Engine {
         };
         if remote.executed_qty < current.accounted_quantity {
             return Ok(());
+        }
+        if !fetch
+            && !remote.terminal()
+            && remote.executed_qty == current.accounted_quantity
+            && remote.status == current.status
+        {
+            return self.save_if_changed(&mut i, false);
         }
         let delta = (remote.executed_qty - current.accounted_quantity).max(Decimal::ZERO);
         if o.role == OrderRole::Entry && delta > Decimal::ZERO {
@@ -880,7 +997,7 @@ impl Engine {
                 p.tp_price = None;
             }
         }
-        self.save(&i)?;
+        self.save(&mut i)?;
         drop(i);
         if fetch && !settled {
             let mut i = self.inner.lock().await;
@@ -897,6 +1014,68 @@ impl Engine {
         Ok(())
     }
     async fn manage_positions(&self) -> Result<()> {
+        let started = Instant::now();
+        self.runtime
+            .lock()
+            .await
+            .position_management
+            .start(now_ms(), started);
+        let result = self.manage_positions_once().await;
+        let elapsed = started.elapsed();
+        self.runtime.lock().await.position_management.finish(
+            now_ms(),
+            elapsed,
+            POSITION_INTERVAL,
+            result.is_err(),
+        );
+        if elapsed > POSITION_INTERVAL {
+            tracing::warn!(mode = ?self.mode, elapsed_ms = elapsed.as_millis() as u64,
+                target_ms = POSITION_INTERVAL.as_millis() as u64, "持仓管理周期超过目标间隔");
+        }
+        result
+    }
+    async fn reconcile_pending(&self) -> Result<()> {
+        let pending = self
+            .inner
+            .lock()
+            .await
+            .book
+            .pending
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut reports = stream::iter(pending)
+            .map(|order| async move {
+                let result = self.exchange.order(&order.symbol, &order.client_id).await;
+                (order, result)
+            })
+            .buffered(4);
+        while let Some((o, result)) = reports.next().await {
+            // Only reads overlap. Apply reports and any cancellation in the original
+            // order so partial fills cannot race settlement or order replacement.
+            match result {
+                Ok(remote) => {
+                    let partial = o.role == OrderRole::Entry
+                        && remote.executed_qty > Decimal::ZERO
+                        && !remote.terminal();
+                    self.apply_order(remote).await?;
+                    if partial
+                        && let Ok(cancelled) = self.exchange.cancel(&o.symbol, &o.client_id).await
+                    {
+                        self.apply_order(cancelled).await?;
+                    }
+                }
+                Err(e) => self.event(
+                    "warn",
+                    Some(&o.symbol),
+                    "订单查询未确认，继续锁定",
+                    json!({"client_id": o.client_id, "error": e.to_string()}),
+                ),
+            }
+        }
+        Ok(())
+    }
+    async fn manage_positions_once(&self) -> Result<()> {
         let _guard = self.reconcile_lock.lock().await;
         if self.mode != Mode::Paper {
             if !self.exchange.configured() {
@@ -905,37 +1084,7 @@ impl Engine {
             if self.inner.lock().await.account_at == 0 {
                 self.exchange.preflight().await?;
             }
-            let pending = self
-                .inner
-                .lock()
-                .await
-                .book
-                .pending
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            for o in pending {
-                match self.exchange.order(&o.symbol, &o.client_id).await {
-                    Ok(remote) => {
-                        let partial = o.role == OrderRole::Entry
-                            && remote.executed_qty > Decimal::ZERO
-                            && !remote.terminal();
-                        self.apply_order(remote).await?;
-                        if partial
-                            && let Ok(cancelled) =
-                                self.exchange.cancel(&o.symbol, &o.client_id).await
-                        {
-                            self.apply_order(cancelled).await?;
-                        }
-                    }
-                    Err(e) => self.event(
-                        "warn",
-                        Some(&o.symbol),
-                        "订单查询未确认，继续锁定",
-                        json!({"client_id": o.client_id, "error": e.to_string()}),
-                    ),
-                }
-            }
+            self.reconcile_pending().await?;
             self.sync_account().await?;
             if let Err(error) = self.sync_funding().await {
                 // Keep exits available using recorded funding if only the income endpoint fails.
@@ -984,9 +1133,11 @@ impl Engine {
         Ok(())
     }
     async fn sync_account(&self) -> Result<()> {
-        let remote = self.exchange.positions().await?;
-        let orders = self.exchange.open_orders().await?;
-        let balances = self.exchange.margin_balances().await?;
+        let (remote, orders, balances) = tokio::try_join!(
+            self.exchange.positions(),
+            self.exchange.open_orders(),
+            self.exchange.margin_balances(),
+        )?;
         let mut i = self.inner.lock().await;
         let mut external = BTreeMap::new();
         let mut actual = BTreeMap::new();
@@ -1073,6 +1224,7 @@ impl Engine {
                 r["asset"].as_str() == settlement_asset(symbol),
                 "资金费资产与合约结算币种不一致"
             );
+            i.persistence_pending = true;
             if let Some(p) = i.book.positions.get_mut(symbol)
                 && p.opened_at <= time
             {
@@ -1087,7 +1239,7 @@ impl Engine {
         }
         i.book.funding_cursor = end;
         i.book.funding_last_poll = end;
-        self.save(&i)?;
+        self.save(&mut i)?;
         Ok(())
     }
     async fn ensure_stop_loss(&self, symbol: &str) -> Result<bool> {
@@ -1126,7 +1278,7 @@ impl Engine {
                     .get_mut(symbol)
                     .unwrap()
                     .stop_loss_triggered = true;
-                self.save(&i)?;
+                self.save(&mut i)?;
                 Some(detail)
             }
         };
@@ -1179,11 +1331,13 @@ impl Engine {
             if self.mode == Mode::Paper {
                 let mut i = self.inner.lock().await;
                 i.book.pending.remove(&o.client_id);
+                i.book.paper_match_times.remove(&o.client_id);
+                i.book.paper_match_exchange_times.remove(&o.client_id);
                 if let Some(p) = i.book.positions.get_mut(symbol) {
                     p.tp_client_id = None;
                     p.tp_price = None;
                 }
-                self.save(&i)?;
+                self.save(&mut i)?;
             } else {
                 let r = self.exchange.cancel(symbol, &o.client_id).await?;
                 self.apply_order(r).await?;
@@ -1209,6 +1363,7 @@ impl Engine {
             let rule = i.catalog.get(symbol).context("交易规则缺失")?;
             let quote = i.quotes.get(symbol).context("盘口缺失")?;
             ensure!(now_ms() - quote.time < 15_000, "盘口过期");
+            let exchange_time = quote.exchange_time;
             let target = p.target_price(rule.tick_size)?;
             let price = if p.side == Action::Long {
                 ceil_step(target.max(quote.ask), rule.tick_size)
@@ -1248,7 +1403,14 @@ impl Engine {
             p.tp_price = Some(price);
             p.tp_client_id = Some(o.client_id.clone());
             i.book.pending.insert(o.client_id.clone(), o.clone());
-            self.save(&i)?;
+            if self.mode == Mode::Paper
+                && let Some(time) = exchange_time
+            {
+                i.book
+                    .paper_match_exchange_times
+                    .insert(o.client_id.clone(), time);
+            }
+            self.save(&mut i)?;
             o
         };
         if self.mode != Mode::Paper {
@@ -1258,6 +1420,7 @@ impl Engine {
     }
     async fn paper_match(&self) -> Result<()> {
         let mut i = self.inner.lock().await;
+        let mut changed = false;
         let positions = i.book.positions.values().cloned().collect::<Vec<_>>();
         for p in positions {
             let Some(id) = &p.tp_client_id else {
@@ -1270,12 +1433,28 @@ impl Engine {
                 continue;
             };
             if q.time <= o.created_at
-                || now_ms() - q.time > 15_000
+                || !(0..15_000).contains(&(now_ms() - q.time))
                 || i.book
                     .paper_match_times
                     .get(id)
                     .is_some_and(|time| *time >= q.time)
             {
+                continue;
+            }
+            if let Some(time) = q.exchange_time {
+                if let Some(previous) = i.book.paper_match_exchange_times.get(id) {
+                    if time <= *previous {
+                        continue;
+                    }
+                } else {
+                    // Upgraded portfolios have no source timestamp baseline. Observe one
+                    // before filling, rather than treating an old snapshot as new liquidity.
+                    i.book.paper_match_exchange_times.insert(id.clone(), time);
+                    i.persistence_pending = true;
+                    changed = true;
+                    continue;
+                }
+            } else if i.book.paper_match_exchange_times.contains_key(id) {
                 continue;
             }
             let price = o.price.context("止盈价格缺失")?;
@@ -1298,7 +1477,12 @@ impl Engine {
             if qty <= Decimal::ZERO {
                 continue;
             }
+            i.persistence_pending = true;
             i.book.paper_match_times.insert(id.clone(), q.time);
+            if let Some(time) = q.exchange_time {
+                i.book.paper_match_exchange_times.insert(id.clone(), time);
+            }
+            changed = true;
             let fee = qty * price * p.maker_fee;
             let gross = p.side.sign() * qty * (price - p.entry_price);
             if let Some(local) = i.book.positions.get_mut(&p.symbol) {
@@ -1313,6 +1497,7 @@ impl Engine {
             if qty == p.quantity {
                 i.book.pending.remove(id);
                 i.book.paper_match_times.remove(id);
+                i.book.paper_match_exchange_times.remove(id);
                 if let Some(local) = i.book.positions.get_mut(&p.symbol) {
                     local.tp_client_id = None;
                     local.tp_price = None;
@@ -1320,7 +1505,7 @@ impl Engine {
             }
         }
         i.available = paper_available(&i);
-        self.save(&i)?;
+        self.save_if_changed(&mut i, changed)?;
         Ok(())
     }
     async fn finalize_closed(&self) -> Result<()> {
@@ -1336,6 +1521,9 @@ impl Engine {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if closed.is_empty() {
+            return self.save_if_changed(&mut i, false);
+        }
         for p in closed {
             let at = now_ms();
             i.book.positions.remove(&p.symbol);
@@ -1356,7 +1544,7 @@ impl Engine {
                 json!({"net_profit": p.net_realized(), "stop_loss_triggered": p.stop_loss_triggered}),
             );
         }
-        self.save(&i)?;
+        self.save(&mut i)?;
         Ok(())
     }
     pub async fn manual_close(&self, symbol: &str) -> Result<()> {
@@ -1395,6 +1583,8 @@ impl Engine {
                 let mut i = self.inner.lock().await;
                 i.book.pending.remove(&o.client_id);
                 i.book.paper_match_times.remove(&o.client_id);
+                i.book.paper_match_exchange_times.remove(&o.client_id);
+                i.persistence_pending = true;
             } else {
                 let r = self.exchange.cancel(symbol, &o.client_id).await?;
                 self.apply_order(r).await?;
@@ -1432,7 +1622,7 @@ impl Engine {
                 local.tp_price = None;
                 i.book.paper_cash += gross - fee;
                 i.available = paper_available(&i);
-                self.save(&i)?;
+                self.save(&mut i)?;
                 None
             } else {
                 ensure!(
@@ -1467,7 +1657,7 @@ impl Engine {
                     leverage: p.leverage,
                 };
                 i.book.pending.insert(o.client_id.clone(), o.clone());
-                self.save(&i)?;
+                self.save(&mut i)?;
                 Some(o)
             }
         };
@@ -1607,6 +1797,7 @@ mod tests {
             bid_qty: Decimal::ONE,
             ask_qty: Decimal::ONE,
             time: now - 14_999,
+            exchange_time: None,
         };
         assert_eq!(quote.spread_bps(), d("10"));
         ensure_entry_quote(&quote, d("10"), now).unwrap();
@@ -1635,6 +1826,7 @@ mod tests {
             bid_qty: d("796509.4"),
             ask_qty: d("28418200.1"),
             time: now - 483,
+            exchange_time: None,
         };
         let error = ensure_entry_quote(&quote, d("10"), now).unwrap_err();
         let detail = waiting_detail(&error);
@@ -1659,6 +1851,611 @@ mod tests {
             Jev::new().unwrap(),
         )
         .unwrap()
+    }
+    #[tokio::test]
+    async fn pending_queries_overlap_but_reports_apply_in_order_and_failed_orders_stay_locked() {
+        use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
+        use tokio::sync::{Semaphore, mpsc};
+        let gates: Arc<Vec<_>> = Arc::new((0..6).map(|_| Semaphore::new(0)).collect());
+        let (started, mut starts) = mpsc::channel(6);
+        let (finished, mut finishes) = mpsc::channel(6);
+        let controls = gates.clone();
+        let app = Router::new().route("/fapi/v1/order", get(move |Query(query): Query<BTreeMap<String, String>>| {
+            let controls = controls.clone(); let started = started.clone(); let finished = finished.clone();
+            async move {
+                let id: usize = query["origClientOrderId"].parse().unwrap();
+                started.send(id).await.unwrap();
+                controls[id].acquire().await.unwrap().forget();
+                finished.send(id).await.unwrap();
+                if id == 3 {
+                    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"code":-1000})))
+                } else {
+                    (StatusCode::OK, Json(json!({"symbol":query["symbol"],"clientOrderId":query["origClientOrderId"],"orderId":id+1,"status":"NEW","executedQty":"0","avgPrice":"0","origQty":"1","cumQuote":"0"})))
+                }
+            }
+        }));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Testnet,
+            Store::open(":memory:", Mode::Testnet).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        {
+            let mut i = e.inner.lock().await;
+            for id in 0..6 {
+                let mut order = entry(Action::Long);
+                order.client_id = id.to_string();
+                order.symbol = format!("S{id}USDT");
+                order.status = if id == 3 { "UNKNOWN" } else { "SUBMITTING" }.into();
+                i.book.pending.insert(order.client_id.clone(), order);
+            }
+            e.save(&mut i).unwrap();
+        }
+        let reconcile = tokio::spawn({
+            let e = e.clone();
+            async move { e.reconcile_pending().await }
+        });
+        let mut active = Vec::new();
+        for _ in 0..4 {
+            active.push(
+                tokio::time::timeout(Duration::from_secs(1), starts.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        active.sort();
+        assert_eq!(active, vec![0, 1, 2, 3]);
+        assert!(starts.try_recv().is_err());
+        for id in [1, 2, 3] {
+            gates[id].add_permits(1);
+        }
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(1), finishes.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // Later replies have arrived, but the first persisted intent must be applied first.
+        assert_eq!(e.inner.lock().await.book.pending["1"].status, "SUBMITTING");
+        assert!(starts.try_recv().is_err());
+        gates[0].add_permits(1);
+        for _ in 0..2 {
+            let id = tokio::time::timeout(Duration::from_secs(1), starts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(id, 4 | 5));
+            gates[id].add_permits(1);
+        }
+        tokio::time::timeout(Duration::from_secs(2), reconcile)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let saved = e.store.load().unwrap().unwrap().1;
+        for id in 0..6 {
+            assert_eq!(
+                saved.pending[&id.to_string()].status,
+                if id == 3 { "UNKNOWN" } else { "NEW" }
+            );
+        }
+        assert!(e.inner.lock().await.occupied("S3USDT"));
+        assert!(saved.positions.is_empty());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn account_reads_overlap_and_only_publish_a_complete_snapshot() {
+        use axum::{
+            Json, Router,
+            http::{StatusCode, Uri},
+        };
+        use tokio::sync::{Semaphore, mpsc};
+        for fail in [false, true] {
+            let release = Arc::new(Semaphore::new(0));
+            let controls = release.clone();
+            let (started, mut starts) = mpsc::channel(3);
+            let app = Router::new().fallback(move |uri: Uri| {
+                let release = controls.clone();let started = started.clone();
+                async move {
+                    let path = uri.path().to_owned();started.send(path.clone()).await.unwrap();
+                    release.acquire().await.unwrap().forget();
+                    if path == "/fapi/v2/account" {
+                        if fail { (StatusCode::BAD_REQUEST, Json(json!({"code":-1000}))) }
+                        else { (StatusCode::OK, Json(json!({"multiAssetsMargin":false,"availableBalance":"250","assets":[{"asset":"USDT","availableBalance":"250"}]}))) }
+                    } else { (StatusCode::OK, Json(json!([]))) }
+                }
+            });
+            let (base, server) = crate::test_support::mock_server(app).await;
+            let e = Engine::new(
+                Mode::Testnet,
+                Store::open(":memory:", Mode::Testnet).unwrap(),
+                config(),
+                Binance::mock(base),
+                Jev::new().unwrap(),
+            )
+            .unwrap();
+            {
+                let mut i = e.inner.lock().await;
+                i.account_at = 123;
+                i.available = d("100");
+            }
+            let sync = tokio::spawn({
+                let e = e.clone();
+                async move { e.sync_account().await }
+            });
+            let mut paths = Vec::new();
+            for _ in 0..3 {
+                paths.push(
+                    tokio::time::timeout(Duration::from_secs(1), starts.recv())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            paths.sort();
+            assert_eq!(
+                paths,
+                vec![
+                    "/fapi/v1/openOrders",
+                    "/fapi/v2/account",
+                    "/fapi/v3/positionRisk"
+                ]
+            );
+            assert_eq!(e.inner.lock().await.account_at, 123);
+            release.add_permits(3);
+            let result = tokio::time::timeout(Duration::from_secs(2), sync)
+                .await
+                .unwrap()
+                .unwrap();
+            let i = e.inner.lock().await;
+            if fail {
+                assert!(result.is_err());
+                assert_eq!(i.account_at, 123);
+                assert_eq!(i.available, d("100"));
+                assert!(i.margin_balances.is_none());
+            } else {
+                result.unwrap();
+                assert!(i.account_at > 123);
+                assert_eq!(i.available, d("250"));
+            }
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn scan_rotates_unserved_coins_and_filters_ineligible_work_before_requests() {
+        let e = paper();
+        let mut i = e.inner.lock().await;
+        for index in 0..200 {
+            let symbol = format!("S{index:03}USDT");
+            i.book.pool.insert(
+                symbol.clone(),
+                PoolCoin {
+                    symbol,
+                    enabled: true,
+                    config: None,
+                },
+            );
+        }
+        let mut served = std::collections::BTreeSet::new();
+        // Slow calls only allow eight dispatches per signal window. Even failed calls
+        // must not send the next bar back to the alphabetically first eight coins.
+        for round in 1..=25 {
+            let now = round * BAR_MS + 10;
+            let work = i.scan_work(now);
+            for (coin, _) in work.iter().take(8) {
+                served.insert(coin.symbol.clone());
+                i.scan_cursor = Some(coin.symbol.clone());
+            }
+            let cursor = i.scan_cursor.clone();
+            assert!(i.scan_work(round * BAR_MS + 60_000).is_empty());
+            assert_eq!(i.scan_cursor, cursor);
+        }
+        assert_eq!(served.len(), 200);
+        let now = 26 * BAR_MS + 10;
+        let bar = now / BAR_MS * BAR_MS - 1;
+        i.book.pool.get_mut("S000USDT").unwrap().enabled = false;
+        i.external_positions.insert("S001USDT".into(), Decimal::ONE);
+        i.book.last_bar.insert("S002USDT".into(), bar);
+        i.book
+            .cooldown_until
+            .insert("S003USDT".into(), bar + BAR_MS);
+        i.scan_cursor = Some("S010USDT".into());
+        i.book.pool.remove("S010USDT");
+        i.revision = 42;
+        let work = i.scan_work(now);
+        assert_eq!(work.len(), 195);
+        assert_eq!(work.first().unwrap().0.symbol, "S011USDT");
+        assert!(work.iter().all(|(_, revision)| *revision == 42));
+        assert!(!work.iter().any(|(c, _)| matches!(
+            c.symbol.as_str(),
+            "S000USDT" | "S001USDT" | "S002USDT" | "S003USDT"
+        )));
+    }
+    #[tokio::test]
+    async fn repeated_exchange_books_do_not_refill_paper_depth_even_after_restart() {
+        for side in [Action::Long, Action::Short] {
+            let mut e = paper();
+            seed(&e).await;
+            e.inner
+                .lock()
+                .await
+                .quotes
+                .get_mut("XUSDT")
+                .unwrap()
+                .exchange_time = Some(100);
+            e.paper_entry(entry(side)).await.unwrap();
+            e.ensure_tp("XUSDT").await.unwrap();
+            let id = e.inner.lock().await.book.positions["XUSDT"]
+                .tp_client_id
+                .clone()
+                .unwrap();
+            for (source_time, expected) in [
+                (Some(100), "1"),
+                (Some(101), "0.6"),
+                (Some(101), "0.6"),
+                (Some(99), "0.6"),
+                (None, "0.6"),
+                (Some(102), "0.2"),
+                (Some(103), "0"),
+            ] {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                {
+                    let mut i = e.inner.lock().await;
+                    let limit = i.book.pending[&id].price.unwrap();
+                    i.book.pending.get_mut(&id).unwrap().created_at = now_ms() - 100;
+                    let q = i.quotes.get_mut("XUSDT").unwrap();
+                    q.time = now_ms() - 1;
+                    q.exchange_time = source_time;
+                    q.bid = if side == Action::Long {
+                        limit + Decimal::ONE
+                    } else {
+                        limit - Decimal::from(2)
+                    };
+                    q.ask = q.bid + Decimal::ONE;
+                    q.bid_qty = d("0.4");
+                    q.ask_qty = d("0.4");
+                }
+                e.paper_match().await.unwrap();
+                assert_eq!(
+                    e.inner.lock().await.book.positions["XUSDT"].quantity,
+                    d(expected)
+                );
+                if source_time == Some(101) && expected == "0.6" {
+                    // Reload the persisted consumed source timestamp, not just in-memory state.
+                    e = Engine::new(
+                        Mode::Paper,
+                        e.store.clone(),
+                        config(),
+                        Binance::new(Mode::Paper).unwrap(),
+                        Jev::new().unwrap(),
+                    )
+                    .unwrap();
+                    seed(&e).await;
+                }
+            }
+            let saved = e.store.load().unwrap().unwrap().1;
+            assert!(!saved.paper_match_times.contains_key(&id));
+            assert!(!saved.paper_match_exchange_times.contains_key(&id));
+        }
+    }
+    #[tokio::test]
+    async fn legacy_paper_order_observes_source_baseline_before_filling() {
+        let e = paper();
+        seed(&e).await;
+        e.paper_entry(entry(Action::Long)).await.unwrap();
+        e.ensure_tp("XUSDT").await.unwrap();
+        prepare_partial_quote(&e).await;
+        e.inner
+            .lock()
+            .await
+            .quotes
+            .get_mut("XUSDT")
+            .unwrap()
+            .exchange_time = Some(100);
+        e.paper_match().await.unwrap();
+        assert_eq!(
+            e.store.load().unwrap().unwrap().1.positions["XUSDT"].quantity,
+            Decimal::ONE
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        e.inner
+            .lock()
+            .await
+            .quotes
+            .get_mut("XUSDT")
+            .unwrap()
+            .exchange_time = Some(101);
+        e.inner.lock().await.quotes.get_mut("XUSDT").unwrap().time = now_ms() - 1;
+        e.paper_match().await.unwrap();
+        assert_eq!(
+            e.store.load().unwrap().unwrap().1.positions["XUSDT"].quantity,
+            d("0.6")
+        );
+    }
+    #[tokio::test]
+    async fn older_exchange_quote_cannot_replace_prices_or_refresh_their_receipt_time() {
+        use axum::{Json, Router, routing::get};
+        let reply = Arc::new(Mutex::new(
+            json!([{"symbol":"XUSDT","bidPrice":"100","askPrice":"101","bidQty":"1","askQty":"1","time":500}]),
+        ));
+        let body = reply.clone();
+        let app = Router::new().route(
+            "/fapi/v1/ticker/bookTicker",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body.lock().await.clone()) }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Paper,
+            Store::open(":memory:", Mode::Paper).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        seed(&e).await;
+        e.refresh_market().await.unwrap();
+        let old_receipt = now_ms() - 100;
+        e.inner.lock().await.quotes.get_mut("XUSDT").unwrap().time = old_receipt;
+        reply.lock().await[0]["time"] = json!(499);
+        reply.lock().await[0]["bidPrice"] = json!("90");
+        e.refresh_market().await.unwrap();
+        {
+            let i = e.inner.lock().await;
+            assert_eq!(i.quotes["XUSDT"].bid, d("100"));
+            assert_eq!(i.quotes["XUSDT"].time, old_receipt);
+        }
+        reply.lock().await[0]["time"] = json!(500);
+        reply.lock().await[0]["bidPrice"] = json!("100");
+        e.refresh_market().await.unwrap();
+        assert!(e.inner.lock().await.quotes["XUSDT"].time > old_receipt);
+        reply.lock().await[0]["time"] = json!(501);
+        reply.lock().await[0]["bidPrice"] = json!("101");
+        e.refresh_market().await.unwrap();
+        assert_eq!(
+            e.inner.lock().await.quotes["XUSDT"].exchange_time,
+            Some(501)
+        );
+        assert_eq!(e.inner.lock().await.quotes["XUSDT"].bid, d("101"));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn unchanged_polling_skips_writes_but_partial_and_complete_fills_persist() {
+        let e = paper();
+        let writes = || {
+            e.store
+                .with_test_connection(rusqlite::Connection::total_changes)
+        };
+        let before = writes();
+        e.manage_positions().await.unwrap();
+        e.scan().await;
+        assert_eq!(writes(), before);
+        let runtime = e.snapshot().await.runtime;
+        assert_eq!(runtime.scan.runs, 1);
+        assert_eq!(runtime.position_management.runs, 1);
+        assert!(!runtime.scan.running);
+        seed(&e).await;
+        e.paper_entry(entry(Action::Long)).await.unwrap();
+        e.ensure_tp("XUSDT").await.unwrap();
+        let before = writes();
+        e.manage_positions().await.unwrap();
+        assert_eq!(writes(), before);
+        prepare_partial_quote(&e).await;
+        e.paper_match().await.unwrap();
+        assert_eq!(writes(), before + 1);
+        assert_eq!(
+            e.store.load().unwrap().unwrap().1.positions["XUSDT"].quantity,
+            d("0.6")
+        );
+        let before = writes();
+        e.paper_match().await.unwrap();
+        e.finalize_closed().await.unwrap();
+        assert_eq!(writes(), before);
+        {
+            let mut i = e.inner.lock().await;
+            let quote = i.quotes.get_mut("XUSDT").unwrap();
+            quote.bid_qty = 1.into();
+            quote.time = now_ms() - 1;
+        }
+        e.paper_match().await.unwrap();
+        e.finalize_closed().await.unwrap();
+        let restored = e.store.load().unwrap().unwrap().1;
+        assert!(restored.positions.is_empty());
+        assert!(restored.pending.is_empty());
+        assert_eq!(restored.closed_trades.len(), 1);
+        let before = writes();
+        e.manage_positions().await.unwrap();
+        assert_eq!(writes(), before);
+    }
+    async fn prepare_partial_quote(e: &Engine) {
+        let mut i = e.inner.lock().await;
+        let id = i.book.positions["XUSDT"].tp_client_id.clone().unwrap();
+        let price = i.book.pending[&id].price.unwrap();
+        i.book.pending.get_mut(&id).unwrap().created_at = now_ms() - 100;
+        let quote = i.quotes.get_mut("XUSDT").unwrap();
+        quote.bid = price + Decimal::ONE;
+        quote.ask = price + Decimal::from(2);
+        quote.bid_qty = d("0.4");
+        quote.time = now_ms() - 10;
+    }
+    #[tokio::test]
+    async fn unchanged_order_reports_skip_writes_but_status_changes_still_persist() {
+        let e = paper();
+        {
+            let mut i = e.inner.lock().await;
+            let order = entry(Action::Long);
+            i.book.pending.insert(order.client_id.clone(), order);
+            e.save(&mut i).unwrap();
+        }
+        let mut remote: ExchangeOrder = serde_json::from_value(json!({
+            "symbol":"XUSDT", "clientOrderId":"test-entry", "orderId":42,
+            "status":"NEW", "executedQty":"0", "avgPrice":"0",
+            "origQty":"1", "cumQuote":"0"
+        }))
+        .unwrap();
+        e.apply_order(remote.clone()).await.unwrap();
+        assert_eq!(
+            e.store.load().unwrap().unwrap().1.pending["test-entry"].status,
+            "NEW"
+        );
+        let before = e
+            .store
+            .with_test_connection(rusqlite::Connection::total_changes);
+        e.apply_order(remote.clone()).await.unwrap();
+        assert_eq!(
+            e.store
+                .with_test_connection(rusqlite::Connection::total_changes),
+            before
+        );
+        remote.status = "CANCELED".into();
+        e.apply_order(remote).await.unwrap();
+        assert!(e.store.load().unwrap().unwrap().1.pending.is_empty());
+    }
+    #[tokio::test]
+    async fn failed_saves_are_retried_even_when_the_next_poll_has_no_changes() {
+        let e = paper();
+        seed(&e).await;
+        e.paper_entry(entry(Action::Long)).await.unwrap();
+        e.ensure_tp("XUSDT").await.unwrap();
+        prepare_partial_quote(&e).await;
+        e.store
+            .with_test_connection(|c| {
+                c.execute_batch(
+                    "CREATE TEMP TRIGGER reject_portfolio_save BEFORE INSERT ON portfolios
+             BEGIN SELECT RAISE(FAIL, 'injected write failure'); END;",
+                )
+            })
+            .unwrap();
+        assert!(e.paper_match().await.is_err());
+        assert!(e.inner.lock().await.persistence_pending);
+        assert_eq!(
+            e.store.load().unwrap().unwrap().1.positions["XUSDT"].quantity,
+            Decimal::ONE
+        );
+        assert!(e.manage_positions().await.is_err());
+        assert_eq!(
+            e.snapshot().await.runtime.position_management.failed_runs,
+            1
+        );
+        e.store
+            .with_test_connection(|c| c.execute_batch("DROP TRIGGER reject_portfolio_save"))
+            .unwrap();
+        // The quote was consumed in memory: this poll must only retry persistence.
+        e.paper_match().await.unwrap();
+        assert!(!e.inner.lock().await.persistence_pending);
+        assert_eq!(
+            e.store.load().unwrap().unwrap().1.positions["XUSDT"].quantity,
+            d("0.6")
+        );
+        let before = e
+            .store
+            .with_test_connection(rusqlite::Connection::total_changes);
+        e.paper_match().await.unwrap();
+        assert_eq!(
+            e.store
+                .with_test_connection(rusqlite::Connection::total_changes),
+            before
+        );
+    }
+    #[tokio::test]
+    async fn changing_jev_credentials_does_not_wait_for_an_in_flight_decision() {
+        use crate::application::Application;
+        use axum::{Json, Router, routing::post};
+        use tokio::sync::Notify;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/v1/systemone",
+            post({
+                let started = started.clone();
+                let release = release.clone();
+                move || {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        Json(json!({"model":"slow-test-model", "answers":{"action":{
+                            "type":"choice", "choice":"LONG", "confidence":0.9,
+                            "probabilities":{"LONG":0.9,"SHORT":0.05,"WAIT":0.05}
+                        }}}))
+                    }
+                }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Paper,
+            Store::open(":memory:", Mode::Paper).unwrap(),
+            config(),
+            Binance::new(Mode::Paper).unwrap(),
+            Jev::mock(base),
+        )
+        .unwrap();
+        let app = Application::from_engine(e.clone());
+        e.inner.lock().await.paused = false;
+        let decision = tokio::spawn({
+            let e = e.clone();
+            async move {
+                let end = now_ms() / BAR_MS * BAR_MS;
+                let bars: Vec<_> = (0..120)
+                    .map(|index| {
+                        let open_time = end - (120 - index) * BAR_MS;
+                        Candle {
+                            open_time,
+                            close_time: open_time + BAR_MS - 1,
+                            open: 100.0,
+                            high: 101.0,
+                            low: 99.0,
+                            close: 100.0,
+                            volume: 1.0,
+                        }
+                    })
+                    .collect();
+                let quote = Quote {
+                    bid: 100.into(),
+                    ask: 100.into(),
+                    bid_qty: 1.into(),
+                    ask_qty: 1.into(),
+                    time: now_ms(),
+                    exchange_time: None,
+                };
+                e.decide("XUSDT", &bars, &quote, &config()).await.unwrap()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            app.configure_connections(
+                serde_json::from_value(json!({"jev_key":"replacement-test-key"})).unwrap(),
+            ),
+        )
+        .await
+        .expect("saving credentials must not wait for the old model response")
+        .unwrap();
+        assert!(!decision.is_finished());
+        let snapshot =
+            tokio::time::timeout(Duration::from_secs(1), app.engine.read().await.snapshot())
+                .await
+                .unwrap();
+        assert!(snapshot.paused);
+        assert!(snapshot.jev_available);
+        assert_eq!(
+            app.store.settings().unwrap().jev_key,
+            "replacement-test-key"
+        );
+        release.notify_one();
+        assert_eq!(decision.await.unwrap().action, Action::Long);
+        assert!(e.snapshot().await.pending.is_empty());
+        server.abort();
     }
     fn entry(side: Action) -> PendingOrder {
         PendingOrder {
@@ -1705,6 +2502,7 @@ mod tests {
                 bid_qty: d("10"),
                 ask_qty: d("10"),
                 time: now_ms(),
+                exchange_time: None,
             },
         );
         i.market_at = now_ms();
@@ -2079,14 +2877,14 @@ mod tests {
             assert!(e.inner.lock().await.occupied("XUSDT"));
             e.ensure_tp("XUSDT").await.unwrap();
             let (id, limit, created) = {
-                let i = e.inner.lock().await;
+                let mut i = e.inner.lock().await;
                 let p = &i.book.positions["XUSDT"];
                 let id = p.tp_client_id.clone().unwrap();
-                (
-                    id.clone(),
-                    p.tp_price.unwrap(),
-                    i.book.pending[&id].created_at,
-                )
+                let limit = p.tp_price.unwrap();
+                // Distinct, recent timestamps without generating future quotes.
+                let created = now_ms() - 100;
+                i.book.pending.get_mut(&id).unwrap().created_at = created;
+                (id, limit, created)
             };
             e.remove_coin("XUSDT").await.unwrap();
             e.set_running(false).await.unwrap();
@@ -2269,7 +3067,7 @@ mod tests {
             i.book
                 .pending
                 .insert(order.client_id.clone(), order.clone());
-            e.save(&i).unwrap();
+            e.save(&mut i).unwrap();
         }
         e.submit_order(order).await.unwrap();
         let (config, book) = e.store.load().unwrap().unwrap();

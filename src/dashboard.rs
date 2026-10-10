@@ -214,6 +214,7 @@ mod tests {
                     bid_qty: Decimal::ONE,
                     ask_qty: Decimal::ONE,
                     time: now_ms(),
+                    exchange_time: None,
                 },
             );
             inner

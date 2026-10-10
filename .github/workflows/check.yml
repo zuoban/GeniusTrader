@@ -1,0 +1,42 @@
+name: Rust Checks
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.89.0", "stable"]
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install Rust toolchain
+        run: rustup toolchain install "${{ matrix.toolchain }}" --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +${{ matrix.toolchain }} fmt --check
+      - name: Run tests
+        run: cargo +${{ matrix.toolchain }} test --locked
+      - name: Run Clippy
+        run: cargo +${{ matrix.toolchain }} clippy --locked --all-targets -- -D warnings
+      - name: Check dashboard JavaScript
+        if: matrix.toolchain == 'stable'
+        run: node --check web/app.js
+      - name: Run dashboard regression tests
+        if: matrix.toolchain == 'stable'
+        run: node --test scripts/web.test.cjs

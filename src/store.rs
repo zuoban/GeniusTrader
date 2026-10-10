@@ -16,12 +16,30 @@ pub struct Store {
     connection: Arc<Mutex<Connection>>,
     mode: Mode,
 }
+const LATEST_DECISIONS_SQL: &str =
+    "SELECT e.id,e.time,json_extract(e.body,'$.symbol'),json_extract(e.body,'$.detail.bar_close'),json_extract(e.body,'$.detail.decision')
+     FROM json_each(?2) AS requested JOIN events AS e ON e.id=(
+         SELECT id FROM events WHERE mode=?1 AND json_extract(body,'$.level')='decision'
+         AND json_extract(body,'$.symbol')=requested.value ORDER BY id DESC LIMIT 1
+     ) ORDER BY requested.key";
 fn tag(mode: Mode) -> &'static str {
     match mode {
         Mode::Paper => "paper",
         Mode::Testnet => "testnet",
         Mode::Live => "live",
     }
+}
+fn decision_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionRecord> {
+    let decision: String = row.get(4)?;
+    Ok(DecisionRecord {
+        id: row.get(0)?,
+        time: row.get(1)?,
+        symbol: row.get(2)?,
+        bar_close: row.get(3)?,
+        decision: serde_json::from_str(&decision).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+    })
 }
 impl Store {
     pub fn open(path: &str, mode: Mode) -> Result<Self> {
@@ -131,8 +149,19 @@ impl Store {
     }
     pub fn save(&self, mode: Mode, config: &Config, book: &Book) -> Result<()> {
         ensure!(mode == self.mode, "禁止跨交易模式写入持仓");
-        self.connection.lock().unwrap().execute("INSERT INTO portfolios(mode,config,book) VALUES(?1,?2,?3) ON CONFLICT(mode) DO UPDATE SET config=excluded.config,book=excluded.book",params![tag(mode),serde_json::to_string(config)?,serde_json::to_string(book)?])?;
+        let config = serde_json::to_string(config)?;
+        let book = serde_json::to_string(book)?;
+        self.connection.lock().unwrap().execute(
+            "INSERT INTO portfolios(mode,config,book) VALUES(?1,?2,?3)
+             ON CONFLICT(mode) DO UPDATE SET config=excluded.config,book=excluded.book
+             WHERE portfolios.config != excluded.config OR portfolios.book != excluded.book",
+            params![tag(mode), config, book],
+        )?;
         Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn with_test_connection<T>(&self, inspect: impl FnOnce(&Connection) -> T) -> T {
+        inspect(&self.connection.lock().unwrap())
     }
     pub fn settings(&self) -> Result<AppSettings> {
         let body: Option<String> = self
@@ -299,12 +328,16 @@ impl Store {
         self.decision_records(limit.min(100), symbol)
     }
     pub fn latest_decisions(&self, symbols: &[&str]) -> Result<Vec<DecisionRecord>> {
-        // Each lookup uses the symbol index and stops at the first row, even with a long history.
-        let mut decisions = Vec::with_capacity(symbols.len());
-        for symbol in symbols {
-            decisions.extend(self.recent_decisions(1, Some(symbol))?);
+        if symbols.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(decisions)
+        // One statement and one lock; each correlated lookup still seeks the symbol index
+        // and stops at its latest row instead of scanning the full decision history.
+        let symbols = serde_json::to_string(symbols)?;
+        let c = self.connection.lock().unwrap();
+        let mut stmt = c.prepare_cached(LATEST_DECISIONS_SQL)?;
+        let rows = stmt.query_map(params![tag(self.mode), symbols], decision_record)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
     fn decision_records(&self, limit: usize, symbol: Option<&str>) -> Result<Vec<DecisionRecord>> {
         let c = self.connection.lock().unwrap();
@@ -318,30 +351,12 @@ impl Store {
              FROM events WHERE mode=?1 AND json_extract(body,'$.level')='decision'
              AND json_extract(body,'$.symbol') IS NOT NULL {selection} ORDER BY id DESC LIMIT ?3"
         );
-        let mut stmt = c.prepare(&sql)?;
+        let mut stmt = c.prepare_cached(&sql)?;
         let rows = stmt.query_map(
             params![tag(self.mode), symbol, limit.min(i64::MAX as usize) as i64],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            },
+            decision_record,
         )?;
-        rows.map(|row| {
-            let (id, time, symbol, bar_close, decision) = row?;
-            Ok(DecisionRecord {
-                id,
-                time,
-                symbol,
-                bar_close,
-                decision: serde_json::from_str(&decision)?,
-            })
-        })
-        .collect()
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
     /// Import a previous per-mode database once; never read .env or overwrite a portfolio.
     pub fn import_legacy(&self, path: &Path) -> Result<bool> {
@@ -393,6 +408,91 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn batch_latest_decisions_preserves_order_isolation_and_indexed_lookup() {
+        let store = Store::open(":memory:", Mode::Paper).unwrap();
+        for symbol in ["BTCUSDT", "ETHUSDT", "X' OR 1=1--"] {
+            for (time, source) in [(200, "older"), (100, "latest")] {
+                store.event(&Event {
+                    time, level: "decision".into(), symbol: Some(symbol.into()),
+                    message: "decision".into(),
+                    detail: serde_json::json!({"bar_close":time-1,"decision":crate::strategy::Decision::wait(source)}),
+                }).unwrap();
+            }
+        }
+        store.for_mode(Mode::Live).event(&Event {
+            time: 300, level: "decision".into(), symbol: Some("BTCUSDT".into()),
+            message: "other mode".into(),
+            detail: serde_json::json!({"bar_close":299,"decision":crate::strategy::Decision::wait("live")}),
+        }).unwrap();
+        store
+            .event(&Event {
+                time: 400,
+                level: "warn".into(),
+                symbol: Some("BTCUSDT".into()),
+                message: "not a decision".into(),
+                detail: serde_json::json!({}),
+            })
+            .unwrap();
+        let symbols = ["ETHUSDT", "MISSING", "BTCUSDT", "X' OR 1=1--", "BTCUSDT"];
+        let decisions = store.latest_decisions(&symbols).unwrap();
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|d| d.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ETHUSDT", "BTCUSDT", "X' OR 1=1--", "BTCUSDT"]
+        );
+        assert!(
+            decisions
+                .iter()
+                .all(|d| d.time == 100 && d.decision.source == "latest")
+        );
+        assert!(store.latest_decisions(&[]).unwrap().is_empty());
+        let c = store.connection.lock().unwrap();
+        let mut stmt = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {LATEST_DECISIONS_SQL}"))
+            .unwrap();
+        let plan = stmt
+            .query_map(
+                params!["paper", serde_json::to_string(&symbols).unwrap()],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("events_decision_lookup")),
+            "{plan:?}"
+        );
+    }
+    #[test]
+    fn identical_portfolio_saves_skip_updates_but_changes_and_modes_persist() {
+        let paper = Store::open(":memory:", Mode::Paper).unwrap();
+        let changes = || paper.with_test_connection(Connection::total_changes);
+        let mut config = Config::default();
+        let mut book = Book::default();
+        let before = changes();
+        paper.save(Mode::Paper, &config, &book).unwrap();
+        assert_eq!(changes(), before + 1);
+        paper.save(Mode::Paper, &config, &book).unwrap();
+        assert_eq!(changes(), before + 1);
+        config.profit_usdt = 2.into();
+        paper.save(Mode::Paper, &config, &book).unwrap();
+        assert_eq!(changes(), before + 2);
+        book.last_bar.insert("BTCUSDT".into(), 123);
+        paper.save(Mode::Paper, &config, &book).unwrap();
+        assert_eq!(changes(), before + 3);
+        let live = paper.for_mode(Mode::Live);
+        live.save(Mode::Live, &config, &book).unwrap();
+        assert_eq!(changes(), before + 4);
+        live.save(Mode::Live, &config, &book).unwrap();
+        assert_eq!(changes(), before + 4);
+        let (restored_config, restored_book) = paper.load().unwrap().unwrap();
+        assert_eq!(restored_config.profit_usdt, config.profit_usdt);
+        assert_eq!(restored_book.last_bar["BTCUSDT"], 123);
+    }
     #[test]
     fn legacy_decision_modes_and_coin_overrides_are_saved_as_jev() {
         use crate::config::DecisionMode;

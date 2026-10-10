@@ -628,6 +628,13 @@ mod tests {
         assert_eq!(v["paused"], true);
         assert_eq!(v["mode"], "paper");
         assert!(v.get("api_key").is_none());
+        let limiter = &v["exchange_rate_limit"];
+        assert_eq!(limiter["weight_limit"], 2400);
+        assert_eq!(limiter["regular_weight_limit"], 2160);
+        assert!(limiter["remaining_weight"].is_u64());
+        assert!(limiter["cooldown_remaining_ms"].is_u64());
+        assert!(limiter.get("charges").is_none());
+        assert!(limiter.get("dispatch").is_none());
     }
     #[tokio::test]
     async fn dashboard_is_public_and_decision_history_survives_engine_restart() {
@@ -699,6 +706,7 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["auth"]["authenticated"], false);
+        assert!(value["exchange_rate_limit"]["estimated_used_weight"].is_u64());
         assert_eq!(
             value["watchlist"][0]["latest_decision"]["source"],
             "latest decision"

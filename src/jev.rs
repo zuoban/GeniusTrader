@@ -45,6 +45,14 @@ struct Model {
     name: String,
 }
 impl Jev {
+    #[cfg(test)]
+    pub(crate) fn mock(base: String) -> Self {
+        Self {
+            client: Client::builder().no_proxy().build().unwrap(),
+            key: Some("local-jev-key".into()),
+            base,
+        }
+    }
     pub fn new() -> Result<Self> {
         Self::with_key("")
     }
@@ -370,6 +378,7 @@ mod tests {
             bid_qty: 1.into(),
             ask_qty: 1.into(),
             time: now_ms(),
+            exchange_time: None,
         };
         let indicators = strategy::indicators(&bars, &config.strategy).unwrap();
         for (symbol, asset) in [("BTCUSDT", "USDT"), ("BTCUSDC", "USDC")] {
@@ -394,6 +403,7 @@ mod tests {
             bid_qty: 1.into(),
             ask_qty: 1.into(),
             time: now_ms(),
+            exchange_time: None,
         };
         for count in [120, 500] {
             for price in [0.0000123456789, 123.456789, 65000.1234567] {
@@ -473,6 +483,7 @@ mod tests {
             bid_qty: 1.into(),
             ask_qty: 1.into(),
             time: now_ms(),
+            exchange_time: None,
         };
         let bars = candles();
         let indicators = strategy::indicators(&bars, &c.strategy).unwrap();
@@ -615,6 +626,7 @@ mod tests {
             bid_qty: 1.into(),
             ask_qty: 1.into(),
             time: crate::domain::now_ms(),
+            exchange_time: None,
         };
         for (status, reason) in [
             (401, "密钥"),
@@ -732,6 +744,7 @@ mod tests {
             bid_qty: 1.into(),
             ask_qty: 1.into(),
             time: crate::domain::now_ms(),
+            exchange_time: None,
         };
         let result = jev.decide("XUSDT", &bars, &quote, &c).await.unwrap();
         assert_eq!(result.action, Action::Long);

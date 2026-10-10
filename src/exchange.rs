@@ -1,4 +1,10 @@
-use crate::{config::Mode, domain::*, settings::Credentials};
+pub use crate::rate_limit::RateLimitSnapshot;
+use crate::{
+    config::Mode,
+    domain::*,
+    rate_limit::{AdmissionError, RequestThrottle, request_cost, retry_after, shared_throttle},
+    settings::Credentials,
+};
 use anyhow::{Context, Result, ensure};
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method};
@@ -9,8 +15,11 @@ use sha2::Sha256;
 use std::{
     collections::BTreeMap,
     str::FromStr,
-    sync::atomic::{AtomicI64, Ordering},
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::Mutex;
 
@@ -36,6 +45,8 @@ enum ExchangeErrorKind {
     IncompleteJson,
     InvalidJson,
     Api,
+    Cooldown(Duration),
+    Budget(Duration),
 }
 impl ExchangeErrorKind {
     fn retryable(self) -> bool {
@@ -109,6 +120,8 @@ impl std::fmt::Display for ExchangeError {
             ExchangeErrorKind::EmptyResponse => "返回空响应，未收到有效 JSON",
             ExchangeErrorKind::IncompleteJson => "返回不完整 JSON，数据可能被截断",
             ExchangeErrorKind::InvalidJson => "返回无效 JSON，请检查网络或代理是否返回了其他内容",
+            ExchangeErrorKind::Cooldown(_) => "限流退避中，暂缓发送请求",
+            ExchangeErrorKind::Budget(_) => "请求权重预算不足，暂缓发送请求",
             ExchangeErrorKind::Api => match self.code {
                 -1021 => "请求时间校验失败，请检查系统时间或网络延迟",
                 -1003 | -1015 => "请求频率受限，请稍后重试",
@@ -122,6 +135,22 @@ impl std::fmt::Display for ExchangeError {
             },
         };
         write!(f, "币安 {} {reason}", self.path)?;
+        if let ExchangeErrorKind::Budget(remaining) = self.kind {
+            return write!(
+                f,
+                "（约 {} 秒后可重试；本次未发送）",
+                remaining.as_millis().div_ceil(1000)
+            );
+        }
+        if let ExchangeErrorKind::Cooldown(remaining) = self.kind {
+            return write!(
+                f,
+                "（约 {} 秒后可重试；上次 HTTP {}，code={}；本次未发送）",
+                remaining.as_millis().div_ceil(1000),
+                self.status,
+                self.code
+            );
+        }
         if self.status == 0 {
             write!(f, "（未收到 HTTP 响应）")?;
         } else {
@@ -176,7 +205,7 @@ pub struct Binance {
     key: Option<String>,
     secret: Option<String>,
     offset: AtomicI64,
-    throttle: Mutex<Instant>,
+    throttle: Arc<Mutex<RequestThrottle>>,
     position_mode_lock: Mutex<()>,
 }
 #[derive(Debug, Clone, Deserialize)]
@@ -298,6 +327,8 @@ impl AccountInfo {
 impl Binance {
     #[cfg(test)]
     pub(crate) fn mock(base: String) -> Self {
+        // Isolate mock servers from process-wide cooldowns when test ports are reused.
+        let throttle = Arc::new(Mutex::new(RequestThrottle::new(Instant::now())));
         Self {
             client: Client::builder()
                 .no_proxy()
@@ -308,7 +339,7 @@ impl Binance {
             key: Some("local-test-key".into()),
             secret: Some("local-test-secret".into()),
             offset: AtomicI64::new(0),
-            throttle: Mutex::new(Instant::now()),
+            throttle,
             position_mode_lock: Mutex::new(()),
         }
     }
@@ -316,7 +347,7 @@ impl Binance {
         Self::with_credentials(mode, &Credentials::default())
     }
     pub fn with_credentials(mode: Mode, credentials: &Credentials) -> Result<Self> {
-        let base = if mode == Mode::Testnet {
+        let base: String = if mode == Mode::Testnet {
             "https://demo-fapi.binance.com"
         } else {
             "https://fapi.binance.com"
@@ -326,6 +357,7 @@ impl Binance {
             (mode != Mode::Paper && !credentials.key.is_empty()).then(|| credentials.key.clone());
         let secret = (mode != Mode::Paper && !credentials.secret.is_empty())
             .then(|| credentials.secret.clone());
+        let throttle = shared_throttle(&base);
         Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(8))
@@ -335,12 +367,78 @@ impl Binance {
             key,
             secret,
             offset: AtomicI64::new(0),
-            throttle: Mutex::new(Instant::now()),
+            throttle,
             position_mode_lock: Mutex::new(()),
         })
     }
     pub fn configured(&self) -> bool {
         self.key.is_some() && self.secret.is_some()
+    }
+    pub async fn rate_limit_snapshot(&self) -> RateLimitSnapshot {
+        self.throttle.lock().await.snapshot(Instant::now())
+    }
+    async fn request_slot(
+        &self,
+        method: &Method,
+        path: &'static str,
+        params: &[(String, String)],
+    ) -> Result<Instant> {
+        // Keep FIFO admission while allowing responses to update cooldown state
+        // immediately. This queue lock is released before sending the HTTP request.
+        let dispatch = self.throttle.lock().await.dispatch.clone();
+        let _queued = dispatch.lock().await;
+        let cost = request_cost(method, path, params);
+        loop {
+            let mut gate = self.throttle.lock().await;
+            let now = Instant::now();
+            let slot = gate.reserve(now, cost);
+            drop(gate);
+            match slot {
+                Ok(None) => return Ok(now),
+                Ok(Some(wait)) => tokio::time::sleep(wait).await,
+                Err(AdmissionError::Cooldown(cooldown)) => {
+                    return Err(ExchangeError {
+                        status: cooldown.status,
+                        code: cooldown.code,
+                        uncertain: false,
+                        path,
+                        kind: ExchangeErrorKind::Cooldown(cooldown.remaining),
+                    }
+                    .into());
+                }
+                Err(AdmissionError::Budget(remaining)) => {
+                    return Err(ExchangeError {
+                        status: 0,
+                        code: 0,
+                        uncertain: false,
+                        path,
+                        kind: ExchangeErrorKind::Budget(remaining),
+                    }
+                    .into());
+                }
+            }
+        }
+    }
+    async fn record_limit(
+        &self,
+        started: Instant,
+        path: &'static str,
+        status: u16,
+        code: i64,
+        retry: Option<Duration>,
+    ) {
+        let delay =
+            self.throttle
+                .lock()
+                .await
+                .penalize(started, Instant::now(), status, code, retry);
+        tracing::warn!(
+            path,
+            status,
+            code,
+            retry_after_ms = delay.as_millis() as u64,
+            "币安限流，暂缓该域名的后续请求"
+        );
     }
     async fn request(
         &self,
@@ -374,17 +472,21 @@ impl Binance {
         &self,
         method: Method,
         path: &'static str,
-        mut params: Vec<(String, String)>,
+        params: Vec<(String, String)>,
         signed: bool,
     ) -> Result<Value> {
-        {
-            let mut next = self.throttle.lock().await;
-            let wait = next.saturating_duration_since(Instant::now());
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await;
-            }
-            *next = Instant::now() + Duration::from_millis(100);
-        }
+        let started = self.request_slot(&method, path, &params).await?;
+        self.request_admitted(method, path, params, signed, started)
+            .await
+    }
+    async fn request_admitted(
+        &self,
+        method: Method,
+        path: &'static str,
+        mut params: Vec<(String, String)>,
+        signed: bool,
+        started: Instant,
+    ) -> Result<Value> {
         if signed {
             params.push((
                 "timestamp".into(),
@@ -427,6 +529,33 @@ impl Binance {
             .await
             .map_err(|error| ExchangeError::transport(error, &method, path, 0))?;
         let status = response.status();
+        let retry = retry_after(
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            SystemTime::now(),
+        );
+        let limited = matches!(status.as_u16(), 418 | 429);
+        if limited {
+            // Apply the gate as soon as headers arrive, even if the body stalls or is HTML.
+            self.record_limit(started, path, status.as_u16(), 0, retry)
+                .await;
+        }
+        // Binance explicitly documents bookTicker's weight header as inaccurate.
+        // Observe other headers before reading the body, including error responses.
+        if path != "/fapi/v1/ticker/bookTicker"
+            && let Some(used) = response
+                .headers()
+                .get("x-mbx-used-weight-1m")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+        {
+            self.throttle
+                .lock()
+                .await
+                .observe_weight(started, Instant::now(), used);
+        }
         let body = response
             .bytes()
             .await
@@ -438,6 +567,10 @@ impl Binance {
             .and_then(|value| value.get("code"))
             .and_then(Value::as_i64)
             .unwrap_or(0);
+        if !limited && matches!(code, -1003 | -1015) {
+            self.record_limit(started, path, status.as_u16(), code, retry)
+                .await;
+        }
         // Preserve HTTP failures even when a gateway returns HTML instead of JSON.
         // A Binance error code must also be rejected if it arrives with HTTP 200.
         if !status.is_success() || code < 0 {
@@ -451,8 +584,8 @@ impl Binance {
             }
             .into());
         }
-        value.map_err(|error| {
-            ExchangeError {
+        let value = value.map_err(|error| {
+            anyhow::Error::from(ExchangeError {
                 code: 0,
                 status: status.as_u16(),
                 uncertain: method == Method::POST || method == Method::DELETE,
@@ -464,14 +597,22 @@ impl Binance {
                 } else {
                     ExchangeErrorKind::InvalidJson
                 },
-            }
-            .into()
-        })
+            })
+        })?;
+        if method == Method::GET && path == "/fapi/v1/exchangeInfo" {
+            self.throttle.lock().await.configure_weight_limit(&value);
+        }
+        Ok(value)
     }
     pub async fn sync_time(&self) -> Result<()> {
+        let admitted = self
+            .request_slot(&Method::GET, "/fapi/v1/time", &[])
+            .await?;
+        // Queueing is local delay, not network round-trip time. Including it would
+        // move the clock offset forward and skew every later signed request.
         let start = now_ms();
         let v = self
-            .request(Method::GET, "/fapi/v1/time", vec![], false)
+            .request_admitted(Method::GET, "/fapi/v1/time", vec![], false, admitted)
             .await?;
         let end = now_ms();
         self.offset.store(
@@ -555,13 +696,19 @@ impl Binance {
             .request(Method::GET, "/fapi/v1/ticker/bookTicker", vec![], false)
             .await?;
         let mut out = BTreeMap::new();
+        let received_at = now_ms();
         for q in v.as_array().context("invalid quotes")? {
+            let exchange_time = q["time"]
+                .as_i64()
+                .context("missing quote transaction time")?;
+            ensure!(exchange_time > 0, "invalid quote transaction time");
             let quote = Quote {
                 bid: decimal(&q["bidPrice"])?,
                 ask: decimal(&q["askPrice"])?,
                 bid_qty: decimal(&q["bidQty"])?,
                 ask_qty: decimal(&q["askQty"])?,
-                time: now_ms(),
+                time: received_at,
+                exchange_time: Some(exchange_time),
             };
             if quote.validate().is_ok() {
                 out.insert(
@@ -877,6 +1024,380 @@ impl Binance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn budget_is_shared_across_client_replacement_and_reserves_account_and_exit_capacity() {
+        use axum::{Json, Router, http::Uri};
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().fallback(move |uri: Uri, method: axum::http::Method, body: String| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                if uri.path() == "/fapi/v1/exchangeInfo" {
+                    Json(serde_json::json!({"rateLimits":[{"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":100}]}))
+                } else {
+                    if method == Method::POST {
+                        assert!(body.contains("reduceOnly=true"));
+                    }
+                    Json(serde_json::json!([]))
+                }
+            }
+        });
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let mut first = Binance::mock(base.clone());
+        first.throttle = shared_throttle(&base);
+        first
+            .request(Method::GET, "/fapi/v1/exchangeInfo", vec![], false)
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            first
+                .request(Method::GET, "/fapi/v1/commissionRate", vec![], true)
+                .await
+                .unwrap();
+        }
+        assert_eq!(first.rate_limit_snapshot().await.estimated_used_weight, 81);
+        drop(first);
+        let mut replacement = Binance::mock(base.clone());
+        replacement.throttle = shared_throttle(&base);
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            replacement.request(Method::GET, "/fapi/v1/commissionRate", vec![], true),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let error = error.downcast_ref::<ExchangeError>().unwrap();
+        assert!(matches!(error.kind, ExchangeErrorKind::Budget(_)));
+        assert!(!error.uncertain);
+        assert!(error.to_string().contains("本次未发送"));
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        for _ in 0..2 {
+            replacement
+                .request(Method::GET, "/fapi/v2/account", vec![], true)
+                .await
+                .unwrap();
+        }
+        replacement
+            .request(Method::DELETE, "/fapi/v1/order", vec![], true)
+            .await
+            .unwrap();
+        // The ordinary budget is exhausted; an unsent entry is definite, while a
+        // zero-IP-weight reduce-only exit can still be dispatched exactly once.
+        assert!(matches!(
+            replacement
+                .request(Method::POST, "/fapi/v1/order", vec![], true)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ExchangeError>()
+                .unwrap()
+                .kind,
+            ExchangeErrorKind::Budget(_)
+        ));
+        replacement
+            .request(
+                Method::POST,
+                "/fapi/v1/order",
+                vec![("reduceOnly".into(), "true".into())],
+                true,
+            )
+            .await
+            .unwrap();
+        let snapshot = replacement.rate_limit_snapshot().await;
+        assert_eq!(snapshot.weight_limit, 100);
+        assert_eq!(snapshot.regular_weight_limit, 90);
+        assert_eq!(snapshot.estimated_used_weight, 92);
+        assert_eq!(snapshot.remaining_weight, 8);
+        assert_eq!(snapshot.regular_remaining_weight, 0);
+        assert_eq!(snapshot.budget_rejections, 2);
+        assert_eq!(snapshot.admitted_requests, 9);
+        assert_eq!(calls.load(Ordering::SeqCst), 9);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn inaccurate_and_malformed_weight_headers_are_ignored() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new()
+            .route(
+                "/fapi/v1/ticker/bookTicker",
+                get(|| async {
+                    (
+                        [("x-mbx-used-weight-1m", "999999")],
+                        Json(serde_json::json!([])),
+                    )
+                }),
+            )
+            .route(
+                "/fapi/v1/commissionRate",
+                get(|| async {
+                    (
+                        [("x-mbx-used-weight-1m", "invalid")],
+                        Json(serde_json::json!({})),
+                    )
+                }),
+            );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let client = Binance::mock(base);
+        client.quotes().await.unwrap();
+        client
+            .request(Method::GET, "/fapi/v1/commissionRate", vec![], true)
+            .await
+            .unwrap();
+        let snapshot = client.rate_limit_snapshot().await;
+        assert_eq!(snapshot.estimated_used_weight, 25);
+        assert_eq!(snapshot.server_reported_used_weight, None);
+        assert_eq!(snapshot.budget_rejections, 0);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn weight_headers_admit_no_ordinary_requests_while_the_response_body_stalls() {
+        use axum::{Router, body::Body, routing::get};
+        use futures_util::StreamExt;
+        let release = Arc::new(tokio::sync::Notify::new());
+        let body_release = release.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route(
+            "/fapi/v1/order",
+            get(move || {
+                let release = body_release.clone();
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let body = futures_util::stream::once(async {
+                        Ok::<_, std::convert::Infallible>("[")
+                    })
+                    .chain(futures_util::stream::once(async move {
+                        release.notified().await;
+                        Ok("]")
+                    }));
+                    ([("x-mbx-used-weight-1m", "2160")], Body::from_stream(body))
+                }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let client = Arc::new(Binance::mock(base));
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request(Method::GET, "/fapi/v1/order", vec![], true)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client
+                .rate_limit_snapshot()
+                .await
+                .server_reported_used_weight
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.request(Method::GET, "/fapi/v1/commissionRate", vec![], true),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ExchangeError>().unwrap().kind,
+            ExchangeErrorKind::Budget(_)
+        ));
+        assert!(!first.is_finished());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let snapshot = client.rate_limit_snapshot().await;
+        assert_eq!(snapshot.remaining_weight, 240);
+        assert_eq!(snapshot.cooldown_remaining_ms, 0);
+        release.notify_one();
+        first.await.unwrap().unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn time_sync_excludes_waiting_in_the_dispatch_queue() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new().route(
+            "/fapi/v1/time",
+            get(|| async { Json(serde_json::json!({"serverTime":now_ms()})) }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let client = Arc::new(Binance::mock(base));
+        let dispatch = client.throttle.lock().await.dispatch.clone();
+        let held = dispatch.lock().await;
+        let sync = tokio::spawn({
+            let client = client.clone();
+            async move { client.sync_time().await }
+        });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!sync.is_finished());
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), sync)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(client.offset.load(Ordering::Relaxed).abs() < 100);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn shared_cooldown_blocks_reads_and_mutations_without_sending_then_recovers() {
+        use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route("/fapi/v1/order", get(move |Query(query): Query<BTreeMap<String, String>>| {
+            let count = count.clone();
+            async move {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")], Json(serde_json::json!({"code":-1003,"msg":"local-test-secret"})))
+                } else {
+                    assert!(query["timestamp"].parse::<i64>().unwrap() >= now_ms() - 200);
+                    (StatusCode::OK, [("retry-after", "0")], Json(serde_json::json!({"symbol":"XUSDT","clientOrderId":"test","orderId":1,"status":"NEW","executedQty":"0","avgPrice":"0","origQty":"1","cumQuote":"0"})))
+                }
+            }
+        }));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let mut first = Binance::mock(base.clone());
+        first.throttle = shared_throttle(&base);
+        let error = first.order("XUSDT", "test").await.unwrap_err();
+        assert_eq!(error.downcast_ref::<ExchangeError>().unwrap().status, 429);
+        assert!(!error.to_string().contains("local-test-secret"));
+        drop(first);
+        let mut replacement = Binance::mock(base.clone());
+        replacement.throttle = shared_throttle(&base);
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            let error = replacement
+                .request(method, "/fapi/v1/order", vec![], true)
+                .await
+                .unwrap_err();
+            let error = error.downcast_ref::<ExchangeError>().unwrap();
+            assert!(matches!(error.kind, ExchangeErrorKind::Cooldown(_)));
+            assert!(!error.uncertain);
+            assert!(error.to_string().contains("本次未发送"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        replacement.order("XUSDT", "test").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn rate_limit_headers_block_queued_requests_before_the_body_completes() {
+        use axum::{Router, body::Body, http::StatusCode, routing::get};
+        use futures_util::StreamExt;
+        let release = Arc::new(tokio::sync::Notify::new());
+        let body_release = release.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route(
+            "/fapi/v1/order",
+            get(move || {
+                let release = body_release.clone();
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let body = futures_util::stream::once(async {
+                        Ok::<_, std::convert::Infallible>("{")
+                    })
+                    .chain(futures_util::stream::once(async move {
+                        release.notified().await;
+                        Ok("\"code\":-1003}")
+                    }));
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "2")],
+                        Body::from_stream(body),
+                    )
+                }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let client = Arc::new(Binance::mock(base));
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.order("XUSDT", "first").await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let error =
+            tokio::time::timeout(Duration::from_millis(500), client.order("XUSDT", "queued"))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ExchangeError>().unwrap().kind,
+            ExchangeErrorKind::Cooldown(_)
+        ));
+        assert!(!first.is_finished());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        assert_eq!(
+            first
+                .await
+                .unwrap()
+                .unwrap_err()
+                .downcast_ref::<ExchangeError>()
+                .unwrap()
+                .status,
+            429
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn bans_and_rate_limit_codes_apply_a_cooldown_without_retries() {
+        use axum::{Json, Router, http::StatusCode};
+        for (status, code) in [(418, -1003), (200, -1003), (400, -1015)] {
+            let app = Router::new().fallback(move || async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    Json(serde_json::json!({"code":code})),
+                )
+            });
+            let (base, server) = crate::test_support::mock_server(app).await;
+            let client = Binance::mock(base);
+            let original = client
+                .request(Method::GET, "/fapi/v1/order", vec![], true)
+                .await
+                .unwrap_err();
+            assert_eq!(original.downcast_ref::<ExchangeError>().unwrap().code, code);
+            let blocked = client
+                .request(Method::POST, "/fapi/v1/order", vec![], true)
+                .await
+                .unwrap_err();
+            let error = blocked.downcast_ref::<ExchangeError>().unwrap();
+            let ExchangeErrorKind::Cooldown(wait) = error.kind else {
+                panic!("expected cooldown");
+            };
+            assert!(wait > Duration::from_secs(if status == 418 { 119 } else { 59 }));
+            assert!(!error.uncertain);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn quote_keeps_exchange_transaction_time_separate_from_receipt_time() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new().route("/fapi/v1/ticker/bookTicker", get(|| async {
+            Json(serde_json::json!([{"symbol":"XUSDT","bidPrice":"100","askPrice":"101","bidQty":"2","askQty":"3","time":12345}]))
+        }));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let exchange = Binance::mock(base);
+        let started = now_ms();
+        let first = exchange.quotes().await.unwrap();
+        let second = exchange.quotes().await.unwrap();
+        for quotes in [&first, &second] {
+            assert_eq!(quotes["XUSDT"].exchange_time, Some(12345));
+            assert!((started..=now_ms()).contains(&quotes["XUSDT"].time));
+        }
+        server.abort();
+    }
     #[tokio::test]
     async fn catalog_includes_usdc_perpetuals_with_their_exchange_rules() {
         use axum::{Json, Router, routing::get};
@@ -1232,7 +1753,7 @@ mod tests {
                     Body::from(if first {
                         "[{\"symbol\":"
                     } else {
-                        "[{\"symbol\":\"BTCUSDT\",\"bidPrice\":\"100\",\"askPrice\":\"101\",\"bidQty\":\"2\",\"askQty\":\"3\"}]"
+                        "[{\"symbol\":\"BTCUSDT\",\"bidPrice\":\"100\",\"askPrice\":\"101\",\"bidQty\":\"2\",\"askQty\":\"3\",\"time\":12345}]"
                     })
                 }
             }),

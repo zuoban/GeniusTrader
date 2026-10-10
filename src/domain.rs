@@ -69,7 +69,11 @@ pub struct Quote {
     pub ask: Decimal,
     pub bid_qty: Decimal,
     pub ask_qty: Decimal,
+    /// Local receipt time, used to detect interrupted polling.
     pub time: i64,
+    /// Exchange transaction time, used to identify repeated book snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange_time: Option<i64>,
 }
 impl Quote {
     pub fn mid(&self) -> Decimal {
@@ -220,6 +224,8 @@ pub struct Book {
     pub sequence: u64,
     #[serde(default)]
     pub paper_match_times: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub paper_match_exchange_times: BTreeMap<String, i64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClosedTrade {
