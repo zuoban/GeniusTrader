@@ -89,6 +89,29 @@ rtk proxy docker compose down
 
 IP 访问失败时先看 `rtk proxy docker compose ps` 的端口：应显示 `0.0.0.0:8787->8787/tcp`；若仅显示 `127.0.0.1:8787`，端口仍只允许本机访问。服务器本机 `rtk proxy curl http://127.0.0.1:8787/api/auth/status` 成功、远程连接超时通常需要检查防火墙 / 云安全组；收到 HTTP 403 则检查是否仍使用旧镜像或覆盖了容器的 `--bind 0.0.0.0` 启动参数。
 
+「持仓管理异常」显示「未收到 HTTP 响应」时，表示尚未收到币安 HTTP 状态码，不能据此认定 API Key 或权限错误。日志会进一步区分域名解析、TLS、连接拒绝、连接中断和超时。宿主机 `curl` 成功不能验证容器的 DNS、出口和代理配置；先分别检查：
+
+```sh
+rtk proxy curl --silent --show-error --max-time 10 https://fapi.binance.com/fapi/v1/time
+rtk proxy docker compose exec -T trader getent ahosts fapi.binance.com
+rtk proxy docker compose exec -T trader cat /etc/resolv.conf
+```
+
+测试网将域名换成 `demo-fapi.binance.com`。镜像不包含 curl；`getent` 只验证容器域名解析，不代表 HTTPS 已连通。宿主机解析正常、容器解析失败时，检查 Docker DNS 和到 DNS 服务器的访问；TLS 错误检查宿主机时间、证书和代理链路；连接被拒绝则检查代理是否运行以及容器是否能访问其地址和端口。
+
+reqwest 会读取进程的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`（也支持小写），宿主机终端中的代理变量不会自动传入容器。需要代理时在 Compose 的 `trader.environment` 中显式配置；容器中的 `127.0.0.1` 指向容器自身，不能直接用于访问宿主机代理。排查时只检查变量是否存在，避免输出含认证信息的代理 URL：
+
+```sh
+rtk proxy docker compose exec -T trader sh -c '
+for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
+  if printenv "$name" >/dev/null; then
+    printf "%s=set\n" "$name"
+  else
+    printf "%s=unset\n" "$name"
+  fi
+done'
+```
+
 升级时修改 `compose.yaml` 中的镜像版本，再执行 `rtk proxy docker compose pull` 和 `rtk proxy docker compose up -d`，复用原数据卷。
 
 ## 已实现
@@ -156,7 +179,7 @@ flowchart TD
 
 当前采用 REST 轮询：盘口目标周期 2 秒，订单/仓位目标周期 5 秒，扫描目标周期 10 秒。网络和节流会影响实际周期；所有入场仅使用已收盘 5 分钟 K 线。持仓管理与 Jev 请求独立运行。尚未接入用户数据 WebSocket，也没有历史回测器。
 
-币安请求单次总超时为 8 秒；HTTP 200 仍可能发生响应读取超时或 JSON 解析异常，错误记录会显示具体接口及失败阶段。公开行情 GET 遇到瞬时连接/读取失败、空响应或不完整 JSON 时，间隔 250 毫秒最多重试一次；HTTP 拒绝和无效 JSON 直接报告。时间同步保持单次请求，确保时差估计不包含失败尝试；签名读取、订单发送和撤单也保持单次请求，执行结果不确定时继续查询确认。行情同步最终失败时暂停新增开仓，行情过期检查继续生效。
+币安请求单次总超时为 8 秒；HTTP 200 仍可能发生响应读取超时或 JSON 解析异常，错误记录会显示具体接口及失败阶段。公开行情和签名只读 GET（持仓、余额、账户、订单状态等）遇到瞬时连接/读取失败、空响应或不完整 JSON 时，间隔 250 毫秒最多重试一次；签名重试重新生成时间戳与签名，避免沿用过期请求。HTTP 拒绝、TLS 错误和无效 JSON 直接报告。时间同步保持单次请求，确保时差估计不包含失败尝试；订单发送和撤单也保持单次请求，执行结果不确定时继续查询确认。重试后仍无法同步行情或持仓时暂停新增开仓，行情与账户过期检查继续生效；持续网络故障仍需修复服务器或容器连接。
 
 入场前和提交订单前检查盘口：距上次更新必须小于 15 秒，买卖点差不得超过配置的「点差上限 / bps」。1 bps = 0.01%，默认 10 bps = 0.1%；点差按 `(卖一价 − 买一价) / 中间价 × 10000` 计算。触发时本轮等待，日志分别显示「盘口过期」或「点差过大」，并在 `quote_check` 中保存当时的原始盘口、盘口年龄、实际点差及限制。
 

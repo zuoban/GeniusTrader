@@ -25,6 +25,10 @@ pub struct ExchangeError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExchangeErrorKind {
     RequestTimeout,
+    Dns,
+    Tls,
+    ConnectionRefused,
+    ConnectionInterrupted,
     Network,
     ResponseTimeout,
     ResponseRead,
@@ -38,6 +42,9 @@ impl ExchangeErrorKind {
         matches!(
             self,
             Self::RequestTimeout
+                | Self::Dns
+                | Self::ConnectionRefused
+                | Self::ConnectionInterrupted
                 | Self::Network
                 | Self::ResponseTimeout
                 | Self::ResponseRead
@@ -45,11 +52,57 @@ impl ExchangeErrorKind {
                 | Self::IncompleteJson
         )
     }
+    fn connection_cause(error: &(dyn std::error::Error + 'static)) -> Self {
+        // The outer reqwest error includes the request URL; classify causes only.
+        let mut source = error.source();
+        let mut dns = false;
+        let mut tls = false;
+        let mut refused = false;
+        let mut interrupted = false;
+        while let Some(cause) = source {
+            // Inspect causes only to select a fixed message. Never retain or expose
+            // upstream text: URLs can include signatures and proxy credentials.
+            let message = cause.to_string().to_ascii_lowercase();
+            dns |= message.contains("dns") || message.contains("failed to lookup address");
+            tls |= message.contains("certificate")
+                || message.contains("tls")
+                || message.contains("ssl");
+            interrupted |= message.contains("connection closed")
+                || message.contains("connection reset")
+                || message.contains("unexpected end of file");
+            if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                refused |= io.kind() == std::io::ErrorKind::ConnectionRefused;
+                interrupted |= matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                );
+            }
+            source = cause.source();
+        }
+        if dns {
+            Self::Dns
+        } else if tls {
+            Self::Tls
+        } else if refused {
+            Self::ConnectionRefused
+        } else if interrupted {
+            Self::ConnectionInterrupted
+        } else {
+            Self::Network
+        }
+    }
 }
 impl std::fmt::Display for ExchangeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason = match self.kind {
             ExchangeErrorKind::RequestTimeout => "请求超时，请检查网络或代理",
+            ExchangeErrorKind::Dns => "域名解析失败，请检查服务器或容器 DNS、代理设置",
+            ExchangeErrorKind::Tls => "TLS 连接失败，请检查系统时间、证书或代理设置",
+            ExchangeErrorKind::ConnectionRefused => "连接被拒绝，请检查目标服务、代理地址和端口",
+            ExchangeErrorKind::ConnectionInterrupted => "连接中断，请检查网络或代理后重试",
             ExchangeErrorKind::Network => "网络连接失败，请检查网络或代理",
             ExchangeErrorKind::ResponseTimeout => "响应读取超时，请检查网络或代理",
             ExchangeErrorKind::ResponseRead => "响应读取中断，请检查网络或代理",
@@ -85,7 +138,7 @@ impl ExchangeError {
     fn transport(error: reqwest::Error, method: &Method, path: &'static str, status: u16) -> Self {
         let kind = match (status == 0, error.is_timeout()) {
             (true, true) => ExchangeErrorKind::RequestTimeout,
-            (true, false) => ExchangeErrorKind::Network,
+            (true, false) => ExchangeErrorKind::connection_cause(&error),
             (false, true) => ExchangeErrorKind::ResponseTimeout,
             (false, false) => ExchangeErrorKind::ResponseRead,
         };
@@ -282,15 +335,16 @@ impl Binance {
         params: Vec<(String, String)>,
         signed: bool,
     ) -> Result<Value> {
-        // Only public GETs may be repeated. Mutations and signed requests retain
-        // their original execution-uncertainty semantics and are never replayed.
+        // All current GET endpoints are read-only, including signed account/order
+        // queries. Retrying them cannot submit or cancel an order. request_once
+        // generates a fresh timestamp and signature after the retry delay.
         // Clock synchronization measures one request's round trip; including a
         // failed attempt would skew its offset and expire subsequent signatures.
-        let retry_public_get = method == Method::GET && !signed && path != "/fapi/v1/time";
+        let retry_get = method == Method::GET && path != "/fapi/v1/time";
         let mut result = self
             .request_once(method.clone(), path, params.clone(), signed)
             .await;
-        if retry_public_get
+        if retry_get
             && result.as_ref().is_err_and(|error| {
                 error
                     .downcast_ref::<ExchangeError>()
@@ -556,6 +610,9 @@ impl Binance {
             let Some(exchange) = error.downcast_ref::<ExchangeError>() else {
                 return error;
             };
+            if exchange.kind != ExchangeErrorKind::Api {
+                return anyhow::anyhow!("无法连接币安或未收到有效账户响应：{exchange}");
+            }
             let message = match exchange.code {
                 -2014 => "API Key 格式无效，请检查复制内容（-2014）",
                 -2015 => "验证失败：API Key 无效、IP 未获授权或权限不足；请确认密钥属于所选测试网 / 实盘环境，并检查合约权限及 IP 白名单（-2015）",
@@ -807,6 +864,192 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize},
     };
 
+    #[test]
+    fn connection_causes_are_classified_without_exposing_signed_urls_or_upstream_text() {
+        #[derive(Debug)]
+        struct TransportCause(std::io::Error);
+        impl std::fmt::Display for TransportCause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                // The outer URL must not make an unrelated failure look like DNS/TLS.
+                write!(
+                    f,
+                    "https://example.invalid/?symbol=DNSTLS&signature=private-signature"
+                )
+            }
+        }
+        impl std::error::Error for TransportCause {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        for (io_kind, cause, kind, reason) in [
+            (
+                std::io::ErrorKind::Other,
+                "dns error: local-test-secret",
+                ExchangeErrorKind::Dns,
+                "域名解析失败",
+            ),
+            (
+                std::io::ErrorKind::InvalidData,
+                "invalid peer certificate: local-test-secret",
+                ExchangeErrorKind::Tls,
+                "TLS 连接失败",
+            ),
+            (
+                std::io::ErrorKind::ConnectionRefused,
+                "local-test-secret",
+                ExchangeErrorKind::ConnectionRefused,
+                "连接被拒绝",
+            ),
+            (
+                std::io::ErrorKind::ConnectionReset,
+                "local-test-secret",
+                ExchangeErrorKind::ConnectionInterrupted,
+                "连接中断",
+            ),
+            (
+                std::io::ErrorKind::Other,
+                "connection closed before message completed: local-test-secret",
+                ExchangeErrorKind::ConnectionInterrupted,
+                "连接中断",
+            ),
+            (
+                std::io::ErrorKind::Other,
+                "local-test-secret",
+                ExchangeErrorKind::Network,
+                "网络连接失败",
+            ),
+        ] {
+            let kind_found = ExchangeErrorKind::connection_cause(&TransportCause(
+                std::io::Error::new(io_kind, cause),
+            ));
+            assert_eq!(kind_found, kind);
+            let error = ExchangeError {
+                code: 0,
+                status: 0,
+                uncertain: false,
+                path: "/fapi/v3/positionRisk",
+                kind: kind_found,
+            };
+            assert!(error.to_string().contains(reason));
+            assert!(error.to_string().contains("未收到 HTTP 响应"));
+            let output = format!("{error} {error:?}");
+            assert!(!output.contains("local-test-secret") && !output.contains("private-signature"));
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_connections_report_the_cause_without_retaining_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = Binance::mock(base).positions().await.unwrap_err();
+        let exchange = error.downcast_ref::<ExchangeError>().unwrap();
+        assert_eq!(exchange.kind, ExchangeErrorKind::ConnectionRefused);
+        assert!(!exchange.uncertain);
+        let output = format!("{error:#} {error:?}");
+        assert!(output.contains("连接被拒绝"));
+        assert!(!output.contains("signature=") && !output.contains("local-test-key"));
+        assert!(!output.contains("local-test-secret"));
+    }
+
+    #[tokio::test]
+    async fn signed_positions_recover_from_disconnect_with_a_fresh_signature() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Binance::mock(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let mut queries = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 1024];
+                while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&buffer[..read]);
+                    assert!(bytes.len() < 8192);
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                let target = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .strip_prefix("GET ")
+                    .unwrap();
+                let target = target.strip_suffix(" HTTP/1.1").unwrap();
+                let query = target.strip_prefix("/fapi/v3/positionRisk?").unwrap();
+                let mut headers = HeaderMap::new();
+                for header in request.lines().skip(1).filter(|line| !line.is_empty()) {
+                    let (name, value) = header.split_once(':').unwrap();
+                    headers.insert(
+                        axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                        value.trim().parse().unwrap(),
+                    );
+                }
+                assert_signed(&headers, query);
+                queries.push(query.to_owned());
+                if attempt == 0 {
+                    // Drop the connection before any HTTP response reaches the client.
+                    continue;
+                }
+                let body = r#"[{"symbol":"BTCUSDT","positionAmt":"2","entryPrice":"100","positionSide":"BOTH"}]"#;
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            queries
+        });
+        let positions = client.positions().await.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, "BTCUSDT");
+        assert_eq!(positions[0].position_amt, Decimal::from(2));
+        let queries = server.await.unwrap();
+        let params: Vec<BTreeMap<_, _>> = queries
+            .iter()
+            .map(|query| url::form_urlencoded::parse(query.as_bytes()).collect())
+            .collect();
+        assert!(
+            params[1]["timestamp"].parse::<i64>().unwrap()
+                > params[0]["timestamp"].parse::<i64>().unwrap()
+        );
+        assert_ne!(params[0]["signature"], params[1]["signature"]);
+    }
+
+    #[tokio::test]
+    async fn signed_positions_do_not_retry_api_rejections() {
+        for (status, code) in [(401, -2015), (429, -1003), (503, -1000), (200, -1021)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let app = Router::new().route(
+                "/fapi/v3/positionRisk",
+                get(move |headers: HeaderMap, RawQuery(query): RawQuery| {
+                    let observed = observed.clone();
+                    async move {
+                        assert_signed(&headers, &query.unwrap());
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::from_u16(status).unwrap(),
+                            Json(serde_json::json!({"code":code})),
+                        )
+                    }
+                }),
+            );
+            let (base, server) = crate::test_support::mock_server(app).await;
+            let error = Binance::mock(base).positions().await.unwrap_err();
+            assert_eq!(error.downcast_ref::<ExchangeError>().unwrap().code, code);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+    }
+
     fn asset_account() -> Value {
         serde_json::json!({
             "multiAssetsMargin": false, "totalWalletBalance": "1000",
@@ -820,7 +1063,7 @@ mod tests {
         })
     }
     #[tokio::test]
-    async fn response_failures_report_the_stage_and_only_retry_transient_public_gets() {
+    async fn response_failures_report_the_stage_and_only_retry_transient_gets() {
         use axum::{body::Body, response::IntoResponse};
         for (status, body, kind, attempts, reason) in [
             (200, "", ExchangeErrorKind::EmptyResponse, 2, "空响应"),
@@ -923,15 +1166,15 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn header_and_body_timeouts_preserve_uncertainty_and_never_replay_signed_or_clock_requests()
-     {
+    async fn header_and_body_timeouts_retry_reads_but_preserve_mutation_and_clock_semantics() {
         use axum::{body::Body, response::IntoResponse};
         use std::convert::Infallible;
         for body_timeout in [false, true] {
             for (method, signed, path, attempts, uncertain) in [
                 (Method::GET, false, "/fapi/v1/ticker/bookTicker", 2, false),
                 (Method::GET, false, "/fapi/v1/time", 1, false),
-                (Method::GET, true, "/fapi/v1/order", 1, false),
+                (Method::GET, true, "/fapi/v1/order", 2, false),
+                (Method::GET, true, "/fapi/v3/positionRisk", 2, false),
                 (Method::POST, true, "/fapi/v1/order", 1, true),
                 (Method::DELETE, true, "/fapi/v1/order", 1, true),
             ] {
@@ -1128,14 +1371,8 @@ mod tests {
             credential_server(StatusCode::OK, serde_json::json!({"canTrade":true})).await;
         server.abort();
         let _ = server.await;
-        assert!(
-            client
-                .verify_credentials()
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("无法连接币安")
-        );
+        let message = client.verify_credentials().await.unwrap_err().to_string();
+        assert!(message.contains("无法连接币安") && message.contains("连接被拒绝"));
     }
     async fn asset_server(
         index_status: StatusCode,
