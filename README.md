@@ -34,7 +34,7 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 ## GitHub Packages 容器
 
-镜像：`ghcr.io/zuoban/geniustrader:0.1.0`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像与仓库保持私有访问。私有镜像需先使用具备 `read:packages` 权限的 GitHub classic PAT，通过 `docker login ghcr.io --username YOUR_GITHUB_USER --password-stdin` 登录；令牌只用于本机登录，不写入代码或配置。
+镜像：`ghcr.io/zuoban/geniustrader:0.1.0`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
 
 ```sh
 rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.0
@@ -59,7 +59,33 @@ rtk proxy python3 scripts/smoke-container.py genius-trader:local
 
 GitHub Actions 的「Publish GitHub Package」可手动执行，也会在推送 `v*` 标签时触发（标签版本须与 Cargo.toml 一致）。两个架构分别构建、测试并验证容器，再发布版本、`latest` 和提交 SHA 标签；发布使用仓库自带的 `GITHUB_TOKEN`，无需保存额外发布密钥。
 
-工作流验证镜像清单中的两个架构、仓库来源及包的私有权限。GitHub 若未自动关联仓库，会在发布摘要中提示；可登录[包页面](https://github.com/users/zuoban/packages/container/package/geniustrader)，点击「Connect repository」并选择 `zuoban/GeniusTrader`，以展示仓库链接和 README。
+工作流验证镜像清单中的两个架构、仓库来源及包的公开状态，并检查版本和 `latest` 标签可以匿名拉取。GitHub 若未自动关联仓库，会在发布摘要中提示；可登录[包页面](https://github.com/users/zuoban/packages/container/package/geniustrader)，点击「Connect repository」并选择 `zuoban/GeniusTrader`，以展示仓库链接和 README。
+
+## Docker Compose 部署
+
+使用 Docker Compose v2 或更新版本，在 `compose.yaml` 所在目录执行。以下命令带 `rtk proxy`；服务器未安装 RTK 时去掉此前缀即可。
+
+```sh
+rtk proxy docker volume create genius-trader-data
+rtk proxy docker compose pull
+rtk proxy docker compose up -d
+rtk proxy docker compose ps
+```
+
+`compose.yaml` 使用已发布的 `0.1.0` 公开镜像，监听宿主机 `127.0.0.1:8787`，数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
+
+打开 http://127.0.0.1:8787，首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"127.0.0.1:8877:8787"`，再访问 http://127.0.0.1:8877；容器端口仍为 8787。
+
+查看日志和停止服务：
+
+```sh
+rtk proxy docker compose logs --tail 100 -f trader
+rtk proxy docker compose down
+```
+
+远程服务器部署时，在本机执行 `rtk proxy ssh -N -L 8877:127.0.0.1:8787 用户名@服务器IP`，然后打开 http://127.0.0.1:8877。应用仍要求 localhost / 127.0.0.1 Host，API 密钥和交易配置由页面保存到 SQLite。
+
+升级时修改 `compose.yaml` 中的镜像版本，再执行 `rtk proxy docker compose pull` 和 `rtk proxy docker compose up -d`，复用原数据卷。
 
 ## 已实现
 

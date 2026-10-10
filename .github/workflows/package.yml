@@ -130,22 +130,40 @@ jobs:
           print("Verified published platforms: linux/amd64, linux/arm64")
           PY
           docker buildx imagetools inspect "$IMAGE:$VERSION"
-      - name: Verify private package and report repository association
+      - name: Verify public package and anonymous pulls
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 - <<'PY'
-          import json, os, subprocess
+          import json, os, subprocess, urllib.request
           endpoint = ("users/" + os.environ["GITHUB_REPOSITORY_OWNER"]
                       + "/packages/container/" + os.environ["IMAGE"].rsplit("/", 1)[1])
           package = json.loads(subprocess.check_output([
               "gh", "api", endpoint,
               "--jq", "{name,visibility,html_url,repository:.repository.full_name}"
           ], text=True))
-          assert package["visibility"] == "private", package
+          assert package["visibility"] == "public", package
           assert package["repository"] in (None, os.environ["GITHUB_REPOSITORY"]), package
+          image_path = os.environ["IMAGE"].removeprefix("ghcr.io/")
+          token_url = "https://ghcr.io/token?service=ghcr.io&scope=repository:" + image_path + ":pull"
+          with urllib.request.urlopen(token_url, timeout=15) as response:
+              token = json.load(response)["token"]
+          digests = set()
+          for tag in (os.environ["VERSION"], "latest"):
+              request = urllib.request.Request(
+                  "https://ghcr.io/v2/" + image_path + "/manifests/" + tag,
+                  method="HEAD",
+                  headers={"Authorization": "Bearer " + token,
+                           "Accept": "application/vnd.oci.image.index.v1+json"},
+              )
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  digest = response.headers.get("Docker-Content-Digest")
+                  assert digest, "Missing digest for " + tag
+                  digests.add(digest)
+              print("Verified anonymous pull: " + os.environ["IMAGE"] + ":" + tag)
+          assert len(digests) == 1, "Version and latest must reference the same manifest"
           if package["repository"] is None:
-              print("::warning::Package published privately; connect the repository from the GitHub package page to display its README and repository link.")
+              print("::warning::Package published publicly; connect the repository from the GitHub package page to display its README and repository link.")
           print(json.dumps(package))
           url = package.get("html_url") or (
               "https://github.com/" + os.environ["GITHUB_REPOSITORY"]
@@ -153,7 +171,7 @@ jobs:
           )
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
               summary.write(f'Published `{os.environ["IMAGE"]}:{os.environ["VERSION"]}` and `latest`\n\n')
-              summary.write('Platforms: `linux/amd64`, `linux/arm64`; visibility: private\n\n')
+              summary.write('Platforms: `linux/amd64`, `linux/arm64`; visibility: public; anonymous pulls verified\n\n')
               summary.write(f'[GitHub package]({url})\n')
               if package["repository"] is None:
                   summary.write('\nRepository association: pending manual connection from the package page.\n')
