@@ -159,3 +159,21 @@ test('monitoring shows public market subscriptions and unsaved cooldowns',async(
   assert.doesNotMatch(h.element('monitor-stream').innerHTML,/<unsafe>/);
   assert.equal(h.element('monitor-state').textContent,'限流退避');
 });
+
+test('background mode notice shows retained exposure and account differences',async()=>{
+  const h=await dashboard();
+  h.run("state={background_modes:[{mode:'testnet',managing:true,configured:true,positions:2,pending_orders:1,external_positions:1,external_orders:1,account_sync_failed:false}]};renderBackgroundModes();");
+  const note=h.element('background-modes-note');
+  assert.equal(note.hidden,false);
+  assert.match(note.textContent,/测试网 · 后台风控管理中 · 2 个持仓 \/ 1 笔待确认订单/);
+  assert.match(note.textContent,/2 项账户差异待人工核对/);
+  assert.match(note.textContent,/新增开仓已暂停/);
+  h.run('state.background_modes[0].account_sync_failed=true;renderBackgroundModes();');
+  assert.match(note.textContent,/账户同步异常/);
+  h.run('state.background_modes[0].configured=false;renderBackgroundModes();');
+  assert.match(note.textContent,/等待原账户密钥/);
+  h.run('state.background_modes[0].configured=true;state.background_modes[0].account_sync_failed=false;state.background_modes[0].managing=false;renderBackgroundModes();');
+  assert.match(note.textContent,/后台管理未启动/);
+  h.run('state={};renderBackgroundModes();');
+  assert.equal(note.hidden,true);
+});

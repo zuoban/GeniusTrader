@@ -128,7 +128,18 @@ function render(){
   const externalOrders=s.external_orders;
   $('reconciliation-note').hidden=!externalPositions.length&&!externalOrders.length;
   $('reconciliation-note').textContent='账户差异待核对 · '+[externalPositions.length?'外部持仓：'+externalPositions.join('、'):'',externalOrders.length?'外部挂单：'+externalOrders.join('、'):''].filter(Boolean).join('；')+'。新增开仓暂停，请核对账户。';
+  renderBackgroundModes();
   $('update-time').textContent='SYNC '+new Date(s.updated_at).toLocaleTimeString('zh-CN',{hour12:false});
+}
+function renderBackgroundModes(){
+  const modes=state.background_modes||[];
+  $('background-modes-note').hidden=!modes.length;
+  $('background-modes-note').textContent=modes.map(m=>{
+    const label={paper:'模拟',testnet:'测试网',live:'实盘'}[m.mode]||m.mode;
+    const status=!m.configured?'等待原账户密钥':m.account_sync_failed?'账户同步异常':m.managing?'后台风控管理中':'后台管理未启动';
+    const differences=Number(m.external_positions||0)+Number(m.external_orders||0);
+    return label+' · '+status+' · '+m.positions+' 个持仓 / '+m.pending_orders+' 笔待确认订单'+(differences?' / '+differences+' 项账户差异待人工核对':'');
+  }).join('；')+'。后台模式新增开仓已暂停，可切回对应模式查看和处理。';
 }
 const actionLabel=action=>({LONG:'做多',SHORT:'做空',WAIT:'等待'}[action]||action);
 const roleLabel=role=>({entry:'开仓',take_profit:'Maker 止盈',stop_loss:'止损平仓',manual_close:'手动平仓'}[role]||role);
@@ -265,7 +276,7 @@ function renderConnections(){
     section('执行模式',[
       select('execution_mode','交易模式',s.mode,{paper:'模拟交易 · Paper',testnet:'币安测试网 · Testnet',live:'币安实盘 · Live'}),
       checkInput('live_enabled','启用实盘交易',s.live_enabled)
-    ],'切换模式或当前币安账户后会暂停新增开仓。测试网和实盘首次同步账户或检查连接时，会自动将该账户所有合约设为单向持仓；已有持仓或挂单导致切换失败时显示原因。有持仓、待确认订单或账户差异时不能更换当前币安账户；可提前保存其他模式的账户。三个模式的币池、仓位和交易参数分别保存。')+
+    ],'切换交易模式后，两边新增开仓均暂停，原模式的持仓与订单继续后台管理，可随时切回查看。测试网和实盘首次同步账户或检查连接时，会自动将该账户所有合约设为单向持仓；已有持仓或挂单导致设置失败时显示原因。任一模式有持仓、待确认订单或账户差异时，不能更换该模式的币安账户密钥。三个模式的币池、仓位和交易参数分别保存。')+
     section('币安测试网账户',[
       secretInput('testnet_key','测试网 API Key',s.testnet.configured,s.testnet.key_masked),
       secretInput('testnet_secret','测试网 API Secret',s.testnet.secret_configured),

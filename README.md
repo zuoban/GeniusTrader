@@ -38,14 +38,14 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 ## GitHub Packages 容器
 
-镜像：`ghcr.io/zuoban/geniustrader:0.1.5`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
+镜像：`ghcr.io/zuoban/geniustrader:0.1.6`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
 
 ```sh
-rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.5
+rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.6
 rtk proxy docker run -d --name genius-trader \
   --publish 8787:8787 \
   --mount type=volume,source=genius-trader-data,target=/app/data \
-  ghcr.io/zuoban/geniustrader:0.1.5
+  ghcr.io/zuoban/geniustrader:0.1.6
 ```
 
 本机打开 http://127.0.0.1:8787，服务器部署则打开 `http://服务器IPv4:8787`，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
@@ -76,7 +76,7 @@ rtk proxy docker compose up -d
 rtk proxy docker compose ps
 ```
 
-`compose.yaml` 使用已发布的 `0.1.5` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
+`compose.yaml` 使用已发布的 `0.1.6` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
 
 打开 `http://服务器IPv4:8787`（本机部署使用 http://127.0.0.1:8787），首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"8877:8787"`，再访问 `http://服务器IPv4:8877`；容器端口仍为 8787。
 
@@ -179,9 +179,9 @@ flowchart TD
 | `testnet` | `https://demo-fapi.binance.com` 的测试账户订单 |
 | `live` | `https://fapi.binance.com` 的真实合约订单 |
 
-在「账户与连接」中填写对应账户密钥并选择模式。实盘还需要勾选「启用实盘交易」，保存后仍需手动启动扫描。测试网和实盘在首次同步账户或检查连接时，先查询持仓模式；发现双向持仓则通过签名 API 自动设置 `dualSidePosition=false`，并再次查询确认。该设置对账户所有合约生效，无需逐币修改；已经是单向持仓时不重复设置。币安因未成交挂单（-4067）或持仓（-4068）拒绝切换时，显示原因并保持新增开仓暂停，由用户处理后重试。切换不会自动撤单或平仓；请求结果不确定时只查询确认，不盲目重发。模式或当前币安账户更换时会暂停扫描，并要求当前无持仓、无待确认订单、无外部账户差异；提前填写其他模式账户不影响当前连接。Jev 密钥可在持仓期间更新，更新后暂停新开仓，已有仓位继续管理。保存为空密钥的测试网配置也能打开页面，但不能启动开仓。
+在「账户与连接」中填写对应账户密钥并选择模式。实盘还需要勾选「启用实盘交易」，保存后仍需手动启动扫描。测试网和实盘在首次同步账户或检查连接时，先查询持仓模式；发现双向持仓则通过签名 API 自动设置 `dualSidePosition=false`，并再次查询确认。该设置对账户所有合约生效，无需逐币修改；已经是单向持仓时不重复设置。币安因未成交挂单（-4067）或持仓（-4068）拒绝切换时，显示原因并保持新增开仓暂停，由用户处理后重试。切换不会自动撤单或平仓；请求结果不确定时只查询确认，不盲目重发。交易模式可以在持仓、订单或账户差异存在时切换：两边新增开仓均暂停，原模式仍核对订单并管理持仓，页面显示后台模式状态；切回时复用原管理引擎。重启后恢复其他模式中已保存的持仓与待确认订单管理，新增开仓仍暂停。更换任一模式的已配置币安账户密钥，仍要求该模式无持仓、无待确认订单、无外部账户差异，后台模式也受此限制；填写尚未使用的其他模式账户不影响当前连接。Jev 密钥可在持仓期间更新，更新后暂停新开仓，已有仓位继续管理。保存为空密钥的测试网配置也能打开页面，但不能启动开仓。
 
-三个模式使用同一 SQLite 内独立的 portfolios 记录，切换回来恢复原来的币池和参数，不混用仓位或交易事件。「检查已保存的连接」检查当前币安公共行情 / 账户访问，并在需要时自动设置单向持仓，不提交交易订单，不调用 Jev。Jev 密钥可通过独立的「测试连接」验证。
+三个模式使用同一 SQLite 内独立的 portfolios 记录，切换回来恢复原来的币池和参数，不混用仓位或交易事件。后台模式列表也保存在 SQLite；即使原模式只有外部账户差异，重启后仍继续观察其账户。外部持仓与挂单仍需人工核对，不自动接管或撤销。「检查已保存的连接」检查当前币安公共行情 / 账户访问，并在需要时自动设置单向持仓，不提交交易订单，不调用 Jev。Jev 密钥可通过独立的「测试连接」验证。
 
 测试网和实盘账户各提供「测试连接」按钮，可在任意交易模式下独立验证对应账户。留空使用已保存的密钥；填写新值时与保留值合并后测试，首次配置必须同时填写 Key / Secret。测试先同步币安时间，再通过 [只读签名账户接口](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/account#account-information-v2-user_data) 验证密钥，显示成功、账户交易状态或中文错误原因（签名错误、Key / 权限 / IP 限制、网络异常等）。测试不会保存输入、切换当前模式、修改持仓模式或提交订单；测试通过后仍需点击保存。账户 `canTrade` 状态不代表 API 下单权限已经验证。
 
@@ -267,9 +267,9 @@ Jev 密钥配置提供「测试连接」：填写时测试当前输入，留空�
 
 | 方法 | 路径 | 内容 |
 | --- | --- | --- |
-| GET | `/api/dashboard` | 控制台聚合快照：兼容 state 字段，新增 updated_at、watchlist、position_views、open_orders、recent_decisions；仅当前交易模式 |
+| GET | `/api/dashboard` | 控制台聚合快照：兼容 state 字段，新增 updated_at、watchlist、position_views、open_orders、recent_decisions；交易详情仅当前模式，background_modes 汇总其他模式的后台管理状态 |
 | GET | `/api/decisions?limit=30&symbol=BTCUSDT` | 最近决策摘要；limit 为 1–100，symbol 可选、忽略大小写并支持 BTC/USDT、BTC/USDC；按记录顺序倒序，不包含原始行情输入 |
-| GET | `/api/state` | 配置、币池、持仓、订单、收益、健康状态、account_assets 及其同步时间 / 错误状态 |
+| GET | `/api/state` | 配置、币池、持仓、订单、收益、健康状态、account_assets 及其同步时间 / 错误状态；background_modes 汇总其他模式的后台管理状态、持仓 / 订单 / 差异数量 |
 | GET | `/api/markets` | 可交易币对，按成交额降序 |
 | GET | `/api/events` | 最近 100 条事件及决策输入；加 `?exclude_decisions=true` 只读取运行事件 |
 | GET | `/api/auth/status` | 是否初始化、当前请求是否登录、到期时间 |

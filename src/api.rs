@@ -176,6 +176,7 @@ async fn request_guard(State(bind): State<Ipv4Addr>, req: Request, next: Next) -
 struct StateResponse {
     #[serde(flatten)]
     trading: Snapshot,
+    background_modes: Vec<crate::application::BackgroundModeView>,
     settings: SettingsView,
     auth: AuthStatus,
     server: ServerSettings,
@@ -187,6 +188,7 @@ async fn state(
     let e = app.engine.read().await;
     Ok(Json(StateResponse {
         trading: e.snapshot().await,
+        background_modes: app.background_modes(e.mode).await,
         settings: app.settings_view().await,
         auth: app.auth.status(auth::cookie_token(&headers))?,
         server: app.store.server_settings()?,
@@ -218,6 +220,7 @@ async fn dashboard(
     )?;
     Ok(Json(DashboardResponse {
         state: StateResponse {
+            background_modes: app.background_modes(trading.mode).await,
             trading,
             settings: app.settings_view().await,
             auth: app
@@ -1093,6 +1096,105 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+    #[tokio::test]
+    async fn mode_switch_api_preserves_pending_orders_and_reports_background_management() {
+        use crate::{config::Mode, domain::PendingOrder, settings::AppSettings, store::Store};
+        let store = Store::open(":memory:", Mode::Paper).unwrap();
+        let settings = AppSettings::default()
+            .patched(
+                serde_json::from_value(json!({
+                    "mode":"testnet", "testnet":{"key":"source-key","secret":"source-secret"},
+                    "live_enabled":true, "live":{"key":"target-key","secret":"target-secret"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        store.save_settings(&settings).unwrap();
+        let application = Application::new(store.clone()).unwrap();
+        let source = application.engine.read().await.clone();
+        {
+            let mut inner = source.inner.lock().await;
+            let order: PendingOrder = serde_json::from_value(json!({
+                "client_id":"unknown", "symbol":"BTCUSDT", "side":"LONG", "role":"entry",
+                "quantity":"1", "price":null, "created_at":1, "signal_time":0, "target_profit":"1",
+                "maker_fee":"0", "taker_fee":"0", "status":"UNKNOWN", "accounted_quantity":"0"
+            }))
+            .unwrap();
+            inner.book.pending.insert(order.client_id.clone(), order);
+            source
+                .store
+                .save(Mode::Testnet, &inner.config, &inner.book)
+                .unwrap();
+        }
+        let router = router(application.clone());
+        let cookie = admin_cookie(&router).await;
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request("PUT", "/api/settings", r#"{"mode":"live"}"#, None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = router
+            .clone()
+            .oneshot(request(
+                "PUT",
+                "/api/settings",
+                r#"{"mode":"live"}"#,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        for endpoint in ["/api/state", "/api/dashboard"] {
+            let response = router
+                .clone()
+                .oneshot(request("GET", endpoint, "", None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["mode"], "live");
+            assert_eq!(value["paused"], true);
+            assert_eq!(value["pending"].as_array().unwrap().len(), 0);
+            assert_eq!(value["background_modes"][0]["mode"], "testnet");
+            assert_eq!(value["background_modes"][0]["pending_orders"], 1);
+            assert_eq!(value["background_modes"][0]["configured"], true);
+            let public = std::str::from_utf8(&bytes).unwrap();
+            for secret in ["source-key", "source-secret", "target-key", "target-secret"] {
+                assert!(!public.contains(secret));
+            }
+        }
+        assert!(
+            source
+                .inner
+                .lock()
+                .await
+                .book
+                .pending
+                .contains_key("unknown")
+        );
+        assert!(source.snapshot().await.paused);
+        assert_eq!(
+            router
+                .oneshot(request(
+                    "PUT",
+                    "/api/settings",
+                    r#"{"testnet":{"clear":true}}"#,
+                    Some(&cookie)
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(store.settings().unwrap().testnet.key, "source-key");
     }
     #[tokio::test]
     async fn credential_test_validation_does_not_save_credentials_or_change_the_engine() {

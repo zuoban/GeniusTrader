@@ -38,6 +38,8 @@ pub struct Credentials {
 #[serde(default, deny_unknown_fields)]
 pub struct AppSettings {
     pub mode: Mode,
+    // Internal lifecycle state; SettingsPatch cannot modify this list.
+    pub managed_modes: Vec<Mode>,
     pub live_enabled: bool,
     pub testnet: Credentials,
     pub live: Credentials,
