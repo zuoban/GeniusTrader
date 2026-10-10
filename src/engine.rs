@@ -1,7 +1,7 @@
 use crate::{
     config::*,
     domain::*,
-    exchange::{AccountInfo, Binance, ExchangeError, ExchangeOrder},
+    exchange::{AccountInfo, Binance, ExchangeError, ExchangeOrder, MarginBalances},
     jev::Jev,
     store::Store,
     strategy::{self, Decision},
@@ -39,6 +39,7 @@ pub struct Inner {
     pub market_at: i64,
     pub account_at: i64,
     pub available: Decimal,
+    pub margin_balances: Option<MarginBalances>,
     pub account_assets: Option<AccountInfo>,
     pub account_assets_at: i64,
     pub account_assets_error: Option<String>,
@@ -56,6 +57,7 @@ pub struct Snapshot {
     pub market_at: i64,
     pub account_at: i64,
     pub available_usdt: Decimal,
+    pub margin_balances: Option<MarginBalances>,
     pub account_assets: Option<AccountInfo>,
     pub account_assets_at: i64,
     pub account_assets_error: Option<String>,
@@ -74,6 +76,40 @@ pub struct Snapshot {
     pub jev_available: bool,
 }
 impl Inner {
+    fn available_for_entry(&self, symbol: &str, mode: Mode) -> Result<Decimal> {
+        if mode == Mode::Paper {
+            return Ok(paper_available(self));
+        }
+        let asset = settlement_asset(symbol).context("不支持的结算币种")?;
+        let balances = self
+            .margin_balances
+            .as_ref()
+            .context("保证金余额尚未同步")?;
+        let available = if balances.multi_assets_margin {
+            balances.available_balance
+        } else {
+            balances
+                .assets
+                .iter()
+                .find(|b| b.asset == asset)
+                .map(|b| b.available_balance)
+                .unwrap_or(Decimal::ZERO)
+        };
+        let mut reserved = Decimal::ZERO;
+        for order in self.book.pending.values().filter(|o| {
+            o.role == OrderRole::Entry
+                && (balances.multi_assets_margin || settlement_asset(&o.symbol) == Some(asset))
+        }) {
+            let price = self
+                .quotes
+                .get(&order.symbol)
+                .context("待确认订单缺少盘口")?
+                .mid();
+            reserved += order.quantity * price / Decimal::from(order.leverage)
+                + order.quantity * price * order.taker_fee;
+        }
+        Ok(available - reserved)
+    }
     fn occupied(&self, symbol: &str) -> bool {
         self.book.positions.contains_key(symbol)
             || self.book.pending.values().any(|o| o.symbol == symbol)
@@ -173,6 +209,7 @@ impl Engine {
                 market_at: 0,
                 account_at: 0,
                 available,
+                margin_balances: None,
                 account_assets: None,
                 account_assets_at: 0,
                 account_assets_error: None,
@@ -221,6 +258,7 @@ impl Engine {
             market_at: i.market_at,
             account_at: i.account_at,
             available_usdt: i.available,
+            margin_balances: i.margin_balances.clone(),
             account_assets: if self.mode == Mode::Paper {
                 Some(AccountInfo::paper(
                     i.book.paper_cash,
@@ -282,7 +320,7 @@ impl Engine {
         let mut i = self.inner.lock().await;
         ensure!(
             i.catalog.contains_key(&coin.symbol),
-            "不是可交易的 USDT 永续币对"
+            "不是可交易的 USDT / USDC 永续币对，请确认币对已上市并已同步行情"
         );
         i.config.for_coin(&coin)?;
         ensure!(
@@ -600,22 +638,7 @@ impl Engine {
                     && qty * price >= rule.min_notional,
                 "配置金额不满足交易规则，未自动扩大金额"
             );
-            let reserved: Decimal = i
-                .book
-                .pending
-                .values()
-                .filter(|o| o.role == OrderRole::Entry)
-                .map(|o| {
-                    o.quantity * i.quotes.get(&o.symbol).map(|q| q.mid()).unwrap_or(price)
-                        / Decimal::from(o.leverage)
-                        + o.quantity * price * o.taker_fee
-                })
-                .sum();
-            let available = if self.mode == Mode::Paper {
-                paper_available(&i)
-            } else {
-                i.available - reserved
-            };
+            let available = i.available_for_entry(&coin.symbol, self.mode)?;
             ensure!(
                 available >= qty * price / Decimal::from(c.leverage) + qty * price * taker_fee,
                 "可用保证金不足"
@@ -810,9 +833,10 @@ impl Engine {
         }
         let mut settled = remote.executed_qty == Decimal::ZERO;
         if let Some(Ok(fills)) = &fills
-            && fills
-                .iter()
-                .all(|f| f.commission_asset == "USDT" && f.order_id == remote.order_id)
+            && fills.iter().all(|f| {
+                Some(f.commission_asset.as_str()) == settlement_asset(&o.symbol)
+                    && f.order_id == remote.order_id
+            })
             && fills.iter().map(|f| f.qty).sum::<Decimal>() == remote.executed_qty
         {
             if let Some(p) = i.book.positions.get_mut(&o.symbol) {
@@ -859,8 +883,8 @@ impl Engine {
             self.event(
                 "warn",
                 Some(&o.symbol),
-                "费用尚未核实，保留结算状态；仅支持 USDT 手续费记账",
-                json!({"client_id": o.client_id}),
+                "费用尚未核实，保留结算状态；手续费必须与合约结算币种一致",
+                json!({"client_id": o.client_id, "settlement_asset": settlement_asset(&o.symbol)}),
             );
         }
         Ok(())
@@ -938,7 +962,7 @@ impl Engine {
     async fn sync_account(&self) -> Result<()> {
         let remote = self.exchange.positions().await?;
         let orders = self.exchange.open_orders().await?;
-        let available = self.exchange.available_balance().await?;
+        let balances = self.exchange.margin_balances().await?;
         let mut i = self.inner.lock().await;
         let mut external = BTreeMap::new();
         let mut actual = BTreeMap::new();
@@ -975,7 +999,17 @@ impl Engine {
             .map(|o| o.symbol.clone())
             .collect();
         i.external_positions = external;
-        i.available = available;
+        i.available = if balances.multi_assets_margin {
+            balances.available_balance
+        } else {
+            balances
+                .assets
+                .iter()
+                .find(|b| b.asset == "USDT")
+                .map(|b| b.available_balance)
+                .unwrap_or(Decimal::ZERO)
+        };
+        i.margin_balances = Some(balances);
         i.account_at = now_ms();
         if !i.external_positions.is_empty() || !i.external_orders.is_empty() {
             i.paused = true;
@@ -1005,7 +1039,16 @@ impl Engine {
             };
             let amount = crate::exchange::decimal(&r["income"])?;
             let time = r["time"].as_i64().context("资金费时间无效")?;
-            ensure!(r["asset"] == "USDT", "资金费资产不是 USDT");
+            // Untracked contracts must not block funding reconciliation for our positions.
+            if !i.book.positions.contains_key(symbol)
+                && !i.book.closed_trades.iter().any(|t| t.symbol == symbol)
+            {
+                continue;
+            }
+            ensure!(
+                r["asset"].as_str() == settlement_asset(symbol),
+                "资金费资产与合约结算币种不一致"
+            );
             if let Some(p) = i.book.positions.get_mut(symbol)
                 && p.opened_at <= time
             {
@@ -1410,15 +1453,18 @@ fn paper_available(i: &Inner) -> Decimal {
 }
 pub fn normalize_symbol(raw: &str) -> Result<String> {
     let mut s = raw.trim().to_ascii_uppercase();
-    if let Some(base) = s.strip_suffix("/USDT") {
-        s = format!("{base}USDT");
+    for asset in ["USDT", "USDC"] {
+        if let Some(base) = s.strip_suffix(&format!("/{asset}")) {
+            s = format!("{base}{asset}");
+            break;
+        }
     }
     ensure!(
         s.chars().count() >= 5
             && s.chars().count() <= 24
             && s.chars().all(char::is_alphanumeric)
-            && s.ends_with("USDT"),
-        "请输入 BTCUSDT 或 BTC/USDT 形式的币对"
+            && settlement_asset(&s).is_some(),
+        "请输入 BTCUSDT、BTC/USDT、BTCUSDC 或 BTC/USDC 形式的币对"
     );
     Ok(s)
 }
@@ -1809,32 +1855,40 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn non_usdt_commission_blocks_settlement_and_new_entries() {
+    async fn mismatched_commission_blocks_settlement_and_new_entries() {
         use axum::{Json, Router, routing::get};
-        let app = Router::new().route("/fapi/v1/userTrades", get(|| async { Json(json!([{"id": 1, "orderId":42,"qty":"1","price":"100","commission":"0.001","commissionAsset":"BNB","realizedPnl":"0","time":1,"side":"BUY"}])) }));
-        let (url, server) = crate::test_support::mock_server(app).await;
-        let e = Engine::new(
-            Mode::Testnet,
-            Store::open(":memory:", Mode::Testnet).unwrap(),
-            config(),
-            Binance::mock(url),
-            Jev::new().unwrap(),
-        )
-        .unwrap();
-        {
-            let mut i = e.inner.lock().await;
-            let o = entry(Action::Long);
-            i.book.pending.insert(o.client_id.clone(), o);
-            i.paused = false;
+        for (symbol, commission_asset) in [
+            ("XUSDT", "BNB"),
+            ("XUSDT", "USDC"),
+            ("XUSDC", "USDT"),
+            ("XUSDC", "BNB"),
+        ] {
+            let app = Router::new().route("/fapi/v1/userTrades", get(move || async move { Json(json!([{"id": 1, "orderId":42,"qty":"1","price":"100","commission":"0.001","commissionAsset":commission_asset,"realizedPnl":"0","time":1,"side":"BUY"}])) }));
+            let (url, server) = crate::test_support::mock_server(app).await;
+            let e = Engine::new(
+                Mode::Testnet,
+                Store::open(":memory:", Mode::Testnet).unwrap(),
+                config(),
+                Binance::mock(url),
+                Jev::new().unwrap(),
+            )
+            .unwrap();
+            {
+                let mut i = e.inner.lock().await;
+                let mut o = entry(Action::Long);
+                o.symbol = symbol.into();
+                i.book.pending.insert(o.client_id.clone(), o);
+                i.paused = false;
+            }
+            let r: ExchangeOrder = serde_json::from_value(json!({"symbol":symbol,"clientOrderId":"test-entry","orderId":42,"status":"FILLED","executedQty":"1","avgPrice":"100","origQty":"1","cumQuote":"100"})).unwrap();
+            e.apply_order(r).await.unwrap();
+            let i = e.inner.lock().await;
+            assert!(i.paused);
+            assert_eq!(i.book.pending["test-entry"].status, "SETTLING");
+            assert!(!i.book.positions[symbol].accounting_complete);
+            assert!(i.occupied(symbol));
+            server.abort();
         }
-        let r: ExchangeOrder = serde_json::from_value(json!({"symbol":"XUSDT","clientOrderId":"test-entry","orderId":42,"status":"FILLED","executedQty":"1","avgPrice":"100","origQty":"1","cumQuote":"100"})).unwrap();
-        e.apply_order(r).await.unwrap();
-        let i = e.inner.lock().await;
-        assert!(i.paused);
-        assert_eq!(i.book.pending["test-entry"].status, "SETTLING");
-        assert!(!i.book.positions["XUSDT"].accounting_complete);
-        assert!(i.occupied("XUSDT"));
-        server.abort();
     }
     #[tokio::test]
     async fn deletion_and_pause_preserve_pending_unknown_orders() {
@@ -1879,7 +1933,186 @@ mod tests {
     #[test]
     fn normalizes_symbols_but_rejects_paths() {
         assert_eq!(normalize_symbol(" btc/usdt ").unwrap(), "BTCUSDT");
+        assert_eq!(normalize_symbol(" btc/usdc ").unwrap(), "BTCUSDC");
+        assert_eq!(normalize_symbol(" ethusdc ").unwrap(), "ETHUSDC");
         assert_eq!(normalize_symbol("龙虾USDT").unwrap(), "龙虾USDT");
-        assert!(normalize_symbol("../USDT").is_err());
+        assert_eq!(normalize_symbol("龙虾/USDC").unwrap(), "龙虾USDC");
+        for invalid in [
+            "../USDT",
+            "../USDC",
+            "USDC",
+            "/USDC",
+            "BTC//USDC",
+            "BTCUSD",
+            "BTCBUSD",
+            "BTC/USDC/USDT",
+        ] {
+            assert!(normalize_symbol(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+    #[tokio::test]
+    async fn margin_checks_use_the_settlement_asset_or_shared_multi_asset_balance() {
+        let e = paper();
+        seed(&e).await;
+        let mut i = e.inner.lock().await;
+        let mut usdc = entry(Action::Long);
+        usdc.symbol = "XUSDC".into();
+        usdc.client_id = "usdc-entry".into();
+        let usdt_quote = i.quotes["XUSDT"].clone();
+        i.quotes.insert(
+            "XUSDC".into(),
+            Quote {
+                bid: d("200"),
+                ask: d("200"),
+                ..usdt_quote
+            },
+        );
+        let usdt = entry(Action::Long);
+        i.book.pending.insert(usdt.client_id.clone(), usdt);
+        i.book.pending.insert(usdc.client_id.clone(), usdc);
+        i.margin_balances = Some(serde_json::from_value(json!({
+            "multiAssetsMargin":false, "availableBalance":"1000",
+            "assets":[{"asset":"USDT","availableBalance":"1000"}, {"asset":"USDC","availableBalance":"20"}]
+        })).unwrap());
+        // Each order reserves its own price and fees, without borrowing the other wallet.
+        assert_eq!(
+            i.available_for_entry("BTCUSDT", Mode::Live).unwrap(),
+            d("949.95")
+        );
+        assert_eq!(
+            i.available_for_entry("BTCUSDC", Mode::Live).unwrap(),
+            d("-80.1")
+        );
+        i.margin_balances
+            .as_mut()
+            .unwrap()
+            .assets
+            .retain(|b| b.asset != "USDC");
+        assert_eq!(
+            i.available_for_entry("BTCUSDC", Mode::Live).unwrap(),
+            d("-100.1")
+        );
+        i.margin_balances.as_mut().unwrap().multi_assets_margin = true;
+        assert_eq!(
+            i.available_for_entry("BTCUSDC", Mode::Live).unwrap(),
+            d("849.85")
+        );
+        assert_eq!(
+            i.available_for_entry("BTCUSDT", Mode::Live).unwrap(),
+            d("849.85")
+        );
+        i.margin_balances = None;
+        assert!(i.available_for_entry("BTCUSDC", Mode::Live).is_err());
+    }
+    #[tokio::test]
+    async fn account_sync_keeps_usdc_balances_without_requiring_a_usdt_wallet() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new()
+            .route("/fapi/v3/positionRisk", get(|| async { Json(json!([])) }))
+            .route("/fapi/v1/openOrders", get(|| async { Json(json!([])) }))
+            .route(
+                "/fapi/v3/balance",
+                get(|| async { Json(json!([{"asset":"USDC","availableBalance":"250"}])) }),
+            )
+            .route(
+                "/fapi/v2/account",
+                get(|| async {
+                    Json(json!({
+                        "multiAssetsMargin":false, "availableBalance":"0",
+                        "assets":[{"asset":"USDC","availableBalance":"250"}]
+                    }))
+                }),
+            );
+        let (url, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Testnet,
+            Store::open(":memory:", Mode::Testnet).unwrap(),
+            config(),
+            Binance::mock(url),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(e.exchange.available_balance().await.unwrap(), d("250"));
+        e.sync_account().await.unwrap();
+        let i = e.inner.lock().await;
+        assert!(i.account_at > 0);
+        assert_eq!(
+            i.available_for_entry("BTCUSDC", Mode::Testnet).unwrap(),
+            d("250")
+        );
+        assert_eq!(
+            i.available_for_entry("BTCUSDT", Mode::Testnet).unwrap(),
+            Decimal::ZERO
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn usdc_fills_funding_and_close_settle_once_in_the_contract_currency() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        let app = Router::new()
+            .route("/fapi/v1/userTrades", get(|Query(params): Query<BTreeMap<String, String>>| async move {
+                assert_eq!(params["symbol"], "XUSDC");
+                let exit = params["orderId"] == "43";
+                Json(json!([{"id":if exit {2} else {1}, "orderId":if exit {43} else {42},
+                    "qty":"1", "price":if exit {"101"} else {"100"},
+                    "commission":if exit {"0.0202"} else {"0.05"}, "commissionAsset":"USDC",
+                    "realizedPnl":if exit {"1"} else {"0"}, "time":now_ms(), "side":if exit {"SELL"} else {"BUY"}}]))
+            }))
+            .route("/fapi/v1/income", get(|| async { Json(json!([
+                {"tranId":1, "symbol":"XUSDC", "income":"-0.01", "asset":"USDC", "time":now_ms()},
+                {"tranId":2, "symbol":"OTHERBTC", "income":"-1", "asset":"BTC", "time":now_ms()}
+            ])) }));
+        let (url, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Testnet,
+            Store::open(":memory:", Mode::Testnet).unwrap(),
+            config(),
+            Binance::mock(url),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        let mut order = entry(Action::Long);
+        order.symbol = "XUSDC".into();
+        {
+            let mut i = e.inner.lock().await;
+            i.book
+                .pending
+                .insert(order.client_id.clone(), order.clone());
+            i.paused = false;
+        }
+        let remote: ExchangeOrder = serde_json::from_value(json!({"symbol":"XUSDC", "clientOrderId":order.client_id, "orderId":42, "status":"FILLED", "executedQty":"1", "avgPrice":"100", "origQty":"1", "cumQuote":"100"})).unwrap();
+        e.apply_order(remote.clone()).await.unwrap();
+        e.apply_order(remote).await.unwrap();
+        e.sync_funding().await.unwrap();
+        {
+            let mut i = e.inner.lock().await;
+            assert!(i.book.pending.is_empty());
+            let p = &i.book.positions["XUSDC"];
+            assert_eq!(p.entry_fee, d("0.05"));
+            assert_eq!(p.funding_cost, d("0.01"));
+            assert!(p.accounting_complete);
+            assert!(!i.paused);
+            i.book.funding_last_poll = 0;
+        }
+        e.sync_funding().await.unwrap();
+        order.client_id = "usdc-exit".into();
+        order.role = OrderRole::TakeProfit;
+        e.inner
+            .lock()
+            .await
+            .book
+            .pending
+            .insert(order.client_id.clone(), order.clone());
+        let remote: ExchangeOrder = serde_json::from_value(json!({"symbol":"XUSDC", "clientOrderId":order.client_id, "orderId":43, "status":"FILLED", "executedQty":"1", "avgPrice":"101", "origQty":"1", "cumQuote":"101"})).unwrap();
+        e.apply_order(remote.clone()).await.unwrap();
+        e.apply_order(remote).await.unwrap();
+        e.finalize_closed().await.unwrap();
+        let i = e.inner.lock().await;
+        assert!(i.book.pending.is_empty());
+        assert!(i.book.positions.is_empty());
+        assert_eq!(i.book.closed_trades.len(), 1);
+        assert_eq!(i.book.closed_trades[0].net_profit, d("0.9198"));
+        assert!(!i.paused);
+        server.abort();
     }
 }

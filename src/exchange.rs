@@ -223,6 +223,20 @@ pub struct Fill {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all(deserialize = "camelCase"))]
+pub struct MarginBalances {
+    pub multi_assets_margin: bool,
+    pub available_balance: Decimal,
+    pub assets: Vec<AssetBalance>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all(deserialize = "camelCase"))]
+pub struct AssetBalance {
+    pub asset: String,
+    pub available_balance: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all(deserialize = "camelCase"))]
 pub struct AccountInfo {
     pub multi_assets_margin: bool,
     pub total_wallet_balance: Decimal,
@@ -487,13 +501,17 @@ impl Binance {
         for s in info["symbols"].as_array().context("missing symbols")? {
             if s["status"] != "TRADING"
                 || s["contractType"] != "PERPETUAL"
-                || s["quoteAsset"] != "USDT"
-                || s["marginAsset"] != "USDT"
+                || !matches!(s["quoteAsset"].as_str(), Some("USDT" | "USDC"))
+                || s["marginAsset"] != s["quoteAsset"]
                 || s["underlyingType"] != "COIN"
             {
                 continue;
             }
             let symbol = s["symbol"].as_str().context("missing symbol")?.to_string();
+            ensure!(
+                settlement_asset(&symbol) == s["quoteAsset"].as_str(),
+                "symbol does not match settlement asset"
+            );
             let filters = s["filters"].as_array().context("missing filters")?;
             let filter = |kind: &str| -> Result<&Value> {
                 filters
@@ -688,13 +706,12 @@ impl Binance {
         let v = self
             .request(Method::GET, "/fapi/v3/balance", vec![], true)
             .await?;
-        let usdt = v
-            .as_array()
-            .context("invalid balance")?
-            .iter()
-            .find(|x| x["asset"] == "USDT")
-            .context("missing USDT balance")?;
-        decimal(&usdt["availableBalance"])
+        let balances = v.as_array().context("invalid balance")?;
+        let balance = ["USDT", "USDC"]
+            .into_iter()
+            .find_map(|asset| balances.iter().find(|x| x["asset"] == asset))
+            .context("missing USDT/USDC balance")?;
+        decimal(&balance["availableBalance"])
     }
     pub async fn account_info(&self) -> Result<AccountInfo> {
         // V2 includes the margin mode and complete asset balances. Its account totals
@@ -712,6 +729,13 @@ impl Binance {
             account.value_assets(indexes, now_ms() + self.offset.load(Ordering::Relaxed));
         }
         Ok(account)
+    }
+    pub async fn margin_balances(&self) -> Result<MarginBalances> {
+        // Single-asset balances are independent; multi-assets uses the shared USD total.
+        Ok(serde_json::from_value(
+            self.request(Method::GET, "/fapi/v2/account", vec![], true)
+                .await?,
+        )?)
     }
     pub async fn positions(&self) -> Result<Vec<RemotePosition>> {
         Ok(serde_json::from_value(
@@ -853,6 +877,64 @@ impl Binance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn catalog_includes_usdc_perpetuals_with_their_exchange_rules() {
+        use axum::{Json, Router, routing::get};
+        let symbol = |name: &str, asset: &str| {
+            serde_json::json!({
+                "symbol": name, "status": "TRADING", "contractType": "PERPETUAL",
+                "quoteAsset": asset, "marginAsset": asset, "underlyingType": "COIN",
+                "filters": [
+                    {"filterType":"PRICE_FILTER", "tickSize":"0.01"},
+                    {"filterType":"LOT_SIZE", "stepSize":"0.001", "minQty":"0.001", "maxQty":"1000"},
+                    {"filterType":"MARKET_LOT_SIZE", "stepSize":"0.002", "minQty":"0.002", "maxQty":"500"},
+                    {"filterType":"MIN_NOTIONAL", "notional":"5"}
+                ]
+            })
+        };
+        let mut inactive = symbol("INACTIVEUSDC", "USDC");
+        inactive["status"] = "BREAK".into();
+        let mut delivery = symbol("DELIVERYUSDC", "USDC");
+        delivery["contractType"] = "CURRENT_QUARTER".into();
+        let mut mismatch = symbol("MISMATCHUSDC", "USDC");
+        mismatch["marginAsset"] = "USDT".into();
+        let mut index = symbol("INDEXUSDC", "USDC");
+        index["underlyingType"] = "INDEX".into();
+        let info = serde_json::json!({"symbols":[
+            symbol("BTCUSDT", "USDT"), symbol("BTCUSDC", "USDC"),
+            symbol("BTCBUSD", "BUSD"), inactive, delivery, mismatch, index
+        ]});
+        let app = Router::new()
+            .route(
+                "/fapi/v1/exchangeInfo",
+                get(move || {
+                    let info = info.clone();
+                    async move { Json(info) }
+                }),
+            )
+            .route(
+                "/fapi/v1/ticker/24hr",
+                get(|| async {
+                    Json(serde_json::json!([
+                        {"symbol":"BTCUSDT", "quoteVolume":"1000000", "lastPrice":"60000"},
+                        {"symbol":"BTCUSDC", "quoteVolume":"2000000", "lastPrice":"60001"}
+                    ]))
+                }),
+            );
+        let (url, server) = crate::test_support::mock_server(app).await;
+        let catalog = Binance::mock(url).symbols().await.unwrap();
+        assert_eq!(
+            catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["BTCUSDC", "BTCUSDT"]
+        );
+        let usdc = &catalog["BTCUSDC"];
+        assert_eq!(usdc.quote_volume, Decimal::from(2000000));
+        assert_eq!(usdc.last_price, Decimal::from(60001));
+        assert_eq!(usdc.tick_size, Decimal::from_str("0.01").unwrap());
+        assert_eq!(usdc.market_step, Decimal::from_str("0.002").unwrap());
+        assert_eq!(usdc.market_max_qty, Decimal::from(500));
+        server.abort();
+    }
     use axum::{
         Json, Router,
         extract::{RawQuery, State},

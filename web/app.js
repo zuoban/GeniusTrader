@@ -8,6 +8,8 @@ const credentialTestRevision={testnet:0,live:0,jev:0};
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=(v,d=2)=>Number(v||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const price=v=>v==null?'—':Number(v).toLocaleString('en-US',{maximumFractionDigits:8});
+const quoteAsset=symbol=>symbol.endsWith('USDC')?'USDC':'USDT';
+const baseAsset=symbol=>symbol.replace(/(?:USDT|USDC)$/,'');
 const color=v=>Number(v)>0?'positive':Number(v)<0?'negative':'';
 function toast(message,error=false){$('toast').textContent=message;$('toast').className='toast'+(error?' error':'');$('toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>{$('toast').hidden=true;},6000);}
 async function api(path,method='GET',body){
@@ -82,11 +84,11 @@ function render(){
   renderAssets();
   $('realized').textContent=num(s.realized_net);$('realized').className=color(s.realized_net);
   $('unrealized').textContent=num(s.unrealized);$('unrealized').className=color(s.unrealized);
-  $('exposure').textContent=num(s.exposure_usdt);$('exposure-cap').textContent='上限 '+num(c.max_exposure_usdt)+' USDT';
+  $('exposure').textContent=num(s.exposure_usdt);$('exposure-cap').textContent='上限 '+num(c.max_exposure_usdt)+' USDT + USDC';
   const slots=new Set(s.positions.map(p=>p.symbol).concat(s.pending.filter(o=>o.role==='entry').map(o=>o.symbol))).size;
-  $('slot-count').textContent=slots+' / '+c.max_positions;$('available').textContent=s.mode!=='paper'&&!s.account_at?'账户尚未连接':'可用保证金 '+num(s.available_usdt)+' USDT';
+  $('slot-count').textContent=slots+' / '+c.max_positions;$('available').textContent=s.mode!=='paper'&&!s.account_at?'账户尚未连接':s.mode==='paper'?'模拟可用 '+num(s.available_usdt)+' USDT':s.margin_balances?.multi_assets_margin?'可用保证金 '+num(s.margin_balances.available_balance)+' USD':'可用 '+['USDT','USDC'].map(asset=>num(s.margin_balances?.assets.find(b=>b.asset===asset)?.available_balance)+' '+asset).join(' / ');
   $('strategy-label').textContent='JEV';
-  $('notional-label').textContent=price(c.notional_usdt)+' USDT';$('profit-label').textContent=price(c.profit_usdt)+' USDT';
+  $('notional-label').textContent=price(c.notional_usdt)+' 计价币';$('profit-label').textContent=price(c.profit_usdt)+' 计价币';
   renderPositions();renderOrders();renderWatchlist();renderDecisions();
   const externalPositions=Object.entries(s.external_positions).map(([symbol,quantity])=>symbol+' ('+price(quantity)+')');
   const externalOrders=s.external_orders;
@@ -112,7 +114,7 @@ function replaceRegion(id,html){
 function renderPositions(){
   const positions=state.position_views;
   $('position-count').textContent=positions.length;$('positions-empty').hidden=positions.length>0;
-  replaceRegion('positions-body',positions.map(p=>'<tr><td><b>'+esc(p.symbol)+'</b><small>'+actionBadge(p.side)+' '+p.leverage+'× · '+Math.max(0,Math.floor((Date.now()-p.opened_at)/60000))+' 分钟</small></td><td>'+price(p.quantity)+'<small>@ '+price(p.entry_price)+'</small></td><td class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+'<small>'+(p.quote_stale?'报价待更新':'目标净赚 '+price(p.target_profit))+'</small></td><td>'+price(p.tp_price)+'<small>'+(p.tp_client_id?'GTX · 只减仓':'等待挂单')+'</small></td><td class="status">'+(Number(p.quantity)===0?'结算中':p.accounting_complete?'管理中':'费用核对中')+'</td><td><button class="text-btn" data-action="close" data-symbol="'+esc(p.symbol)+'" data-focus-key="close:'+esc(p.symbol)+'">平仓</button></td></tr>').join(''));
+  replaceRegion('positions-body',positions.map(p=>'<tr><td><b>'+esc(p.symbol)+'</b><small>'+actionBadge(p.side)+' '+p.leverage+'× · '+Math.max(0,Math.floor((Date.now()-p.opened_at)/60000))+' 分钟</small></td><td>'+price(p.quantity)+'<small>@ '+price(p.entry_price)+'</small></td><td class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' '+quoteAsset(p.symbol)+'<small>'+(p.quote_stale?'报价待更新':'目标净赚 '+price(p.target_profit)+' '+quoteAsset(p.symbol))+'</small></td><td>'+price(p.tp_price)+'<small>'+(p.tp_client_id?'GTX · 只减仓':'等待挂单')+'</small></td><td class="status">'+(Number(p.quantity)===0?'结算中':p.accounting_complete?'管理中':'费用核对中')+'</td><td><button class="text-btn" data-action="close" data-symbol="'+esc(p.symbol)+'" data-focus-key="close:'+esc(p.symbol)+'">平仓</button></td></tr>').join(''));
 }
 function renderOrders(){
   const orders=state.open_orders;
@@ -126,13 +128,14 @@ function renderWatchlist(){
   $('pool-count').textContent=cards.length;$('pool-empty').hidden=cards.length>0;$('pool-no-results').hidden=!cards.length||visible.length>0;
   $('watchlist-summary').textContent='展示 '+visible.length+' / '+cards.length+' 个币对 · '+cards.filter(c=>c.enabled).length+' 个已启用';
   replaceRegion('pool-body',visible.map(coin=>{
+    const asset=quoteAsset(coin.symbol),base=baseAsset(coin.symbol);
     const p=coin.position,d=coin.latest_decision,hasExternal=coin.external_position!=null||coin.external_order;
     const status=hasExternal?'账户差异':p?'持仓管理中':coin.orders.length?'委托跟踪中':!coin.enabled?'已停用':state.paused?'扫描已暂停':'等待收盘评估';
     const btn=(action,label,glyph)=>'<button type="button" class="icon-btn" data-action="'+action+'" data-symbol="'+esc(coin.symbol)+'" data-focus-key="'+esc(coin.symbol)+':'+action+'" aria-label="'+label+' '+esc(coin.symbol)+'" title="'+label+'">'+glyph+'</button>';
-    const position=p?'<div class="card-position"><div class="card-section-label"><span>持仓 '+actionBadge(p.side)+' <b>'+p.leverage+'×</b></span><strong class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' <small>USDT</small></strong></div><div class="card-stats"><span>数量<b>'+price(p.quantity)+'</b></span><span>开仓均价<b>'+price(p.entry_price)+'</b></span><span>止盈价<b>'+price(p.tp_price)+'</b></span></div></div>':'<div class="card-flat"><span>当前空仓</span><span>单币 '+price(coin.notional_usdt)+' / 止盈 '+price(coin.profit_usdt)+' USDT</span></div>';
+    const position=p?'<div class="card-position"><div class="card-section-label"><span>持仓 '+actionBadge(p.side)+' <b>'+p.leverage+'×</b></span><strong class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' <small>'+asset+'</small></strong></div><div class="card-stats"><span>数量<b>'+price(p.quantity)+'</b></span><span>开仓均价<b>'+price(p.entry_price)+'</b></span><span>止盈价<b>'+price(p.tp_price)+'</b></span></div></div>':'<div class="card-flat"><span>当前空仓</span><span>单币 '+price(coin.notional_usdt)+' / 止盈 '+price(coin.profit_usdt)+' '+asset+'</span></div>';
     const orders=coin.orders.length?coin.orders.map(o=>'<div class="card-order"><span>'+esc(roleLabel(o.role))+' · '+(o.order_side==='BUY'?'买':'卖')+'</span><b>'+(o.price==null?'市价':price(o.price))+'</b><small>'+esc(statusLabel(o.status))+' · 剩余 '+price(o.remaining_quantity)+'</small></div>').join(''):'<div class="card-no-order">暂无挂单</div>';
     const decision=d?'<div class="card-decision-heading"><span>最近决策</span><time>'+timestamp(d.time)+'</time></div><div class="card-decision-result">'+actionBadge(d.action)+'<span>'+confidence(d.confidence)+'</span><small title="'+esc(d.model||d.source)+'">'+esc(d.model||'JEV')+'</small></div><p class="card-decision-source" title="'+esc(decisionReason(d))+'">'+esc(decisionReason(d))+'</p>':'<div class="card-decision-heading"><span>最近决策</span><span>尚未评估</span></div><p class="card-decision-source">等待启用扫描与新的收盘信号</p>';
-    return '<article class="watch-card'+(!coin.enabled?' disabled':'')+'"><div class="watch-card-head"><div class="symbol-identity"><span class="coin-code">'+esc(coin.symbol.replace(/USDT$/,'').slice(0,3))+'</span><div><h3>'+esc(coin.symbol.replace(/USDT$/,''))+'<span> / USDT</span></h3><small class="coin-state'+(hasExternal?' uncertain':'')+'"><i class="state-dot'+(!coin.enabled?' off':'')+'"></i>'+status+'</small></div></div><div class="coin-actions">'+btn('toggle',coin.enabled?'停用扫描':'启用扫描',coin.enabled?'Ⅱ':'▷')+btn('edit','单币配置','⚙')+btn('remove','移出自选','×')+'</div></div><div class="card-quote"><strong>'+price(coin.price)+'</strong><span class="quote-state'+(coin.quote_stale?' delayed':'')+'">'+(coin.quote_stale?'报价待更新':coin.quote?'点差 '+num((Number(coin.quote.ask)-Number(coin.quote.bid))/Number(coin.price)*10000,2)+' bps':'暂无报价')+'</span></div>'+position+'<div class="card-orders"><div class="card-section-label">挂单 <span>'+coin.orders.length+'</span></div>'+orders+'</div><div class="card-decision">'+decision+'</div>'+(hasExternal?'<p class="card-external">'+(coin.external_position!=null?'外部持仓 '+price(coin.external_position)+' ':'')+(coin.external_order?'存在外部挂单':'')+' · 待核对</p>':'')+'</article>';
+    return '<article class="watch-card'+(!coin.enabled?' disabled':'')+'"><div class="watch-card-head"><div class="symbol-identity"><span class="coin-code">'+esc(base.slice(0,3))+'</span><div><h3>'+esc(base)+'<span> / '+asset+'</span></h3><small class="coin-state'+(hasExternal?' uncertain':'')+'"><i class="state-dot'+(!coin.enabled?' off':'')+'"></i>'+status+'</small></div></div><div class="coin-actions">'+btn('toggle',coin.enabled?'停用扫描':'启用扫描',coin.enabled?'Ⅱ':'▷')+btn('edit','单币配置','⚙')+btn('remove','移出自选','×')+'</div></div><div class="card-quote"><strong>'+price(coin.price)+'</strong><span class="quote-state'+(coin.quote_stale?' delayed':'')+'">'+(coin.quote_stale?'报价待更新':coin.quote?'点差 '+num((Number(coin.quote.ask)-Number(coin.quote.bid))/Number(coin.price)*10000,2)+' bps':'暂无报价')+'</span></div>'+position+'<div class="card-orders"><div class="card-section-label">挂单 <span>'+coin.orders.length+'</span></div>'+orders+'</div><div class="card-decision">'+decision+'</div>'+(hasExternal?'<p class="card-external">'+(coin.external_position!=null?'外部持仓 '+price(coin.external_position)+' ':'')+(coin.external_order?'存在外部挂单':'')+' · 待核对</p>':'')+'</article>';
   }).join(''));
 }
 function renderDecisions(){
@@ -160,7 +163,7 @@ async function openMarkets(){selected=new Set();$('market-search').value='';$('m
 async function loadMarkets(){try{markets=await api('/api/markets');renderMarkets();}catch(err){toast(err.message,true);}}
 function renderMarkets(){
   const search=$('market-search').value.trim().toUpperCase().replace('/',''),existing=new Set(state?.pool.map(c=>c.symbol)||[]);
-  $('market-list').innerHTML=markets.filter(m=>m.symbol.includes(search)).slice(0,150).map(m=>'<label class="market-row"><input type="checkbox" data-market="'+esc(m.symbol)+'" '+(selected.has(m.symbol)?'checked ':'')+(existing.has(m.symbol)?'disabled':'')+'><b>'+esc(m.symbol)+'</b><span>24h '+num(Number(m.quote_volume)/1000000)+'M USDT</span><span>'+(existing.has(m.symbol)?'已添加':price(m.last_price))+'</span></label>').join('')||'<div class="empty">暂无匹配币对，请等待行情同步或更新排名。</div>';
+  $('market-list').innerHTML=markets.filter(m=>m.symbol.includes(search)).slice(0,150).map(m=>'<label class="market-row"><input type="checkbox" data-market="'+esc(m.symbol)+'" '+(selected.has(m.symbol)?'checked ':'')+(existing.has(m.symbol)?'disabled':'')+'><b>'+esc(m.symbol)+'</b><span>24h '+num(Number(m.quote_volume)/1000000)+'M '+quoteAsset(m.symbol)+'</span><span>'+(existing.has(m.symbol)?'已添加':price(m.last_price))+'</span></label>').join('')||'<div class="empty">暂无匹配币对，请等待行情同步或更新排名。</div>';
   $('selected-count').textContent='已选择 '+selected.size+' 个币对';
 }
 const input=(key,label,value,extra='')=>'<label>'+label+'<input name="'+key+'" value="'+esc(value)+'" '+extra+'></label>';
@@ -171,14 +174,14 @@ function showSettings(){
   if(!state)return;const c=state.config,s=c.strategy,j=c.jev;
   $('settings-fields').innerHTML=
     section('仓位与止盈',[
-      numeric('notional_usdt','单币名义金额 / USDT',c.notional_usdt,1,100000,'0.01'),
-      numeric('profit_usdt','单笔净止盈 / USDT',c.profit_usdt,.01,100000,'0.01'),
+      numeric('notional_usdt','单币名义金额 / 计价币',c.notional_usdt,1,100000,'0.01'),
+      numeric('profit_usdt','单笔净止盈 / 计价币',c.profit_usdt,.01,100000,'0.01'),
       numeric('max_positions','最大同时持仓数',c.max_positions,1,50),
-      numeric('max_exposure_usdt','总仓位上限 / USDT',c.max_exposure_usdt,1,10000000,'0.01'),
+      numeric('max_exposure_usdt','总仓位上限 / USDT + USDC',c.max_exposure_usdt,1,10000000,'0.01'),
       numeric('leverage','杠杆',c.leverage,1,20),numeric('cooldown_bars','平仓后冷却 / K 线根数',c.cooldown_bars,0,288),
       select('allowed_direction','允许方向',c.allowed_direction,{both:'做多与做空',long:'仅做多',short:'仅做空'}),
       numeric('max_spread_bps','点差上限 / bps',c.max_spread_bps,.1,1000,'.1')
-    ],'名义金额不再乘杠杆。退出采用 Maker 止盈或手动平仓。')+
+    ],'金额与净止盈使用币对的计价币（USDT 或 USDC）；总敞口按两种稳定币 1:1 合并。名义金额不再乘杠杆。退出采用 Maker 止盈或手动平仓。')+
     section('JEV 行情指标 · 固定 5 分钟',[
       numeric('fast','快线周期',s.fast,2,149),numeric('slow','慢线周期',s.slow,3,150),
       numeric('signal','MACD 信号周期',s.signal,2,100),numeric('period','RSI / 布林带周期',s.period,2,150),
@@ -193,7 +196,7 @@ function showSettings(){
     section('模拟费用',[
       numeric('maker_fee','Maker 费率 / 小数',c.maker_fee,0,.1,'.00001'),numeric('taker_fee','Taker 费率 / 小数',c.taker_fee,0,.1,'.00001'),
       numeric('paper_balance_usdt','初始模拟余额 / USDT',c.paper_balance_usdt,1,10000000,'.01')
-    ],'修改模拟本金按差额调整余额，并保留累计收益。测试网 / 实盘开仓时读取账户费率；模拟不包含队列竞争、强平和资金费。');
+    ],'模拟 USDC 合约与 USDT 钱包按 1:1 记账。修改模拟本金按差额调整余额，并保留累计收益。测试网 / 实盘开仓时读取账户费率；模拟不包含队列竞争、强平和资金费。');
   renderConnections();renderSystem();settingsTab('trading');$('settings-dialog').showModal();
 }
 function settingsTab(name){
@@ -243,7 +246,7 @@ function showCoin(coin){
   $('coin-fields').innerHTML=section('覆盖配置',[
     input('notional','名义金额 / 留空继承',o.notional_usdt||'','type="number" min="1" step=".01"'),
     input('profit','净止盈 / 留空继承',o.profit_usdt||'','type="number" min=".01" step=".01"'),
-  ],'决策统一使用 JEV。单币指标参数可通过 /api/pool 配置。');
+  ],'金额与净止盈单位为 '+quoteAsset(coin.symbol)+'。决策统一使用 JEV。单币指标参数可通过 /api/pool 配置。');
   $('coin-dialog').showModal();
 }
 const addCoin=symbol=>{

@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    domain::{Action, BAR_MS, Candle, Quote, now_ms},
+    domain::{Action, BAR_MS, Candle, Quote, now_ms, settlement_asset},
     strategy::{self, Decision},
 };
 use anyhow::{Context, Result, anyhow, ensure};
@@ -229,6 +229,7 @@ fn decision_request(
             "quote": quote,
             "indicators": indicators,
             "indicator_parameters": c.strategy,
+            "amount_currency": settlement_asset(symbol).context("不支持的结算币种")?,
             "notional_usdt": c.notional_usdt,
             "target_net_profit_usdt": c.profit_usdt,
             "profit_target_role": "exit_take_profit_only_not_entry_requirement",
@@ -240,7 +241,7 @@ fn decision_request(
         "questions": {
             "action": {
                 "type": "choice",
-                "instructions": "Choose the entry with a supported directional edge over forecast_bars using only these closed 5m bars, indicators and quote. Account for spread and entry taker / exit maker fees. A modest edge can qualify; do not require every indicator to agree. target_net_profit_usdt is an exit take-profit objective, not a minimum forecast move or a deadline: do not require reaching it within forecast_bars. WAIT when neither direction has a supported edge after costs or data is insufficient. No external or missing data. Confidence is not win probability.",
+                "instructions": "Amounts in notional_usdt and target_net_profit_usdt use amount_currency (USDT or USDC). Choose the entry with a supported directional edge over forecast_bars using only these closed 5m bars, indicators and quote. Account for spread and entry taker / exit maker fees. A modest edge can qualify; do not require every indicator to agree. target_net_profit_usdt is an exit take-profit objective, not a minimum forecast move or a deadline: do not require reaching it within forecast_bars. WAIT when neither direction has a supported edge after costs or data is insufficient. No external or missing data. Confidence is not win probability.",
                 "criteria": {
                     "LONG": "Price action and indicators favor an upward move that can cover spread and fees, even if the full exit profit target needs more time.",
                     "SHORT": "Price action and indicators favor a downward move that can cover spread and fees, even if the full exit profit target needs more time.",
@@ -358,6 +359,31 @@ mod tests {
                 }
             })
             .collect()
+    }
+    #[test]
+    fn decision_amounts_use_the_contract_quote_currency() {
+        let config = Config::default();
+        let bars = candles_with_count(120);
+        let quote = Quote {
+            bid: 100.into(),
+            ask: 100.into(),
+            bid_qty: 1.into(),
+            ask_qty: 1.into(),
+            time: now_ms(),
+        };
+        let indicators = strategy::indicators(&bars, &config.strategy).unwrap();
+        for (symbol, asset) in [("BTCUSDT", "USDT"), ("BTCUSDC", "USDC")] {
+            let request = decision_request(symbol, &bars, &quote, &config, &indicators).unwrap();
+            assert_eq!(request["state"]["amount_currency"], asset);
+            assert_eq!(
+                request["state"]["notional_usdt"],
+                json!(config.notional_usdt)
+            );
+            assert_eq!(
+                request["state"]["target_net_profit_usdt"],
+                json!(config.profit_usdt)
+            );
+        }
     }
     #[test]
     fn compact_request_preserves_every_bar_and_reduces_payload_size() {

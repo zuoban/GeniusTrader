@@ -1,6 +1,6 @@
 # Genius Trader
 
-Rust 币安 USDT 永续合约交易服务，附本地中文控制台。使用已收盘的 5 分钟 K 线判断做多、做空或等待；每币默认 100 USDT 名义金额，采用 GTX / reduce-only Maker 止盈。按当前需求不设置自动止损、超时强平、自动反手或亏损补仓。
+Rust 币安 USDT / USDC 永续合约交易服务，附本地中文控制台。使用已收盘的 5 分钟 K 线判断做多、做空或等待；每币默认 100 计价币（USDT 或 USDC）名义金额，采用 GTX / reduce-only Maker 止盈。按当前需求不设置自动止损、超时强平、自动反手或亏损补仓。
 
 ## 启动
 
@@ -38,14 +38,14 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 ## GitHub Packages 容器
 
-镜像：`ghcr.io/zuoban/geniustrader:0.1.3`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
+镜像：`ghcr.io/zuoban/geniustrader:0.1.4`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
 
 ```sh
-rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.3
+rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.4
 rtk proxy docker run -d --name genius-trader \
   --publish 8787:8787 \
   --mount type=volume,source=genius-trader-data,target=/app/data \
-  ghcr.io/zuoban/geniustrader:0.1.3
+  ghcr.io/zuoban/geniustrader:0.1.4
 ```
 
 本机打开 http://127.0.0.1:8787，服务器部署则打开 `http://服务器IPv4:8787`，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
@@ -76,7 +76,7 @@ rtk proxy docker compose up -d
 rtk proxy docker compose ps
 ```
 
-`compose.yaml` 使用已发布的 `0.1.3` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
+`compose.yaml` 使用已发布的 `0.1.4` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
 
 打开 `http://服务器IPv4:8787`（本机部署使用 http://127.0.0.1:8787），首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"8877:8787"`，再访问 `http://服务器IPv4:8877`；容器端口仍为 8787。
 
@@ -120,7 +120,7 @@ done'
 
 ## 已实现
 
-- 合约成交额排序、手动输入、批量添加、启用/停用、删除币种。
+- USDT / USDC 永续合约成交额排序、手动输入（BTCUSDC 或 BTC/USDC）、批量添加、启用/停用、删除币种。
 - 全局配置与单币覆盖，金额和止盈目标使用十进制字符串。
 - 仅使用 Jev 决策做多、做空或等待；EMA、MACD、RSI、布林带统一作为行情输入，支持配置指标参数。
 - SQLite WAL 持久化配置、币池、持仓、订单、信号去重及事件；同一数据库仅允许一个服务实例。
@@ -208,7 +208,7 @@ Jev 密钥配置提供「测试连接」：填写时测试当前输入，留空�
 ## 当前边界
 
 - 模拟 Maker 成交要求挂单后的新报价严格穿过限价，按盘口数量限制成交；触价不算成交。模拟不建模撮合队列、强平和资金费。
-- 实盘资金费读取账户 income；手续费暂只支持 USDT。BNB 等其他资产手续费保持待结算并告警，不虚构兑换收益。
+- 实盘手续费与资金费按合约结算币种（USDT / USDC）记账；其他资产手续费（如 BNB）或结算币种不匹配时保持待结算并告警，不虚构兑换收益。
 - 非本系统订单、外部持仓或数量差异会暂停新增开仓并标记，保留外部订单，需人工核对。
 - 未知订单保留锁定。超过交易所历史查询保留期、单订单 1,000 笔成交查询上限，需要人工核对。
 - 净止盈是计算目标，实际滑点、资金费与收费变化可能造成偏差。
@@ -222,7 +222,7 @@ Jev 密钥配置提供「测试连接」：填写时测试当前输入，留空�
 | 方法 | 路径 | 内容 |
 | --- | --- | --- |
 | GET | `/api/dashboard` | 控制台聚合快照：兼容 state 字段，新增 updated_at、watchlist、position_views、open_orders、recent_decisions；仅当前交易模式 |
-| GET | `/api/decisions?limit=30&symbol=BTCUSDT` | 最近决策摘要；limit 为 1–100，symbol 可选、忽略大小写并支持 BTC/USDT；按记录顺序倒序，不包含原始行情输入 |
+| GET | `/api/decisions?limit=30&symbol=BTCUSDT` | 最近决策摘要；limit 为 1–100，symbol 可选、忽略大小写并支持 BTC/USDT、BTC/USDC；按记录顺序倒序，不包含原始行情输入 |
 | GET | `/api/state` | 配置、币池、持仓、订单、收益、健康状态、account_assets 及其同步时间 / 错误状态 |
 | GET | `/api/markets` | 可交易币对，按成交额降序 |
 | GET | `/api/events` | 最近 100 条事件及决策输入；加 `?exclude_decisions=true` 只读取运行事件 |
@@ -246,6 +246,8 @@ Jev 密钥配置提供「测试连接」：填写时测试当前输入，留空�
 
 `watchlist` 为每个自选币对聚合有效 notional_usdt / profit_usdt、quote / price / quote_stale、position、orders、latest_decision 及 external_position / external_order。`position_views` 保留原持仓字段并增加 mark_price / unrealized / quote_stale；缺失盘口时前两者为 null，金额仍使用十进制字符串。`open_orders` 保留原委托字段并增加 order_side（BUY / SELL，退出方向与持仓相反）及 remaining_quantity（委托数量减已核对成交数量，不小于零）。`latest_decision` / `recent_decisions` 包含 id、time、symbol、bar_close 以及结构化决策字段；time 和 bar_close 为 Unix 毫秒。
 
+USDT / USDC 币对均须在当前环境上市、可交易且为加密货币标的的 USDⓈ-M 永续合约。名义金额与净止盈按币对计价币使用；为兼容已保存配置，API 字段仍保留 `notional_usdt` / `profit_usdt` 等名称。总收益与敞口按 USDT / USDC 1:1 名义合并，不代表兑换后的精确价值；Paper 的 USDC 合约也按 1:1 计入模拟 USDT 钱包。实盘单资产模式按对应结算币余额检查保证金，联合保证金模式使用币安 USD 可用余额并扣除所有待确认入场的预留金额。`state.margin_balances` 返回当前保证金模式、共享余额及各资产的可用余额。
+
 单币 `config` 字段：`notional_usdt`、`profit_usdt`、`strategy`（指标参数）、`decision_mode`（固定为 `jev`，可为 null 继承）、`allowed_direction`；未覆盖字段为 null。时间为 Unix 毫秒。
 
 连接设置支持部分更新，例如 `{ "mode": "testnet", "testnet": { "key": "...", "secret": "..." }, "jev_key": "..." }`。空字符串 / 省略密钥字段表示保留，`testnet.clear`、`live.clear`、`clear_jev` 表示显式清除。实盘模式需要 `live_enabled: true`。
@@ -260,7 +262,7 @@ rtk proxy sh scripts/cargo.sh clippy --locked --all-targets -- -D warnings
 
 测试不需要真实账户，不提交测试网或实盘订单。
 
-部分测试会启动回环地址上的模拟 HTTP 服务，需要本机监听权限。已覆盖多空部分止盈、触价不成交、重复报价、暂停/删除仍管理、同根 K 线去重、重启后未知订单恢复、重复回报、USDT 费用结算、跨模式数据库隔离、Jev 结构与阈值验证。真实 Jev 账户调用和币安测试网/实盘成交仍需配置各自密钥后验证。
+部分测试会启动回环地址上的模拟 HTTP 服务，需要本机监听权限。已覆盖多空部分止盈、触价不成交、重复报价、暂停/删除仍管理、同根 K 线去重、重启后未知订单恢复、重复回报、USDT / USDC 费用结算与资金费去重、USDC 添加与保存恢复、单资产与联合保证金余额检查、跨模式数据库隔离、Jev 结构与阈值验证。真实 Jev 账户调用和币安测试网/实盘成交仍需配置各自密钥后验证。
 
 旧版单模式 state 表自动迁移；默认数据库首次导入旧版 data/paper.sqlite、testnet.sqlite、live.sqlite，或之前预览使用的 preview-paper.sqlite，不覆盖已存在的对应模式记录，原文件保留。旧环境变量和 .env 不再生效，API 密钥需要在页面重新填写。管理员密码未初始化的旧数据库会显示首次设置引导，不自动生成默认密码。
 

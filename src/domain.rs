@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const BAR_MS: i64 = 300_000;
+pub fn settlement_asset(symbol: &str) -> Option<&'static str> {
+    ["USDT", "USDC"]
+        .into_iter()
+        .find(|asset| symbol.len() > asset.len() && symbol.ends_with(asset))
+}
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

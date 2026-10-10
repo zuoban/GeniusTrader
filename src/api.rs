@@ -448,6 +448,106 @@ mod tests {
         cookie.split(';').next().unwrap().to_string()
     }
     #[tokio::test]
+    async fn usdc_pool_routes_add_update_restore_and_remove_normalized_pairs() {
+        use crate::{config::Mode, engine::Engine, exchange::Binance, jev::Jev, store::Store};
+        let store = Store::open(":memory:", Mode::Paper).unwrap();
+        let engine = Engine::new(
+            Mode::Paper,
+            store.clone(),
+            Config::default(),
+            Binance::new(Mode::Paper).unwrap(),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        for (symbol, volume) in [("BTCUSDT", "1000"), ("BTCUSDC", "2000")] {
+            let market: SymbolInfo = serde_json::from_value(serde_json::json!({
+                "symbol":symbol, "quote_volume":volume, "last_price":"60000",
+                "tick_size":"0.01", "step_size":"0.001", "market_step":"0.001",
+                "min_qty":"0.001", "market_min_qty":"0.001", "min_notional":"5",
+                "max_qty":"1000", "market_max_qty":"1000"
+            }))
+            .unwrap();
+            engine
+                .inner
+                .lock()
+                .await
+                .catalog
+                .insert(symbol.into(), market);
+        }
+        let app = router(Application::from_engine(engine.clone()));
+        let cookie = admin_cookie(&app).await;
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/api/markets", "", None))
+            .await
+            .unwrap();
+        let markets: Vec<SymbolInfo> = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 10000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            markets
+                .iter()
+                .map(|m| m.symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["BTCUSDC", "BTCUSDT"]
+        );
+        for body in [
+            r#"{"symbol":" btc/usdc ","enabled":true,"config":null}"#,
+            r#"{"symbol":"btcusdc","enabled":false,"config":{"notional_usdt":"150","profit_usdt":"1"}}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request("POST", "/api/pool", body, Some(&cookie)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let restored = Engine::new(
+            Mode::Paper,
+            store,
+            Config::default(),
+            Binance::new(Mode::Paper).unwrap(),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        let snapshot = restored.snapshot().await;
+        assert_eq!(snapshot.pool.len(), 1);
+        assert_eq!(snapshot.pool[0].symbol, "BTCUSDC");
+        assert!(!snapshot.pool[0].enabled);
+        assert_eq!(
+            snapshot.pool[0].config.as_ref().unwrap().notional_usdt,
+            Some(150.into())
+        );
+        for symbol in ["BTCUSD", "UNKNOWNUSDC", "../USDC"] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    "/api/pool",
+                    &serde_json::json!({"symbol":symbol,"enabled":true,"config":null}).to_string(),
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/api/decisions?symbol=btc%2Fusdc", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .oneshot(request("DELETE", "/api/pool/btcusdc", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(engine.snapshot().await.pool.is_empty());
+    }
+    #[tokio::test]
     async fn jev_test_route_rejects_missing_invalid_and_clear_keys_without_echoing_secrets() {
         let store = crate::store::Store::open(":memory:", crate::config::Mode::Paper).unwrap();
         let application = Application::new(store.clone()).unwrap();
