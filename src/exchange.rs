@@ -167,6 +167,12 @@ impl std::fmt::Display for ExchangeError {
 }
 impl std::error::Error for ExchangeError {}
 impl ExchangeError {
+    pub(crate) fn budget_retry_after(&self) -> Option<Duration> {
+        match self.kind {
+            ExchangeErrorKind::Budget(wait) => Some(wait),
+            _ => None,
+        }
+    }
     fn transport(error: reqwest::Error, method: &Method, path: &'static str, status: u16) -> Self {
         let kind = match (status == 0, error.is_timeout()) {
             (true, true) => ExchangeErrorKind::RequestTimeout,

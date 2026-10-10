@@ -77,6 +77,7 @@ pub struct Inner {
     pub health: String,
     persistence_pending: bool,
     scan_cursor: Option<String>,
+    market_retry_at: Option<Instant>,
 }
 #[derive(Serialize)]
 pub struct Snapshot {
@@ -344,6 +345,7 @@ impl Engine {
                 health,
                 persistence_pending: false,
                 scan_cursor: None,
+                market_retry_at: None,
             }),
         }))
     }
@@ -741,6 +743,39 @@ impl Engine {
         true
     }
     async fn refresh_market(&self) -> Result<()> {
+        {
+            let mut i = self.inner.lock().await;
+            // Keep WebSocket freshness current even while REST awaits quota.
+            // Entry checks still reject stale quotes without changing user intent.
+            i.market_health(self.mode);
+            if i.market_retry_at
+                .is_some_and(|retry| Instant::now() < retry)
+            {
+                return Ok(());
+            }
+            i.market_retry_at = None;
+        }
+        match self.refresh_market_once().await {
+            Err(error) => {
+                let Some(wait) = error
+                    .downcast_ref::<ExchangeError>()
+                    .and_then(ExchangeError::budget_retry_after)
+                else {
+                    return Err(error);
+                };
+                self.inner.lock().await.market_retry_at = Some(Instant::now() + wait);
+                self.event(
+                    "warn",
+                    None,
+                    "行情请求等待权重额度，稍后自动重试",
+                    json!({"error": error.to_string(), "retry_after_ms": wait.as_millis() as u64}),
+                );
+                Ok(())
+            }
+            result => result,
+        }
+    }
+    async fn refresh_market_once(&self) -> Result<()> {
         if self.inner.lock().await.catalog.is_empty() {
             self.exchange.sync_time().await?;
             let catalog = self.exchange.symbols().await?;
@@ -2713,6 +2748,176 @@ mod tests {
         e.refresh_market().await.unwrap();
         assert_eq!(*calls.lock().await, vec!["YUSDC", "XUSDT", "YUSDC"]);
         assert_eq!(e.inner.lock().await.quotes.len(), 2);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn market_budget_wait_preserves_scan_intent_and_retries_without_bypassing_freshness() {
+        use axum::{Json, Router, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for mode in [Mode::Paper, Mode::Testnet] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let app = Router::new()
+                .route(
+                    "/fapi/v1/time",
+                    get(|| async {
+                        (
+                            [("x-mbx-used-weight-1m", "2159")],
+                            Json(json!({"serverTime": now_ms()})),
+                        )
+                    }),
+                )
+                .route(
+                    "/fapi/v1/exchangeInfo",
+                    get(|| async {
+                        Json(json!({"symbols": [], "rateLimits": [{
+                            "rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE",
+                            "intervalNum": 1, "limit": 10000
+                        }]}))
+                    }),
+                )
+                .route("/fapi/v1/ticker/24hr", get(|| async { Json(json!([])) }))
+                .route(
+                    "/fapi/v1/ticker/bookTicker",
+                    get(move || {
+                        let observed = observed.clone();
+                        async move {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            Json(
+                                json!({"symbol": "XUSDT", "bidPrice": "100", "askPrice": "100",
+                                "bidQty": "1", "askQty": "1", "time": 101, "lastUpdateId": 11}),
+                            )
+                        }
+                    }),
+                );
+            let (base, server) = crate::test_support::mock_server(app).await;
+            let e = Engine::new(
+                mode,
+                Store::open(":memory:", mode).unwrap(),
+                config(),
+                Binance::mock(base),
+                Jev::new().unwrap(),
+            )
+            .unwrap();
+            seed(&e).await;
+            {
+                let mut i = e.inner.lock().await;
+                i.book.pool.insert(
+                    "XUSDT".into(),
+                    PoolCoin {
+                        symbol: "XUSDT".into(),
+                        enabled: true,
+                        config: None,
+                    },
+                );
+                i.paused = false;
+                i.account_at = now_ms();
+            }
+            e.exchange.sync_time().await.unwrap();
+            e.refresh_market().await.unwrap();
+            let retry_at = {
+                let i = e.inner.lock().await;
+                assert!(!i.paused);
+                assert_eq!(i.revision, 0);
+                assert!(i.scan_allowed(mode, now_ms()));
+                i.market_retry_at.unwrap()
+            };
+            assert!(retry_at > Instant::now());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let events = e.store.events(10).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].level, "warn");
+            assert!(events[0].message.contains("自动重试"));
+            assert!(events[0].detail["retry_after_ms"].as_u64().unwrap() > 0);
+
+            // Waiting neither retries admission every tick nor renews old quotes.
+            e.inner.lock().await.quotes.get_mut("XUSDT").unwrap().time = now_ms() - 16_000;
+            e.refresh_market().await.unwrap();
+            {
+                let i = e.inner.lock().await;
+                assert!(!i.paused);
+                assert!(!i.scan_allowed(mode, now_ms()));
+                assert!(now_ms() - i.market_at >= 15_000);
+            }
+            assert_eq!(e.exchange.rate_limit_snapshot().await.budget_rejections, 1);
+            assert_eq!(e.store.events(10).unwrap().len(), 1);
+
+            // Fresh WebSocket data resumes scanning even while REST awaits quota.
+            let mut quote = e.inner.lock().await.quotes["XUSDT"].clone();
+            quote.time = now_ms();
+            quote.exchange_time = Some(100);
+            quote.update_id = Some(10);
+            assert!(e.apply_market_quote("XUSDT".into(), quote).await);
+            e.refresh_market().await.unwrap();
+            assert!(e.inner.lock().await.scan_allowed(mode, now_ms()));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // Make quota available through a real exchangeInfo response, then
+            // simulate the retry deadline passing without a minute-long sleep.
+            e.exchange.symbols().await.unwrap();
+            e.refresh_market().await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            e.inner.lock().await.market_retry_at = Some(Instant::now());
+            e.refresh_market().await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            {
+                let i = e.inner.lock().await;
+                assert!(i.market_retry_at.is_none());
+                assert!(!i.paused);
+                assert_eq!(i.quotes["XUSDT"].update_id, Some(11));
+                assert!(i.scan_allowed(mode, now_ms()));
+            }
+
+            // A user pause during the wait survives both pushes and REST recovery.
+            e.inner.lock().await.market_retry_at = Some(retry_at);
+            e.set_running(false).await.unwrap();
+            e.refresh_market().await.unwrap();
+            assert!(e.snapshot().await.paused);
+            e.inner.lock().await.market_retry_at = Some(Instant::now());
+            e.refresh_market().await.unwrap();
+            assert!(e.snapshot().await.paused);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn market_http_failure_and_cooldown_still_require_manual_restart() {
+        use axum::{Json, Router, http::StatusCode, routing::get};
+        let app = Router::new().route(
+            "/fapi/v1/ticker/bookTicker",
+            get(|| async { (StatusCode::TOO_MANY_REQUESTS, Json(json!({"code": -1003}))) }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Paper,
+            Store::open(":memory:", Mode::Paper).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        seed(&e).await;
+        e.set_pool(PoolCoin {
+            symbol: "XUSDT".into(),
+            enabled: true,
+            config: None,
+        })
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            e.inner.lock().await.paused = false;
+            let error = e.refresh_market().await.unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<ExchangeError>()
+                    .unwrap()
+                    .budget_retry_after()
+                    .is_none()
+            );
+            e.fault("行情同步失败", error).await;
+            assert!(e.snapshot().await.paused);
+            assert!(e.inner.lock().await.market_retry_at.is_none());
+        }
         server.abort();
     }
     #[tokio::test]

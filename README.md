@@ -38,14 +38,14 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 ## GitHub Packages 容器
 
-镜像：`ghcr.io/zuoban/geniustrader:0.1.6`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
+镜像：`ghcr.io/zuoban/geniustrader:0.1.7`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
 
 ```sh
-rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.6
+rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.7
 rtk proxy docker run -d --name genius-trader \
   --publish 8787:8787 \
   --mount type=volume,source=genius-trader-data,target=/app/data \
-  ghcr.io/zuoban/geniustrader:0.1.6
+  ghcr.io/zuoban/geniustrader:0.1.7
 ```
 
 本机打开 http://127.0.0.1:8787，服务器部署则打开 `http://服务器IPv4:8787`，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
@@ -76,7 +76,7 @@ rtk proxy docker compose up -d
 rtk proxy docker compose ps
 ```
 
-`compose.yaml` 使用已发布的 `0.1.6` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
+`compose.yaml` 使用已发布的 `0.1.7` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
 
 打开 `http://服务器IPv4:8787`（本机部署使用 http://127.0.0.1:8787），首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"8877:8787"`，再访问 `http://服务器IPv4:8877`；容器端口仍为 8787。
 
@@ -202,6 +202,8 @@ flowchart TD
 行情接入 [USD-M 公共 bookTicker WebSocket](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public)，按 [当前连接规范](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Connect)使用 `wss://fstream.binance.com/public/stream`；测试模式使用 `wss://demo-fstream.binance.com/stream`。模拟模式也接收真实公共报价，无需账户密钥。订阅覆盖币池、持仓和待确认订单，即使币对已停用或移出币池，仍保留持仓风控需要的报价。每 2 秒检查订阅变化，先退订再新增；订阅确认超过 8 秒、格式异常或断线时重连，单连接超过 1024 个币对时使用 REST 兜底。每 30 秒发送心跳，90 秒无帧或连接接近 24 小时时重连，指数退避最长 60 秒；握手也遵守共享限流退避。
 
 REST 持续兜底：每 2 秒检查各币对报价，行情连接健康时只补取缺失或超过 8 秒未更新的币对，断线时补取全部所需币对。一至两个币对使用单币查询，三个及以上使用一次全市场查询，返回结果只保留仍被币池、持仓或订单需要的币对。行情时效取所需币对中最早的接收时间，避免活跃币对掩盖其他币对的过期报价。订单/仓位目标周期 5 秒，扫描目标周期 10 秒；账户事件也会唤醒持仓管理，并合并短时间内的事件。网络和节流会影响实际周期；所有入场仅使用已收盘 5 分钟 K 线。持仓管理与 Jev 请求独立运行。目前没有历史回测器。
+
+行情 REST 请求因本地权重预算不足而未发送时，保留扫描启动状态，记录一次等待事件，并在预计额度释放后自动重试；等待期间仍每 2 秒更新 WebSocket 行情时效。盘口超过 15 秒时暂不扫描，报价恢复后自动继续。手动暂停、账户同步失败、服务端限流退避和其他行情错误仍沿用原有暂停流程，不会因行情恢复自动重新启动。
 
 订单对账最多并发 4 个只读状态查询，回报仍按原委托顺序入账，部分开仓的撤单和成交结算顺序保留；单个查询失败时继续保留原订单并锁定该币对。仓位、未成交订单与保证金余额并发读取，三项都成功后才一次性更新账户快照。发送仍受同一域名的 100 毫秒间隔限制，慢请求仍可能延长持仓管理周期；时间同步在取得发送名额后开始计时，排队等待不计入交易所时差。
 
