@@ -38,14 +38,14 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 ## GitHub Packages 容器
 
-镜像：`ghcr.io/zuoban/geniustrader:0.1.7`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
+镜像：`ghcr.io/zuoban/geniustrader:0.1.8`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
 
 ```sh
-rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.7
+rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.8
 rtk proxy docker run -d --name genius-trader \
   --publish 8787:8787 \
   --mount type=volume,source=genius-trader-data,target=/app/data \
-  ghcr.io/zuoban/geniustrader:0.1.7
+  ghcr.io/zuoban/geniustrader:0.1.8
 ```
 
 本机打开 http://127.0.0.1:8787，服务器部署则打开 `http://服务器IPv4:8787`，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
@@ -76,7 +76,7 @@ rtk proxy docker compose up -d
 rtk proxy docker compose ps
 ```
 
-`compose.yaml` 使用已发布的 `0.1.7` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
+`compose.yaml` 使用已发布的 `0.1.8` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
 
 打开 `http://服务器IPv4:8787`（本机部署使用 http://127.0.0.1:8787），首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"8877:8787"`，再访问 `http://服务器IPv4:8877`；容器端口仍为 8787。
 
@@ -191,7 +191,11 @@ flowchart TD
 
 完整账户同步失败时，立即暂停新增开仓，并停止新增或替换止盈单；原有订单继续查询确认，已启用的止损继续检查。触发止损后，单独读取该币对的持仓与挂单：只有单向持仓方向、数量和本系统已记录的止盈单全部匹配，且不存在未知订单、未确认费用或已发现的外部变更时，才允许确认撤单并提交只减仓市价单。撤单发生部分成交后再次核对剩余数量；独立核对从开始请求起 15 秒内有效，提交前再次检查盘口时效。限流退避、核对失败或不一致时保留止损意图，等待后续轮询。
 
-独立核对不会更新完整账户时间、余额或解除同步失败状态。`/api/state` 与 `/api/dashboard` 的 `account_sync_failed` 标识完整同步失败；即使上一份账户快照尚未过期，也禁止重新启动扫描。只有完整账户同步成功才清除该标识，恢复后仍需手动启动新增开仓。同步失败期间的止损使用已记录资金费，尚未同步的费用可能影响触发时机。
+独立核对不会更新完整账户时间、余额或解除同步失败状态。`/api/state` 与 `/api/dashboard` 的 `account_sync_failed` 标识完整同步失败；即使上一份账户快照尚未过期，也禁止重新启动扫描。只有完整账户同步成功才清除该标识。账户请求因本地权重预算不足而未发送时，保留扫描启动状态，但同步失败标识继续阻止新开仓，完整对账成功后自动继续；其他账户同步失败恢复后仍需手动启动新增开仓。同步失败期间的止损使用已记录资金费，尚未同步的费用可能影响触发时机。
+
+资金费与成交费用核对因本地请求权重不足而等待时，同样保留扫描启动状态，但禁止新增开仓和手动绕过核对。资金费核对完成且已有持仓费用全部确认后自动继续；其他费用错误仍暂停新增开仓。`funding_sync_pending` 标识资金费同步等待，`entry_data_pending` 标识资金费或成交费用待核实，控制台分别显示「资金费核对中」与「成交费用核对中」。手动暂停、外部账户差异、账户推送中断及服务端限流退避仍要求手动重新启动。
+
+币安[下单与撤单响应](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade)可能不包含 `avgPrice` 和 `cumQuote`。未成交订单允许缺少这两个字段；已成交开仓按有效均价、累计成交金额或已确认成交明细取得真实均价。成交明细数量与订单不一致、价格缺失或费用未确认时继续保留委托并查询，不使用限价或当前盘口虚构成交价格，不重复提交订单。
 
 这是由本地服务轮询执行的止损，服务停止期间不执行，交易所没有预挂止损单。只使用距更新小于 15 秒的有效盘口；持仓检查目标周期约 5 秒，实际周期受请求和节流影响。滑点、网络延迟、未知订单或账户差异可能推迟平仓并使实际亏损超过配置金额；该金额是触发阈值。
 

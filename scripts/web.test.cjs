@@ -137,6 +137,19 @@ test('monitoring displays zero counters, cooldowns and pending account reconcili
   assert.equal(h.element('monitor-state').textContent,'账户同步异常');
 });
 
+test('monitoring distinguishes funding and fill reconciliation from a user pause',async()=>{
+  const h=await dashboard();
+  h.run("state={mode:'live',paused:false,market_at:Date.now(),account_at:Date.now(),funding_sync_pending:true,entry_data_pending:true};renderMonitoring();");
+  assert.equal(h.element('monitor-state').textContent,'资金费核对中');
+  assert.match(h.element('monitor-state').className,/uncertain/);
+  h.run('state.funding_sync_pending=false;renderMonitoring();');
+  assert.equal(h.element('monitor-state').textContent,'成交费用核对中');
+  h.run('state.entry_data_pending=false;renderMonitoring();');
+  assert.equal(h.element('monitor-state').textContent,'运行中');
+  h.run('state.paused=true;renderMonitoring();');
+  assert.equal(h.element('monitor-state').textContent,'新增开仓已暂停');
+});
+
 test('monitoring handles absent metrics and paper mode without misleading values',async()=>{
   const h=await dashboard();
   h.run("state={mode:'paper',paused:true,market_at:0,account_at:0};renderMonitoring();");

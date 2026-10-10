@@ -103,9 +103,9 @@ function renderMonitoring(){
   replaceRegion('monitor-stream','<label>账户事件连接</label><strong class="'+(stream?.enabled&&!stream.connected?'uncertain':'')+'">'+streamLabel+'</strong><dl><div><dt>推送 / 重连次数</dt><dd>'+count(stream?.events)+' / '+count(stream?.reconnects)+'</dd></div><div><dt>最近账户事件</dt><dd>'+timestamp(stream?.last_event_at)+'</dd></div></dl><p>'+esc(s.mode==='paper'?'止盈与止损在本机轮询':stream?.last_error||'REST 对账持续运行')+'</p><p class="'+(market?.last_error?'uncertain':'')+'">'+esc(marketLabel)+'</p>');
   const age=(at)=>!at?'尚未同步':now<Number(at)?'时间异常':duration(now-Number(at))+' 前';
   const stale=!s.market_at||now-Number(s.market_at)>=15000||now<Number(s.market_at)||s.mode!=='paper'&&(!s.account_at||now-Number(s.account_at)>=15000||now<Number(s.account_at));
-  const status=s.account_sync_failed?'账户同步异常':s.account_update_pending?'账户对账中':stale?'数据待更新':s.paused?'新增开仓已暂停':'运行中';
+  const status=s.account_sync_failed?'账户同步异常':s.account_update_pending?'账户对账中':s.funding_sync_pending?'资金费核对中':s.entry_data_pending?'成交费用核对中':stale?'数据待更新':s.paused?'新增开仓已暂停':'运行中';
   $('monitor-state').textContent=limit?.cooldown_persistence_pending?'退避状态待保存':cooldown>0?'限流退避':status;
-  $('monitor-state').className='monitor-state'+(limit?.cooldown_persistence_pending||cooldown>0||s.account_sync_failed||stale?' uncertain':'');
+  $('monitor-state').className='monitor-state'+(limit?.cooldown_persistence_pending||cooldown>0||s.account_sync_failed||s.entry_data_pending||stale?' uncertain':'');
   $('monitor-freshness').textContent='行情 '+age(s.market_at)+' · '+(s.mode==='paper'?'模拟账户': '完整账户 '+age(s.account_at))+' · 异常轮次包含风控等待，累计次数在引擎重启后重置';
 }
 function render(){

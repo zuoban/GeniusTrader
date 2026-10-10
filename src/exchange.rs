@@ -228,8 +228,12 @@ pub struct ExchangeOrder {
     pub order_id: i64,
     pub status: String,
     pub executed_qty: Decimal,
+    // New/cancel order responses omit these fields in Binance's current schema.
+    // Filled orders must obtain a price from cumulative value or confirmed fills.
+    #[serde(default)]
     pub avg_price: Decimal,
     pub orig_qty: Decimal,
+    #[serde(default)]
     pub cum_quote: Decimal,
 }
 impl ExchangeOrder {
@@ -337,6 +341,14 @@ impl AccountInfo {
 }
 
 impl Binance {
+    #[cfg(test)]
+    pub(crate) async fn expire_mock_weight_window(&self) {
+        // Simulate elapsed weight windows without resetting cooldowns or counters.
+        self.throttle
+            .lock()
+            .await
+            .snapshot(Instant::now() + Duration::from_secs(60));
+    }
     #[cfg(test)]
     pub(crate) fn mock(base: String) -> Self {
         // Isolate mock servers from process-wide cooldowns when test ports are reused.
@@ -1190,6 +1202,34 @@ impl Binance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn order_responses_allow_missing_price_fields_but_require_identity_and_quantities() {
+        let response = serde_json::json!({"symbol":"ENAUSDC", "clientOrderId":"test", "orderId":42,
+            "status":"NEW", "executedQty":"0", "origQty":"1", "cumQty":"0"});
+        let order: ExchangeOrder = serde_json::from_value(response.clone()).unwrap();
+        assert_eq!(order.avg_price, Decimal::ZERO);
+        assert_eq!(order.cum_quote, Decimal::ZERO);
+        for field in [
+            "symbol",
+            "clientOrderId",
+            "orderId",
+            "status",
+            "executedQty",
+            "origQty",
+        ] {
+            let mut incomplete = response.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<ExchangeOrder>(incomplete).is_err(),
+                "{field}"
+            );
+        }
+        for field in ["avgPrice", "cumQuote"] {
+            let mut invalid = response.clone();
+            invalid[field] = serde_json::json!("invalid");
+            assert!(serde_json::from_value::<ExchangeOrder>(invalid).is_err());
+        }
+    }
     #[tokio::test]
     async fn budget_is_shared_across_client_replacement_and_reserves_account_and_exit_capacity() {
         use axum::{Json, Router, http::Uri};

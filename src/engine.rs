@@ -63,6 +63,7 @@ pub struct Inner {
     pub account_at: i64,
     pub account_sync_failed: bool,
     pub account_update_pending: bool,
+    pub funding_sync_pending: bool,
     account_generation: u64,
     pub available: Decimal,
     realized_net: Decimal,
@@ -88,6 +89,8 @@ pub struct Snapshot {
     pub account_at: i64,
     pub account_sync_failed: bool,
     pub account_update_pending: bool,
+    pub funding_sync_pending: bool,
+    pub entry_data_pending: bool,
     pub available_usdt: Decimal,
     pub margin_balances: Option<MarginBalances>,
     pub account_assets: Option<AccountInfo>,
@@ -138,7 +141,8 @@ impl Inner {
                 .min()
                 .unwrap_or(0)
         };
-        if (0..15_000).contains(&(now_ms() - self.market_at))
+        if self.entry_data_ready()
+            && (0..15_000).contains(&(now_ms() - self.market_at))
             && (mode == Mode::Paper
                 || (!self.account_sync_failed
                     && !self.account_update_pending
@@ -149,6 +153,7 @@ impl Inner {
     }
     fn scan_allowed(&self, mode: Mode, now: i64) -> bool {
         !self.paused
+            && self.entry_data_ready()
             && (0..15_000).contains(&(now - self.market_at))
             && (mode == Mode::Paper
                 || (!self.account_sync_failed
@@ -156,6 +161,11 @@ impl Inner {
                     && (0..15_000).contains(&(now - self.account_at))))
             && self.slots() < self.config.max_positions
             && self.exposure() < self.config.max_exposure_usdt
+    }
+    fn entry_data_ready(&self) -> bool {
+        !self.funding_sync_pending
+            && self.book.positions.values().all(|p| p.accounting_complete)
+            && self.book.pending.values().all(|o| o.status != "SETTLING")
     }
     fn scan_ready(&self, coin: &PoolCoin, now: i64) -> bool {
         let bar = now / BAR_MS * BAR_MS - 1;
@@ -331,6 +341,7 @@ impl Engine {
                 account_at: 0,
                 account_sync_failed: false,
                 account_update_pending: false,
+                funding_sync_pending: false,
                 account_generation: 0,
                 available,
                 realized_net,
@@ -407,6 +418,8 @@ impl Engine {
             account_at: i.account_at,
             account_sync_failed: i.account_sync_failed,
             account_update_pending: i.account_update_pending,
+            funding_sync_pending: i.funding_sync_pending,
+            entry_data_pending: !i.entry_data_ready(),
             available_usdt: i.available,
             margin_balances: i.margin_balances.clone(),
             account_assets: if self.mode == Mode::Paper {
@@ -505,6 +518,10 @@ impl Engine {
         let jev_available = !run || self.jev.read().await.available();
         let mut i = self.inner.lock().await;
         if run {
+            ensure!(
+                i.entry_data_ready(),
+                "资金费或成交费用尚未核实，等待同步完成"
+            );
             ensure!(
                 self.mode == Mode::Paper || self.exchange.configured(),
                 "请在账户与连接中配置币安 API Key 和 Secret"
@@ -714,6 +731,21 @@ impl Engine {
         }
     }
     async fn fault(&self, message: &str, error: anyhow::Error) {
+        if let Some(wait) = error
+            .downcast_ref::<ExchangeError>()
+            .and_then(ExchangeError::budget_retry_after)
+        {
+            self.event(
+                "warn",
+                None,
+                "同步请求等待权重额度，稍后自动重试",
+                json!({"context": message, "error": error.to_string(), "retry_after_ms": wait.as_millis() as u64}),
+            );
+            self.inner.lock().await.health = format!("等待请求权重额度：{message}");
+            // Account/funding/settlement readiness gates block entries until
+            // reconciliation succeeds; a local unsent request keeps user intent.
+            return;
+        }
         self.event("error", None, message, json!({"error": error.to_string()}));
         let mut i = self.inner.lock().await;
         i.health = format!("{message}: {error}");
@@ -883,6 +915,7 @@ impl Engine {
             let i = self.inner.lock().await;
             let expected_close = now_ms() / BAR_MS * BAR_MS - 1;
             if i.paused
+                || !i.entry_data_ready()
                 || i.revision != revision
                 || i.occupied(&coin.symbol)
                 || i.slots() >= i.config.max_positions
@@ -908,6 +941,7 @@ impl Engine {
         let quote = {
             let mut i = self.inner.lock().await;
             if i.paused
+                || !i.entry_data_ready()
                 || i.revision != revision
                 || i.occupied(&coin.symbol)
                 || i.book
@@ -951,6 +985,7 @@ impl Engine {
         let order = {
             let mut i = self.inner.lock().await;
             if i.paused
+                || !i.entry_data_ready()
                 || i.revision != revision
                 || i.occupied(&coin.symbol)
                 || !i.book.pool.get(&coin.symbol).is_some_and(|p| p.enabled)
@@ -1129,7 +1164,9 @@ impl Engine {
             remote.symbol == o.symbol
                 && remote.orig_qty == o.quantity
                 && remote.executed_qty >= Decimal::ZERO
-                && remote.executed_qty <= o.quantity,
+                && remote.executed_qty <= o.quantity
+                && remote.avg_price >= Decimal::ZERO
+                && remote.cum_quote >= Decimal::ZERO,
             "订单回报与已持久化委托不一致"
         );
         let fetch = remote.executed_qty > o.accounted_quantity
@@ -1157,8 +1194,24 @@ impl Engine {
         if o.role == OrderRole::Entry && delta > Decimal::ZERO {
             let avg = if remote.avg_price > Decimal::ZERO {
                 remote.avg_price
-            } else {
+            } else if remote.cum_quote > Decimal::ZERO {
                 remote.cum_quote / remote.executed_qty
+            } else if let Some(Ok(fills)) = &fills
+                && fills.iter().all(|f| {
+                    f.order_id == remote.order_id
+                        && f.qty > Decimal::ZERO
+                        && f.price > Decimal::ZERO
+                })
+                && fills.iter().map(|f| f.qty).sum::<Decimal>() == remote.executed_qty
+            {
+                fills.iter().map(|f| f.qty * f.price).sum::<Decimal>() / remote.executed_qty
+            } else {
+                // Never fabricate a zero/limit/market quote as the execution price.
+                // The persisted intent stays locked and is queried on the next cycle.
+                return Err(match fills {
+                    Some(Err(error)) => error.context("成交均价尚未确认，保留订单等待查询"),
+                    _ => anyhow::anyhow!("成交均价尚未确认，保留订单等待查询"),
+                });
             };
             let p = i
                 .book
@@ -1251,15 +1304,30 @@ impl Engine {
         self.save(&mut i)?;
         drop(i);
         if fetch && !settled {
+            let budget_wait = fills.as_ref().and_then(|result| {
+                result.as_ref().err().and_then(|error| {
+                    error
+                        .downcast_ref::<ExchangeError>()
+                        .and_then(ExchangeError::budget_retry_after)
+                })
+            });
             let mut i = self.inner.lock().await;
-            i.paused = true;
-            i.revision += 1;
+            if budget_wait.is_none() {
+                i.paused = true;
+                i.revision += 1;
+            }
+            i.health = "成交费用尚未核实，等待对账；持仓风控继续管理".into();
             drop(i);
             self.event(
                 "warn",
                 Some(&o.symbol),
-                "费用尚未核实，保留结算状态；手续费必须与合约结算币种一致",
-                json!({"client_id": o.client_id, "settlement_asset": settlement_asset(&o.symbol)}),
+                if budget_wait.is_some() {
+                    "成交费用等待权重额度，保留结算状态并自动核对"
+                } else {
+                    "费用尚未核实，保留结算状态；手续费必须与合约结算币种一致"
+                },
+                json!({"client_id": o.client_id, "settlement_asset": settlement_asset(&o.symbol),
+                    "retry_after_ms": budget_wait.map(|wait| wait.as_millis() as u64)}),
             );
         }
         Ok(())
@@ -1356,10 +1424,14 @@ impl Engine {
                 // take-profit orders until the already queued reconciliation.
                 Ok(false) => degraded = true,
                 Ok(true) => {
-                    if let Err(error) = self.sync_funding().await {
-                        // Keep exits available using recorded funding if only the income endpoint fails.
-                        self.fault("资金费同步失败，持仓风控使用已记录资金费", error)
-                            .await;
+                    match self.sync_funding().await {
+                        Ok(()) => self.inner.lock().await.funding_sync_pending = false,
+                        Err(error) => {
+                            self.inner.lock().await.funding_sync_pending = true;
+                            // Keep exits available using recorded funding if only the income endpoint fails.
+                            self.fault("资金费同步失败，持仓风控使用已记录资金费", error)
+                                .await;
+                        }
                     }
                 }
             }
@@ -1481,7 +1553,7 @@ impl Engine {
     async fn sync_funding(&self) -> Result<()> {
         let cursor = {
             let i = self.inner.lock().await;
-            if now_ms() - i.book.funding_last_poll < 60_000 {
+            if !i.funding_sync_pending && now_ms() - i.book.funding_last_poll < 60_000 {
                 return Ok(());
             }
             i.book.funding_cursor.saturating_sub(5 * 60_000)
@@ -2303,6 +2375,229 @@ mod tests {
             Jev::new().unwrap(),
         )
         .unwrap()
+    }
+    async fn read_budget_engine(
+        report_path: &'static str,
+        used: &'static str,
+    ) -> (
+        Arc<Engine>,
+        Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::Uri};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let limited = Arc::new(AtomicBool::new(true));
+        let report = limited.clone();
+        let app = Router::new().fallback(move |uri: Uri| {
+            let report = report.clone();
+            async move {
+                let value = match uri.path() {
+                    "/fapi/v1/time" => json!({"serverTime": now_ms()}),
+                    "/fapi/v2/account" => json!({"multiAssetsMargin": false, "availableBalance": "1000",
+                        "assets": [{"asset": "USDT", "availableBalance": "1000"}]}),
+                    "/fapi/v1/order" => json!({"symbol":"XUSDT", "clientOrderId":"test-entry", "orderId":42,
+                        "status":"FILLED", "executedQty":"1", "origQty":"1", "avgPrice":"100", "cumQuote":"100"}),
+                    "/fapi/v1/userTrades" => json!([{"id":1, "orderId":42, "qty":"1", "price":"100",
+                        "commission":"0.05", "commissionAsset":"USDT", "realizedPnl":"0", "time":1, "side":"BUY"}]),
+                    _ => json!([]),
+                };
+                let weight = if uri.path() == report_path && report.load(Ordering::SeqCst) { used } else { "0" };
+                ([("x-mbx-used-weight-1m", weight)], Json(value))
+            }
+        });
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Live,
+            Store::open(":memory:", Mode::Live).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        seed(&e).await;
+        {
+            let mut i = e.inner.lock().await;
+            i.book.pool.insert(
+                "XUSDT".into(),
+                PoolCoin {
+                    symbol: "XUSDT".into(),
+                    enabled: true,
+                    config: None,
+                },
+            );
+            i.paused = false;
+            i.account_at = now_ms();
+            i.book.funding_last_poll = now_ms();
+        }
+        e.market_stream.lock().await.connected = true;
+        (e, limited, server)
+    }
+    #[tokio::test]
+    async fn account_budget_wait_blocks_entries_then_recovers_without_changing_scan_intent() {
+        for manual_pause in [false, true] {
+            let (e, limited, server) = read_budget_engine("/fapi/v1/time", "2386").await;
+            e.exchange.sync_time().await.unwrap();
+            let account_at = e.snapshot().await.account_at;
+            e.manage_positions().await.unwrap();
+            e.refresh_market().await.unwrap();
+            {
+                let i = e.inner.lock().await;
+                assert!(!i.paused);
+                assert!(i.account_sync_failed);
+                assert_eq!(i.account_at, account_at);
+                assert!(!i.scan_allowed(Mode::Live, now_ms()));
+                assert!(i.health.contains("权重额度"));
+            }
+            assert!(
+                e.set_running(true)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("账户尚未对账")
+            );
+            if manual_pause {
+                e.set_running(false).await.unwrap();
+            }
+            limited.store(false, std::sync::atomic::Ordering::SeqCst);
+            e.exchange.expire_mock_weight_window().await;
+            e.manage_positions().await.unwrap();
+            let i = e.inner.lock().await;
+            assert!(!i.account_sync_failed);
+            assert_eq!(i.paused, manual_pause);
+            assert_eq!(i.scan_allowed(Mode::Live, now_ms()), !manual_pause);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn funding_budget_wait_blocks_entries_until_funding_is_reconciled() {
+        let (e, limited, server) = read_budget_engine("/fapi/v2/account", "2155").await;
+        e.inner.lock().await.book.funding_last_poll = 0;
+        e.manage_positions().await.unwrap();
+        e.refresh_market().await.unwrap();
+        {
+            let i = e.inner.lock().await;
+            assert!(!i.paused);
+            assert!(!i.account_sync_failed);
+            assert!(i.funding_sync_pending);
+            assert!(!i.scan_allowed(Mode::Live, now_ms()));
+            assert_eq!(i.book.funding_last_poll, 0);
+        }
+        assert!(e.snapshot().await.entry_data_pending);
+        assert!(
+            e.set_running(true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("费用尚未核实")
+        );
+        limited.store(false, std::sync::atomic::Ordering::SeqCst);
+        e.exchange.expire_mock_weight_window().await;
+        e.manage_positions().await.unwrap();
+        let i = e.inner.lock().await;
+        assert!(!i.paused);
+        assert!(!i.funding_sync_pending);
+        assert!(i.book.funding_last_poll > 0);
+        assert!(i.scan_allowed(Mode::Live, now_ms()));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn fill_budget_wait_preserves_quantity_and_blocks_entries_until_fees_are_confirmed() {
+        let (e, limited, server) = read_budget_engine("/fapi/v1/time", "2399").await;
+        {
+            let mut i = e.inner.lock().await;
+            let o = entry(Action::Long);
+            i.book.pending.insert(o.client_id.clone(), o);
+            e.save(&mut i).unwrap();
+        }
+        let remote: ExchangeOrder = serde_json::from_value(json!({"symbol":"XUSDT", "clientOrderId":"test-entry", "orderId":42,
+            "status":"FILLED", "executedQty":"1", "origQty":"1", "avgPrice":"100", "cumQuote":"100"})).unwrap();
+        e.exchange.sync_time().await.unwrap();
+        e.apply_order(remote).await.unwrap();
+        {
+            let i = e.inner.lock().await;
+            assert!(!i.paused);
+            assert_eq!(i.book.pending["test-entry"].status, "SETTLING");
+            assert_eq!(i.book.positions["XUSDT"].quantity, Decimal::ONE);
+            assert_eq!(i.book.positions["XUSDT"].entry_price, d("100"));
+            assert!(!i.book.positions["XUSDT"].accounting_complete);
+            assert!(!i.scan_allowed(Mode::Live, now_ms()));
+        }
+        limited.store(false, std::sync::atomic::Ordering::SeqCst);
+        e.exchange.expire_mock_weight_window().await;
+        e.reconcile_pending().await.unwrap();
+        let i = e.inner.lock().await;
+        assert!(!i.paused);
+        assert!(i.book.pending.is_empty());
+        assert_eq!(i.book.positions["XUSDT"].quantity, Decimal::ONE);
+        assert_eq!(i.book.positions["XUSDT"].entry_fee, d("0.05"));
+        assert!(i.book.positions["XUSDT"].accounting_complete);
+        assert!(i.scan_allowed(Mode::Live, now_ms()));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn order_without_price_fields_uses_confirmed_fills_and_never_resubmits() {
+        use axum::{Json, Router, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let count = submissions.clone();
+        let filled = Arc::new(Mutex::new(false));
+        let state = filled.clone();
+        let response = || {
+            json!({"symbol":"XUSDT", "clientOrderId":"test-entry", "orderId":42,
+            "status":"FILLED", "executedQty":"1", "origQty":"1", "cumQty":"1"})
+        };
+        let app = Router::new()
+            .route("/fapi/v1/order", get(move || async move { Json(response()) }).post(move || {
+                let count = count.clone(); async move { count.fetch_add(1, Ordering::SeqCst); Json(response()) }
+            }))
+            .route("/fapi/v1/userTrades", get(move || { let state = state.clone(); async move {
+                Json(if *state.lock().await {
+                    json!([{"id":1,"orderId":42,"qty":"0.4","price":"100","commission":"0.02","commissionAsset":"USDT","realizedPnl":"0","time":1,"side":"BUY"},
+                        {"id":2,"orderId":42,"qty":"0.6","price":"101","commission":"0.03","commissionAsset":"USDT","realizedPnl":"0","time":1,"side":"BUY"}])
+                } else { json!([]) })
+            }}));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Live,
+            Store::open(":memory:", Mode::Live).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        let o = entry(Action::Long);
+        {
+            let mut i = e.inner.lock().await;
+            i.paused = false;
+            i.book.pending.insert(o.client_id.clone(), o.clone());
+            e.save(&mut i).unwrap();
+        }
+        // No price is fabricated when the response and fills cannot establish one.
+        assert!(
+            e.submit_order(o)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("成交均价尚未确认")
+        );
+        assert!(e.snapshot().await.positions.is_empty());
+        assert_eq!(
+            e.store.load().unwrap().unwrap().1.pending["test-entry"].status,
+            "SUBMITTING"
+        );
+        *filled.lock().await = true;
+        e.reconcile_pending().await.unwrap();
+        e.reconcile_pending().await.unwrap();
+        let i = e.inner.lock().await;
+        assert!(!i.paused);
+        assert!(i.book.pending.is_empty());
+        assert_eq!(i.book.positions["XUSDT"].quantity, Decimal::ONE);
+        assert_eq!(i.book.positions["XUSDT"].entry_price, d("100.6"));
+        assert_eq!(i.book.positions["XUSDT"].entry_fee, d("0.05"));
+        assert_eq!(i.book.positions["XUSDT"].observed_trade_ids.len(), 2);
+        assert!(i.book.positions["XUSDT"].accounting_complete);
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        server.abort();
     }
     #[tokio::test]
     async fn pending_queries_overlap_but_reports_apply_in_order_and_failed_orders_stay_locked() {
