@@ -161,6 +161,15 @@ test('monitoring handles absent metrics and paper mode without misleading values
   assert.match(h.element('monitor-freshness').textContent,/尚未同步/);
 });
 
+test('partial orders display the fee blocker and clear it after reconciliation',async()=>{
+  const h=await dashboard();
+  h.run("state={open_orders:[{symbol:'WLDUSDC',client_id:'test-order',role:'take_profit',status:'PARTIALLY_FILLED',order_side:'SELL',price:'101',quantity:'1',remaining_quantity:'0.6',accounted_quantity:'0.4',created_at:1,settlement_issue:'成交明细查询失败：<unsafe>'}]};renderOrders();");
+  assert.match(h.element('pending-body').innerHTML,/部分成交/);
+  assert.match(h.element('pending-body').innerHTML,/费用核对：成交明细查询失败：&lt;unsafe&gt;/);
+  h.run('state.open_orders[0].settlement_issue=null;renderOrders();');
+  assert.doesNotMatch(h.element('pending-body').innerHTML,/费用核对：/);
+});
+
 test('monitoring shows public market subscriptions and unsaved cooldowns',async()=>{
   const h=await dashboard();
   h.run("state={mode:'paper',paused:true,market_at:Date.now(),market_stream:{connected:true,subscriptions:3,last_error:null},exchange_rate_limit:{weight_limit:2400,estimated_used_weight:0,cooldown_remaining_ms:60000,cooldown_persistence_pending:true}};renderMonitoring();");

@@ -2,7 +2,7 @@ use crate::{
     config::*,
     domain::*,
     exchange::{
-        AccountInfo, Binance, ExchangeError, ExchangeOrder, MarginBalances, RateLimitSnapshot,
+        AccountInfo, Binance, ExchangeError, ExchangeOrder, Fill, MarginBalances, RateLimitSnapshot,
     },
     jev::Jev,
     market_stream::MarketStreamStatus,
@@ -64,6 +64,7 @@ pub struct Inner {
     pub account_sync_failed: bool,
     pub account_update_pending: bool,
     pub funding_sync_pending: bool,
+    funding_sync_error: Option<String>,
     account_generation: u64,
     pub available: Decimal,
     realized_net: Decimal,
@@ -91,6 +92,7 @@ pub struct Snapshot {
     pub account_update_pending: bool,
     pub funding_sync_pending: bool,
     pub entry_data_pending: bool,
+    pub entry_blockers: Vec<String>,
     pub available_usdt: Decimal,
     pub margin_balances: Option<MarginBalances>,
     pub account_assets: Option<AccountInfo>,
@@ -165,7 +167,50 @@ impl Inner {
     fn entry_data_ready(&self) -> bool {
         !self.funding_sync_pending
             && self.book.positions.values().all(|p| p.accounting_complete)
-            && self.book.pending.values().all(|o| o.status != "SETTLING")
+            && self
+                .book
+                .pending
+                .values()
+                .all(|o| o.status != "SETTLING" && o.settlement_issue.is_none())
+    }
+    fn entry_blockers(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.funding_sync_pending {
+            reasons.push(format!(
+                "资金费同步未完成：{}",
+                self.funding_sync_error.as_deref().unwrap_or("等待重试")
+            ));
+        }
+        for order in self.book.pending.values() {
+            if order.settlement_issue.is_some() || order.status == "SETTLING" {
+                reasons.push(format!(
+                    "{} 成交费用尚未核实（{}）：{}",
+                    order.symbol,
+                    order.client_id,
+                    order
+                        .settlement_issue
+                        .as_deref()
+                        .unwrap_or("等待重新查询成交明细")
+                ));
+            }
+        }
+        for position in self
+            .book
+            .positions
+            .values()
+            .filter(|p| !p.accounting_complete)
+        {
+            if !self.book.pending.values().any(|o| {
+                o.symbol == position.symbol
+                    && (o.settlement_issue.is_some() || o.status == "SETTLING")
+            }) {
+                reasons.push(format!(
+                    "{} 成交费用尚未核实，等待重新查询成交明细",
+                    position.symbol
+                ));
+            }
+        }
+        reasons
     }
     fn scan_ready(&self, coin: &PoolCoin, now: i64) -> bool {
         let bar = now / BAR_MS * BAR_MS - 1;
@@ -303,6 +348,22 @@ impl Engine {
             // An unsent paper intent has no exchange side effect. Never open it after restart.
             book.pending
                 .retain(|_, o| o.role != OrderRole::Entry || o.status != "SUBMITTING");
+        } else {
+            // Older books have only the position-level flag. Preserve its uncertainty
+            // on each affected order so unchanged partial fills are queried again.
+            for order in book.pending.values_mut() {
+                if order.settlement_issue.is_none()
+                    && (order.status == "SETTLING"
+                        || order.accounted_quantity > Decimal::ZERO
+                            && book
+                                .positions
+                                .get(&order.symbol)
+                                .is_some_and(|p| !p.accounting_complete))
+                {
+                    order.settlement_issue =
+                        Some("历史成交费用尚未核实，等待重新查询成交明细".into());
+                }
+            }
         }
         let realized_net = store.save(mode, &config, &book)?;
         let available = if mode == Mode::Paper {
@@ -342,6 +403,7 @@ impl Engine {
                 account_sync_failed: false,
                 account_update_pending: false,
                 funding_sync_pending: false,
+                funding_sync_error: None,
                 account_generation: 0,
                 available,
                 realized_net,
@@ -420,6 +482,7 @@ impl Engine {
             account_update_pending: i.account_update_pending,
             funding_sync_pending: i.funding_sync_pending,
             entry_data_pending: !i.entry_data_ready(),
+            entry_blockers: i.entry_blockers(),
             available_usdt: i.available,
             margin_balances: i.margin_balances.clone(),
             account_assets: if self.mode == Mode::Paper {
@@ -520,7 +583,8 @@ impl Engine {
         if run {
             ensure!(
                 i.entry_data_ready(),
-                "资金费或成交费用尚未核实，等待同步完成"
+                "资金费或成交费用尚未核实：{}",
+                i.entry_blockers().join("；")
             );
             ensure!(
                 self.mode == Mode::Paper || self.exchange.configured(),
@@ -1055,6 +1119,7 @@ impl Engine {
                 taker_fee,
                 status: "SUBMITTING".into(),
                 accounted_quantity: Decimal::ZERO,
+                settlement_issue: None,
                 leverage: c.leverage,
             };
             i.book
@@ -1149,14 +1214,16 @@ impl Engine {
         }
     }
     async fn apply_order(&self, remote: ExchangeOrder) -> Result<()> {
-        let pending = self
-            .inner
-            .lock()
-            .await
-            .book
-            .pending
-            .get(&remote.client_order_id)
-            .cloned();
+        let (pending, legacy_unsettled) = {
+            let i = self.inner.lock().await;
+            (
+                i.book.pending.get(&remote.client_order_id).cloned(),
+                i.book
+                    .positions
+                    .get(&remote.symbol)
+                    .is_some_and(|p| !p.accounting_complete),
+            )
+        };
         let Some(o) = pending else {
             return Ok(());
         };
@@ -1170,11 +1237,17 @@ impl Engine {
             "订单回报与已持久化委托不一致"
         );
         let fetch = remote.executed_qty > o.accounted_quantity
-            || remote.terminal() && remote.executed_qty > Decimal::ZERO;
+            || remote.executed_qty > Decimal::ZERO
+                && (remote.terminal() || o.settlement_issue.is_some() || legacy_unsettled);
         let fills = if fetch {
             Some(self.exchange.fills(&o.symbol, remote.order_id).await)
         } else {
             None
+        };
+        let (settlement_issue, incomplete_fills) = match &fills {
+            Some(Ok(fills)) => fill_settlement_issue(fills, &remote, &o),
+            Some(Err(error)) => (Some(format!("成交明细查询失败：{error}")), false),
+            None => (None, false),
         };
         let mut i = self.inner.lock().await;
         let Some(current) = i.book.pending.get(&o.client_id).cloned() else {
@@ -1203,15 +1276,23 @@ impl Engine {
                         && f.price > Decimal::ZERO
                 })
                 && fills.iter().map(|f| f.qty).sum::<Decimal>() == remote.executed_qty
+                && fills.iter().map(|f| f.id).collect::<BTreeSet<_>>().len() == fills.len()
             {
                 fills.iter().map(|f| f.qty * f.price).sum::<Decimal>() / remote.executed_qty
             } else {
                 // Never fabricate a zero/limit/market quote as the execution price.
                 // The persisted intent stays locked and is queried on the next cycle.
-                return Err(match fills {
+                let error = match fills {
                     Some(Err(error)) => error.context("成交均价尚未确认，保留订单等待查询"),
                     _ => anyhow::anyhow!("成交均价尚未确认，保留订单等待查询"),
-                });
+                };
+                i.book
+                    .pending
+                    .get_mut(&o.client_id)
+                    .unwrap()
+                    .settlement_issue = Some(error.to_string());
+                self.save(&mut i)?;
+                return Err(error);
             };
             let p = i
                 .book
@@ -1261,11 +1342,7 @@ impl Engine {
         }
         let mut settled = remote.executed_qty == Decimal::ZERO;
         if let Some(Ok(fills)) = &fills
-            && fills.iter().all(|f| {
-                Some(f.commission_asset.as_str()) == settlement_asset(&o.symbol)
-                    && f.order_id == remote.order_id
-            })
-            && fills.iter().map(|f| f.qty).sum::<Decimal>() == remote.executed_qty
+            && settlement_issue.is_none()
         {
             if let Some(p) = i.book.positions.get_mut(&o.symbol) {
                 if o.role == OrderRole::Entry {
@@ -1280,12 +1357,12 @@ impl Engine {
                         p.observed_trade_ids.push(f.id);
                     }
                 }
-                p.accounting_complete = true;
             }
             settled = true;
         }
         if let Some(order) = i.book.pending.get_mut(&o.client_id) {
             order.accounted_quantity = order.accounted_quantity.max(remote.executed_qty);
+            order.settlement_issue = settlement_issue.clone();
             order.status = if remote.terminal() && !settled {
                 "SETTLING".into()
             } else {
@@ -1301,6 +1378,14 @@ impl Engine {
                 p.tp_price = None;
             }
         }
+        // A successful read for one order must not clear another order's fee wait.
+        let symbol_unsettled = i.book.pending.values().any(|order| {
+            order.symbol == o.symbol
+                && (order.status == "SETTLING" || order.settlement_issue.is_some())
+        });
+        if fetch && let Some(position) = i.book.positions.get_mut(&o.symbol) {
+            position.accounting_complete = settled && !symbol_unsettled;
+        }
         self.save(&mut i)?;
         drop(i);
         if fetch && !settled {
@@ -1312,21 +1397,36 @@ impl Engine {
                 })
             });
             let mut i = self.inner.lock().await;
-            if budget_wait.is_none() {
+            if budget_wait.is_none() && !incomplete_fills {
                 i.paused = true;
                 i.revision += 1;
             }
-            i.health = "成交费用尚未核实，等待对账；持仓风控继续管理".into();
+            i.health = format!(
+                "{} 成交费用尚未核实：{}",
+                o.symbol,
+                settlement_issue.as_deref().unwrap_or("等待重新查询")
+            );
             drop(i);
             self.event(
                 "warn",
                 Some(&o.symbol),
                 if budget_wait.is_some() {
                     "成交费用等待权重额度，保留结算状态并自动核对"
+                } else if incomplete_fills {
+                    "成交明细尚未完整，保留委托并自动重查"
                 } else {
-                    "费用尚未核实，保留结算状态；手续费必须与合约结算币种一致"
+                    "成交费用尚未核实，保留委托并自动重查"
                 },
-                json!({"client_id": o.client_id, "settlement_asset": settlement_asset(&o.symbol),
+                json!({"client_id": o.client_id, "order_id":remote.order_id, "status":remote.status,
+                    "settlement_asset": settlement_asset(&o.symbol), "reason":settlement_issue,
+                    "executed_quantity":remote.executed_qty,
+                    "fills_count": fills.as_ref().and_then(|r|r.as_ref().ok()).map(Vec::len),
+                    "fills_quantity": fills.as_ref().and_then(|r|r.as_ref().ok()).map(|f|f.iter().map(|f|f.qty).sum::<Decimal>()),
+                    "commission_by_asset":fills.as_ref().and_then(|r|r.as_ref().ok()).map(|fills| {
+                        let mut fees = BTreeMap::<String, Decimal>::new();
+                        for fill in fills { *fees.entry(fill.commission_asset.clone()).or_default() += fill.commission; }
+                        fees
+                    }),
                     "retry_after_ms": budget_wait.map(|wait| wait.as_millis() as u64)}),
             );
         }
@@ -1425,9 +1525,17 @@ impl Engine {
                 Ok(false) => degraded = true,
                 Ok(true) => {
                     match self.sync_funding().await {
-                        Ok(()) => self.inner.lock().await.funding_sync_pending = false,
+                        Ok(()) => {
+                            let mut i = self.inner.lock().await;
+                            i.funding_sync_pending = false;
+                            i.funding_sync_error = None;
+                        }
                         Err(error) => {
-                            self.inner.lock().await.funding_sync_pending = true;
+                            {
+                                let mut i = self.inner.lock().await;
+                                i.funding_sync_pending = true;
+                                i.funding_sync_error = Some(error.to_string());
+                            }
                             // Keep exits available using recorded funding if only the income endpoint fails.
                             self.fault("资金费同步失败，持仓风控使用已记录资金费", error)
                                 .await;
@@ -1769,6 +1877,7 @@ impl Engine {
                 }
                 .into(),
                 accounted_quantity: Decimal::ZERO,
+                settlement_issue: None,
                 leverage: p.leverage,
             };
             let p = i.book.positions.get_mut(symbol).unwrap();
@@ -2166,6 +2275,7 @@ impl Engine {
                     taker_fee,
                     status: "SUBMITTING".into(),
                     accounted_quantity: Decimal::ZERO,
+                    settlement_issue: None,
                     leverage: p.leverage,
                 };
                 i.book.pending.insert(o.client_id.clone(), o.clone());
@@ -2210,6 +2320,52 @@ impl std::fmt::Display for EntryQuoteError {
     }
 }
 impl std::error::Error for EntryQuoteError {}
+fn fill_settlement_issue(
+    fills: &[Fill],
+    remote: &ExchangeOrder,
+    order: &PendingOrder,
+) -> (Option<String>, bool) {
+    let mut ids = BTreeSet::new();
+    if fills.iter().any(|fill| {
+        fill.order_id != remote.order_id
+            || fill.qty <= Decimal::ZERO
+            || fill.price <= Decimal::ZERO
+            || !ids.insert(fill.id)
+    }) {
+        return (
+            Some("成交明细的订单、数量、价格或成交标识不一致".into()),
+            false,
+        );
+    }
+    let quantity: Decimal = fills.iter().map(|fill| fill.qty).sum();
+    if quantity != remote.executed_qty {
+        return (
+            Some(format!(
+                "成交明细数量未匹配：已查询 {quantity}，订单已成交 {}",
+                remote.executed_qty
+            )),
+            quantity < remote.executed_qty,
+        );
+    }
+    let Some(asset) = settlement_asset(&order.symbol) else {
+        return (Some("合约结算币种不支持".into()), false);
+    };
+    let foreign: BTreeSet<_> = fills
+        .iter()
+        .filter(|fill| fill.commission != Decimal::ZERO && fill.commission_asset != asset)
+        .map(|fill| fill.commission_asset.as_str())
+        .collect();
+    if !foreign.is_empty() {
+        return (
+            Some(format!(
+                "非零手续费币种无法按 {asset} 记账：实际 {}",
+                foreign.into_iter().collect::<Vec<_>>().join("、")
+            )),
+            false,
+        );
+    }
+    (None, false)
+}
 fn ensure_entry_quote(quote: &Quote, max_spread_bps: Decimal, now: i64) -> Result<()> {
     let quote_age_ms = now - quote.time;
     let spread_bps = quote.spread_bps();
@@ -3561,6 +3717,7 @@ mod tests {
             taker_fee: d("0.0005"),
             status: "SUBMITTING".into(),
             accounted_quantity: Decimal::ZERO,
+            settlement_issue: None,
             leverage: 2,
         }
     }
@@ -4822,6 +4979,171 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn partial_fill_retries_missing_fees_without_further_execution() {
+        use axum::{Json, Router, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let queries = Arc::new(AtomicUsize::new(0));
+        let count = queries.clone();
+        let app = Router::new().route(
+            "/fapi/v1/userTrades",
+            get(move || {
+                let count = count.clone();
+                async move {
+                    Json(if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        json!([])
+                    } else {
+                        json!([{"id":1,"orderId":42,"qty":"0.4","price":"101","commission":"0.02",
+                        "commissionAsset":"USDT","realizedPnl":"0.4","time":1,"side":"SELL"}])
+                    })
+                }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Testnet,
+            Store::open(":memory:", Mode::Testnet).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        seed(&e).await;
+        e.paper_entry(entry(Action::Long)).await.unwrap();
+        {
+            let mut i = e.inner.lock().await;
+            let mut o = entry(Action::Long);
+            o.client_id = "test-tp".into();
+            o.role = OrderRole::TakeProfit;
+            o.price = Some(d("101"));
+            i.book.pending.insert(o.client_id.clone(), o);
+            i.paused = false;
+        }
+        let remote: ExchangeOrder = serde_json::from_value(json!({"symbol":"XUSDT","clientOrderId":"test-tp",
+            "orderId":42,"status":"PARTIALLY_FILLED","executedQty":"0.4","origQty":"1","avgPrice":"101","cumQuote":"40.4"})).unwrap();
+        e.apply_order(remote.clone()).await.unwrap();
+        assert!(!e.inner.lock().await.entry_data_ready());
+        assert!(!e.snapshot().await.paused);
+        let error = e.set_running(true).await.unwrap_err().to_string();
+        assert!(error.contains("XUSDT"));
+        assert!(error.contains("已查询 0，订单已成交 0.4"));
+        // The same cumulative quantity must still retry the unconfirmed fee read.
+        e.apply_order(remote.clone()).await.unwrap();
+        e.apply_order(remote).await.unwrap();
+        let i = e.inner.lock().await;
+        assert_eq!(i.book.positions["XUSDT"].quantity, d("0.6"));
+        assert_eq!(i.book.positions["XUSDT"].exit_fee, d("0.02"));
+        assert_eq!(i.book.positions["XUSDT"].realized_gross, d("0.4"));
+        assert!(i.book.positions["XUSDT"].accounting_complete);
+        assert!(i.entry_data_ready());
+        assert!(!i.paused);
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn legacy_partial_fee_wait_recovers_after_restart_without_new_fills() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new().route(
+            "/fapi/v1/userTrades",
+            get(|| async {
+                Json(
+                    json!([{"id":1,"orderId":42,"qty":"0.4","price":"101","commission":"0.02",
+                "commissionAsset":"USDT","realizedPnl":"0.4","time":1,"side":"SELL"}]),
+                )
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let old = paper();
+        seed(&old).await;
+        old.paper_entry(entry(Action::Long)).await.unwrap();
+        let (config, mut book) = old.store.load().unwrap().unwrap();
+        let position = book.positions.get_mut("XUSDT").unwrap();
+        position.quantity = d("0.6");
+        position.accounting_complete = false;
+        let mut order = entry(Action::Long);
+        order.client_id = "test-tp".into();
+        order.role = OrderRole::TakeProfit;
+        order.status = "PARTIALLY_FILLED".into();
+        order.accounted_quantity = d("0.4");
+        let value = serde_json::to_value(&order).unwrap();
+        assert!(value.get("settlement_issue").is_none()); // Old schema remains readable.
+        book.pending.insert(
+            order.client_id.clone(),
+            serde_json::from_value(value).unwrap(),
+        );
+        let store = Store::open(":memory:", Mode::Testnet).unwrap();
+        store.save(Mode::Testnet, &config, &book).unwrap();
+        let e = Engine::new(
+            Mode::Testnet,
+            store,
+            config,
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        assert!(e.snapshot().await.pending[0].settlement_issue.is_some());
+        let remote: ExchangeOrder = serde_json::from_value(json!({"symbol":"XUSDT","clientOrderId":"test-tp",
+            "orderId":42,"status":"PARTIALLY_FILLED","executedQty":"0.4","origQty":"1","avgPrice":"101","cumQuote":"40.4"})).unwrap();
+        e.apply_order(remote).await.unwrap();
+        let i = e.inner.lock().await;
+        assert!(i.paused); // A restart does not start trading by itself.
+        assert!(i.entry_data_ready());
+        assert_eq!(i.book.positions["XUSDT"].quantity, d("0.6"));
+        assert_eq!(i.book.positions["XUSDT"].exit_fee, d("0.02"));
+        assert!(i.book.pending["test-tp"].settlement_issue.is_none());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn settling_one_order_keeps_other_orders_fees_pending() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        let app = Router::new().route("/fapi/v1/userTrades", get(|Query(query): Query<BTreeMap<String,String>>| async move {
+            let first = query["orderId"] == "42";
+            Json(json!([{"id":if first {1} else {2},"orderId":if first {42} else {43},
+                "qty":if first {"0.2"} else {"0.3"},"price":"101","commission":if first {"0.01"} else {"0.02"},
+                "commissionAsset":"USDT","realizedPnl":if first {"0.2"} else {"0.3"},"time":1,"side":"SELL"}]))
+        }));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Testnet,
+            Store::open(":memory:", Mode::Testnet).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        seed(&e).await;
+        e.paper_entry(entry(Action::Long)).await.unwrap();
+        {
+            let mut i = e.inner.lock().await;
+            let position = i.book.positions.get_mut("XUSDT").unwrap();
+            position.quantity = d("0.5");
+            position.accounting_complete = false;
+            for (id, quantity) in [("tp-1", "0.2"), ("tp-2", "0.3")] {
+                let mut order = entry(Action::Long);
+                order.client_id = id.into();
+                order.role = OrderRole::TakeProfit;
+                order.quantity = d(quantity);
+                order.accounted_quantity = d(quantity);
+                order.status = "SETTLING".into();
+                order.settlement_issue = Some("成交明细查询失败".into());
+                i.book.pending.insert(order.client_id.clone(), order);
+            }
+        }
+        for (id, order_id, quantity) in [("tp-1", 42, "0.2"), ("tp-2", 43, "0.3")] {
+            let remote: ExchangeOrder = serde_json::from_value(json!({"symbol":"XUSDT","clientOrderId":id,
+                "orderId":order_id,"status":"FILLED","executedQty":quantity,"origQty":quantity,"avgPrice":"101","cumQuote":"1"})).unwrap();
+            e.apply_order(remote.clone()).await.unwrap();
+            e.apply_order(remote).await.unwrap();
+            let i = e.inner.lock().await;
+            assert_eq!(i.entry_data_ready(), id == "tp-2");
+            assert_eq!(i.book.positions["XUSDT"].accounting_complete, id == "tp-2");
+        }
+        let i = e.inner.lock().await;
+        assert_eq!(i.book.positions["XUSDT"].quantity, d("0.5"));
+        assert_eq!(i.book.positions["XUSDT"].exit_fee, d("0.03"));
+        assert_eq!(i.book.positions["XUSDT"].realized_gross, d("0.5"));
+        server.abort();
+    }
+    #[tokio::test]
     async fn mismatched_commission_blocks_settlement_and_new_entries() {
         use axum::{Json, Router, routing::get};
         for (symbol, commission_asset) in [
@@ -4849,11 +5171,62 @@ mod tests {
             }
             let r: ExchangeOrder = serde_json::from_value(json!({"symbol":symbol,"clientOrderId":"test-entry","orderId":42,"status":"FILLED","executedQty":"1","avgPrice":"100","origQty":"1","cumQuote":"100"})).unwrap();
             e.apply_order(r).await.unwrap();
+            let detail = &e.store.events(1).unwrap()[0].detail;
+            assert_eq!(
+                detail["commission_by_asset"][commission_asset],
+                json!("0.001")
+            );
+            assert_eq!(detail["fills_quantity"], json!("1"));
+            let error = e.set_running(true).await.unwrap_err().to_string();
+            assert!(error.contains(commission_asset));
+            assert!(error.contains(settlement_asset(symbol).unwrap()));
             let i = e.inner.lock().await;
             assert!(i.paused);
             assert_eq!(i.book.pending["test-entry"].status, "SETTLING");
             assert!(!i.book.positions[symbol].accounting_complete);
             assert!(i.occupied(symbol));
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn confirmed_zero_commission_does_not_require_currency_conversion() {
+        use axum::{Json, Router, routing::get};
+        for symbol in ["XUSDT", "XUSDC"] {
+            let app = Router::new().route(
+                "/fapi/v1/userTrades",
+                get(|| async {
+                    Json(
+                        json!([{"id":1,"orderId":42,"qty":"1","price":"100","commission":"0",
+                    "commissionAsset":"BNB","realizedPnl":"0","time":1,"side":"BUY"}]),
+                    )
+                }),
+            );
+            let (base, server) = crate::test_support::mock_server(app).await;
+            let e = Engine::new(
+                Mode::Testnet,
+                Store::open(":memory:", Mode::Testnet).unwrap(),
+                config(),
+                Binance::mock(base),
+                Jev::new().unwrap(),
+            )
+            .unwrap();
+            {
+                let mut i = e.inner.lock().await;
+                let mut order = entry(Action::Long);
+                order.symbol = symbol.into();
+                i.book.pending.insert(order.client_id.clone(), order);
+                i.paused = false;
+            }
+            let remote: ExchangeOrder = serde_json::from_value(json!({"symbol":symbol,"clientOrderId":"test-entry",
+                "orderId":42,"status":"FILLED","executedQty":"1","origQty":"1","avgPrice":"100","cumQuote":"100"})).unwrap();
+            e.apply_order(remote.clone()).await.unwrap();
+            e.apply_order(remote).await.unwrap();
+            let i = e.inner.lock().await;
+            assert!(!i.paused);
+            assert!(i.entry_data_ready());
+            assert!(i.book.pending.is_empty());
+            assert_eq!(i.book.positions[symbol].entry_fee, Decimal::ZERO);
+            assert_eq!(i.book.positions[symbol].quantity, Decimal::ONE);
             server.abort();
         }
     }
@@ -4889,6 +5262,7 @@ mod tests {
             taker_fee: Decimal::ZERO,
             status: "UNKNOWN".into(),
             accounted_quantity: Decimal::ZERO,
+            settlement_issue: None,
             leverage: 2,
         };
         i.book.pending.insert(o.client_id.clone(), o);

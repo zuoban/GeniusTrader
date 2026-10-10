@@ -208,6 +208,8 @@ pub struct PendingOrder {
     pub taker_fee: Decimal,
     pub status: String,
     pub accounted_quantity: Decimal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_issue: Option<String>,
     #[serde(default = "default_leverage")]
     pub leverage: u8,
 }

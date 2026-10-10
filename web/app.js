@@ -113,7 +113,7 @@ function render(){
   auth=s.auth;renderAccess();
   if(!auth.initialized&&!setupPrompted){setupPrompted=true;showAuth();}
   $('mode').textContent={paper:'PAPER · 模拟交易',testnet:'TESTNET · 币安测试网',live:'LIVE · 币安实盘'}[s.mode];
-  $('mode').className='mode'+(s.mode==='live'?' live':'');$('health').textContent=s.health;
+  $('mode').className='mode'+(s.mode==='live'?' live':'');$('health').textContent=s.health+((s.entry_blockers||[]).length?' · 无法启动：'+s.entry_blockers.join('；'):'');
   $('run-btn').textContent=s.paused?'启动开仓扫描 ↗':'暂停新增开仓 Ⅱ';
   renderAssets();renderMonitoring();
   $('realized').textContent=num(s.realized_net);$('realized').className=color(s.realized_net);
@@ -168,7 +168,7 @@ function renderPositions(){
 function renderOrders(){
   const orders=state.open_orders;
   $('order-count').textContent=orders.length;$('orders-empty').hidden=orders.length>0;
-  replaceRegion('pending-body',orders.map(o=>'<article class="order-item"><div class="order-heading"><b>'+esc(o.symbol)+'</b><span class="order-role">'+esc(roleLabel(o.role))+'</span><span class="order-status '+(o.status==='UNKNOWN'?'uncertain':'')+'">'+esc(statusLabel(o.status))+'</span></div><div class="order-values"><span><small>'+(o.order_side==='BUY'?'买入':'卖出')+'价格</small><b>'+(o.price==null?'市价':price(o.price))+'</b></span><span><small>剩余 / 委托数量</small><b>'+price(o.remaining_quantity)+' / '+price(o.quantity)+'</b></span></div><div class="order-meta"><time>'+timestamp(o.created_at)+'</time><span title="已累计核对成交量">已核对 '+price(o.accounted_quantity)+'</span></div><details data-key="'+esc(o.client_id)+'"><summary data-focus-key="order:'+esc(o.client_id)+'">委托标识</summary><code>'+esc(o.client_id)+'</code></details></article>').join(''));
+  replaceRegion('pending-body',orders.map(o=>'<article class="order-item"><div class="order-heading"><b>'+esc(o.symbol)+'</b><span class="order-role">'+esc(roleLabel(o.role))+'</span><span class="order-status '+(o.status==='UNKNOWN'?'uncertain':'')+'">'+esc(statusLabel(o.status))+'</span></div><div class="order-values"><span><small>'+(o.order_side==='BUY'?'买入':'卖出')+'价格</small><b>'+(o.price==null?'市价':price(o.price))+'</b></span><span><small>剩余 / 委托数量</small><b>'+price(o.remaining_quantity)+' / '+price(o.quantity)+'</b></span></div><div class="order-meta"><time>'+timestamp(o.created_at)+'</time><span title="已累计核对成交量">已核对 '+price(o.accounted_quantity)+'</span></div>'+(o.settlement_issue?'<p class="uncertain">费用核对：'+esc(o.settlement_issue)+'</p>':'')+'<details data-key="'+esc(o.client_id)+'"><summary data-focus-key="order:'+esc(o.client_id)+'">委托标识</summary><code>'+esc(o.client_id)+'</code></details></article>').join(''));
 }
 function renderWatchlist(){
   if(!state)return;

@@ -388,6 +388,7 @@ mod tests {
             taker_fee: rust_decimal::Decimal::ZERO,
             status: "UNKNOWN".into(),
             accounted_quantity: rust_decimal::Decimal::ZERO,
+            settlement_issue: None,
             leverage: 2,
         }
     }
@@ -957,6 +958,7 @@ mod tests {
                     taker_fee: rust_decimal::Decimal::ZERO,
                     status: "UNKNOWN".into(),
                     accounted_quantity: rust_decimal::Decimal::ZERO,
+                    settlement_issue: None,
                     leverage: 2,
                 },
             );
