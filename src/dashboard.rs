@@ -16,6 +16,8 @@ pub struct PositionView {
     pub mark_price: Option<Decimal>,
     pub unrealized: Option<Decimal>,
     pub quote_stale: bool,
+    pub stop_trigger_price: Option<Decimal>,
+    pub stop_order_status: Option<String>,
 }
 #[derive(Clone, Serialize)]
 pub struct OrderView {
@@ -23,6 +25,7 @@ pub struct OrderView {
     pub order: PendingOrder,
     pub order_side: &'static str,
     pub remaining_quantity: Decimal,
+    pub trigger_price: Option<Decimal>,
 }
 #[derive(Serialize)]
 pub struct WatchlistCard {
@@ -66,6 +69,16 @@ pub fn build(
                 mark_price,
                 unrealized: mark_price.map(|mark| p.unrealized(mark)),
                 quote_stale: stale(quote),
+                stop_trigger_price: snapshot
+                    .stop_orders
+                    .iter()
+                    .find(|s| s.order.symbol == p.symbol)
+                    .map(|s| s.trigger_price),
+                stop_order_status: snapshot
+                    .stop_orders
+                    .iter()
+                    .find(|s| s.order.symbol == p.symbol)
+                    .map(|s| s.order.status.clone()),
             }
         })
         .collect();
@@ -80,8 +93,15 @@ pub fn build(
                 o.side.exit_side()
             },
             remaining_quantity: (o.quantity - o.accounted_quantity).max(Decimal::ZERO),
+            trigger_price: None,
         })
         .collect();
+    open_orders.extend(snapshot.stop_orders.iter().map(|s| OrderView {
+        order: s.order.clone(),
+        order_side: s.order.side.exit_side(),
+        remaining_quantity: s.order.quantity,
+        trigger_price: Some(s.trigger_price),
+    }));
     open_orders.sort_by_key(|o| {
         (
             std::cmp::Reverse(o.order.created_at),

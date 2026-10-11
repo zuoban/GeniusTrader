@@ -258,6 +258,46 @@ impl ExchangeOrder {
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AlgoOrder {
+    pub algo_id: i64,
+    pub client_algo_id: String,
+    pub symbol: String,
+    pub side: String,
+    pub position_side: String,
+    pub order_type: String,
+    pub quantity: Decimal,
+    pub trigger_price: Decimal,
+    pub algo_status: String,
+    pub working_type: String,
+    pub reduce_only: bool,
+    pub close_position: bool,
+    pub price_protect: bool,
+    #[serde(default, deserialize_with = "optional_order_id")]
+    pub actual_order_id: Option<i64>,
+}
+fn optional_order_id<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<i64>, D::Error> {
+    let v = Value::deserialize(d)?;
+    let id = match v {
+        Value::Null => return Ok(None),
+        Value::String(s) if s.is_empty() || s == "0" => return Ok(None),
+        Value::String(s) => s.parse::<i64>().map_err(serde::de::Error::custom)?,
+        Value::Number(n) => n
+            .as_i64()
+            .ok_or_else(|| serde::de::Error::custom("invalid actualOrderId"))?,
+        _ => return Err(serde::de::Error::custom("invalid actualOrderId")),
+    };
+    if id == 0 {
+        Ok(None)
+    } else if id > 0 {
+        Ok(Some(id))
+    } else {
+        Err(serde::de::Error::custom("invalid actualOrderId"))
+    }
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RemotePosition {
     pub symbol: String,
     pub position_amt: Decimal,
@@ -1116,6 +1156,88 @@ impl Binance {
         )
         .await?;
         Ok(())
+    }
+    pub async fn submit_stop(&self, stop: &StopOrder) -> Result<AlgoOrder> {
+        let o = &stop.order;
+        Ok(serde_json::from_value(
+            self.request(
+                Method::POST,
+                "/fapi/v1/algoOrder",
+                vec![
+                    ("algoType".into(), "CONDITIONAL".into()),
+                    ("symbol".into(), o.symbol.clone()),
+                    ("side".into(), o.side.exit_side().into()),
+                    ("positionSide".into(), "BOTH".into()),
+                    ("type".into(), "STOP_MARKET".into()),
+                    ("quantity".into(), o.quantity.normalize().to_string()),
+                    ("reduceOnly".into(), "true".into()),
+                    (
+                        "triggerPrice".into(),
+                        stop.trigger_price.normalize().to_string(),
+                    ),
+                    ("workingType".into(), "CONTRACT_PRICE".into()),
+                    ("priceProtect".into(), "false".into()),
+                    ("clientAlgoId".into(), o.client_id.clone()),
+                ],
+                true,
+            )
+            .await?,
+        )?)
+    }
+    fn stop_identity(stop: &StopOrder) -> Vec<(String, String)> {
+        if let Some(id) = stop.algo_id {
+            vec![("algoId".into(), id.to_string())]
+        } else {
+            vec![("clientAlgoId".into(), stop.order.client_id.clone())]
+        }
+    }
+    pub async fn stop_order(&self, stop: &StopOrder) -> Result<AlgoOrder> {
+        Ok(serde_json::from_value(
+            self.request(
+                Method::GET,
+                "/fapi/v1/algoOrder",
+                Self::stop_identity(stop),
+                true,
+            )
+            .await?,
+        )?)
+    }
+    pub async fn cancel_stop(&self, stop: &StopOrder) -> Result<()> {
+        let response = self
+            .request(
+                Method::DELETE,
+                "/fapi/v1/algoOrder",
+                Self::stop_identity(stop),
+                true,
+            )
+            .await?;
+        ensure!(
+            response["clientAlgoId"].as_str() == Some(&stop.order.client_id)
+                && stop
+                    .algo_id
+                    .is_none_or(|id| response["algoId"].as_i64() == Some(id))
+                && (response["code"].as_i64() == Some(200)
+                    || response["code"].as_str() == Some("200")),
+            "止损撤单响应未确认"
+        );
+        Ok(())
+    }
+    pub async fn open_stop_orders(&self) -> Result<Vec<AlgoOrder>> {
+        Ok(serde_json::from_value(
+            self.request(Method::GET, "/fapi/v1/openAlgoOrders", vec![], true)
+                .await?,
+        )?)
+    }
+    pub async fn open_stop_orders_for(&self, symbol: &str) -> Result<Vec<AlgoOrder>> {
+        Ok(serde_json::from_value(
+            self.request(
+                Method::GET,
+                "/fapi/v1/openAlgoOrders",
+                vec![("symbol".into(), symbol.into())],
+                true,
+            )
+            .await?,
+        )?)
     }
     pub async fn submit(&self, o: &PendingOrder) -> Result<ExchangeOrder> {
         let exit = o.role != OrderRole::Entry;

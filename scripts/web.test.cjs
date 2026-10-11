@@ -30,6 +30,22 @@ test('account differences identify untracked order IDs and retain older API comp
   assert.match(h.element('reconciliation-note').textContent,/本地 做空 987.3，交易所 已无持仓/);
 });
 
+test('native stop protection shows its trigger and distinguishes confirmation from fee settlement',async()=>{
+  const h=await dashboard();
+  h.run(`state={mode:'live',paused:false,market_at:Date.now(),account_at:Date.now(),positions:[],position_views:[{symbol:'TIAUSDC',side:'LONG',quantity:'1617',entry_price:'0.6179607',opened_at:Date.now(),leverage:10,stop_loss_usdt:'10',stop_order_status:'NEW',stop_trigger_price:'0.6123'}],open_orders:[{symbol:'TIAUSDC',client_id:'gt-sl-test',role:'stop_loss',order_side:'SELL',quantity:'1617',remaining_quantity:'1617',accounted_quantity:'0',status:'UNKNOWN',trigger_price:'0.6123',created_at:Date.now(),settlement_issue:'查询失败 <retry>'}],stop_protection_pending:true};renderPositions();renderOrders();renderMonitoring();`);
+  assert.match(h.element('positions-body').innerHTML,/交易所止损 已挂单 · 触发价 0.6123/);
+  assert.match(h.element('pending-body').innerHTML,/交易所市价止损/);
+  assert.match(h.element('pending-body').innerHTML,/触发价 0.6123/);
+  assert.match(h.element('pending-body').innerHTML,/止损确认：查询失败 &lt;retry&gt;/);
+  assert.doesNotMatch(h.element('pending-body').innerHTML,/费用核对：/);
+  assert.equal(h.element('monitor-state').textContent,'止损保护待确认');
+  h.run(`state.position_views[0].stop_loss_triggered=true;state.position_views[0].stop_order_status=null;renderPositions();`);
+  assert.match(h.element('positions-body').innerHTML,/止损已触发，正在核对平仓/);
+  assert.doesNotMatch(h.element('positions-body').innerHTML,/止损待挂单/);
+  h.run(`state.mode='paper';state.position_views[0].stop_loss_triggered=false;renderPositions();`);
+  assert.match(h.element('positions-body').innerHTML,/本地模拟止损/);
+});
+
 async function dashboard(){
   const elements=new Map(),timers=new Map(),intervals=new Map(),listeners=new Map();
   let timerId=0;

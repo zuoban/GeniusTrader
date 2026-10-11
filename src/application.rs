@@ -76,7 +76,9 @@ impl Application {
             if mode != settings.mode
                 && (settings.managed_modes.contains(&mode)
                     || store.for_mode(mode).load()?.is_some_and(|(_, book)| {
-                        !book.positions.is_empty() || !book.pending.is_empty()
+                        !book.positions.is_empty()
+                            || !book.pending.is_empty()
+                            || !book.stop_orders.is_empty()
                     }))
             {
                 engines.push(ManagedEngine {
@@ -135,6 +137,7 @@ impl Application {
             let i = managed.engine.inner.lock().await;
             if i.book.positions.is_empty()
                 && i.book.pending.is_empty()
+                && i.book.stop_orders.is_empty()
                 && i.external_positions.is_empty()
                 && i.external_orders.is_empty()
                 && !i.account_sync_failed
@@ -147,7 +150,7 @@ impl Application {
                 configured: managed.engine.mode == Mode::Paper
                     || managed.engine.exchange.configured(),
                 positions: i.book.positions.len(),
-                pending_orders: i.book.pending.len(),
+                pending_orders: i.book.pending.len() + i.book.stop_orders.len(),
                 external_positions: i.external_positions.len(),
                 external_orders: i.external_orders.len(),
                 account_sync_failed: i.account_sync_failed,
@@ -197,6 +200,7 @@ impl Application {
                 ensure!(
                     i.book.positions.is_empty()
                         && i.book.pending.is_empty()
+                        && i.book.stop_orders.is_empty()
                         && i.external_positions.is_empty()
                         && i.external_orders.is_empty(),
                     "{}仍有持仓（{}）、待确认订单（{}）或外部账户差异（{}），暂不能更换该模式的账户密钥；切换交易模式时请保留原账户密钥",
@@ -205,7 +209,7 @@ impl Application {
                         _ => "实盘",
                     },
                     i.book.positions.len(),
-                    i.book.pending.len(),
+                    i.book.pending.len() + i.book.stop_orders.len(),
                     i.external_positions.len() + i.external_orders.len()
                 );
             }
@@ -236,7 +240,9 @@ impl Application {
                 Arc::ptr_eq(&next, &old)
                     || candidate.mode == Mode::Paper
                     || next.exchange.configured()
-                    || (i.book.positions.is_empty() && i.book.pending.is_empty()),
+                    || (i.book.positions.is_empty()
+                        && i.book.pending.is_empty()
+                        && i.book.stop_orders.is_empty()),
                 "该模式有已保存的持仓或订单，请同时填写原账户的 API Key 与 Secret"
             );
         }
@@ -726,7 +732,7 @@ mod tests {
                 }
             }
         }));
-        let (base, server) = crate::test_support::mock_server(router).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(router).await;
         let store = Store::open(":memory:", Mode::Paper).unwrap();
         store.save_settings(&testnet_settings()).unwrap();
         let app = Application::new(store.clone()).unwrap();

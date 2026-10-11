@@ -37,7 +37,7 @@ pub(crate) fn request_cost(
     let single = parameter("symbol").is_some_and(|symbol| !symbol.is_empty());
     let weight = match (method.as_str(), path) {
         ("GET", "/fapi/v1/time" | "/fapi/v1/exchangeInfo") => 1,
-        ("GET", "/fapi/v1/ticker/24hr" | "/fapi/v1/openOrders") => {
+        ("GET", "/fapi/v1/ticker/24hr" | "/fapi/v1/openOrders" | "/fapi/v1/openAlgoOrders") => {
             if single {
                 1
             } else {
@@ -74,10 +74,10 @@ pub(crate) fn request_cost(
         ) => 5,
         ("GET", "/fapi/v1/positionSide/dual" | "/fapi/v1/income") => 30,
         ("GET", "/fapi/v1/commissionRate") => 20,
-        ("POST", "/fapi/v1/order") => 0,
+        ("POST", "/fapi/v1/order" | "/fapi/v1/algoOrder") => 0,
         ("POST" | "PUT", "/fapi/v1/listenKey") => 1,
         ("GET", "/ws") => 0,
-        ("GET" | "DELETE", "/fapi/v1/order")
+        ("GET" | "DELETE", "/fapi/v1/order" | "/fapi/v1/algoOrder")
         | ("POST", "/fapi/v1/leverage" | "/fapi/v1/positionSide/dual") => 1,
         _ => 40, // Conservative fallback for any future, unmapped endpoint.
     };
@@ -90,13 +90,15 @@ pub(crate) fn request_cost(
                 | "/fapi/v3/balance"
                 | "/fapi/v3/positionRisk"
                 | "/fapi/v1/openOrders"
+                | "/fapi/v1/openAlgoOrders"
+                | "/fapi/v1/algoOrder"
                 | "/fapi/v1/order"
                 | "/fapi/v1/userTrades"
-        ) | ("DELETE", "/fapi/v1/order")
+        ) | ("DELETE", "/fapi/v1/order" | "/fapi/v1/algoOrder")
             | ("GET", "/ws")
             | ("POST" | "PUT", "/fapi/v1/listenKey")
     ) || (method == Method::POST
-        && path == "/fapi/v1/order"
+        && matches!(path, "/fapi/v1/order" | "/fapi/v1/algoOrder")
         && parameter("reduceOnly") == Some("true"));
     RequestCost { weight, protected }
 }
@@ -710,6 +712,31 @@ mod tests {
         );
         assert!(request_cost(&Method::GET, "/fapi/v1/order", &[]).protected);
         assert!(request_cost(&Method::DELETE, "/fapi/v1/order", &[]).protected);
+        assert_eq!(
+            request_cost(&Method::GET, "/fapi/v1/openAlgoOrders", &[]).weight,
+            40
+        );
+        assert_eq!(
+            request_cost(
+                &Method::GET,
+                "/fapi/v1/openAlgoOrders",
+                &[("symbol".into(), "TIAUSDC".into())]
+            )
+            .weight,
+            1
+        );
+        for method in [Method::GET, Method::DELETE] {
+            let cost = request_cost(&method, "/fapi/v1/algoOrder", &[]);
+            assert_eq!(cost.weight, 1);
+            assert!(cost.protected);
+        }
+        let cost = request_cost(
+            &Method::POST,
+            "/fapi/v1/algoOrder",
+            &[("reduceOnly".into(), "true".into())],
+        );
+        assert_eq!(cost.weight, 0);
+        assert!(cost.protected);
         let entry = request_cost(&Method::POST, "/fapi/v1/order", &[]);
         assert_eq!(entry.weight, 0);
         assert!(!entry.protected);

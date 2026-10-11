@@ -2,7 +2,8 @@ use crate::{
     config::*,
     domain::*,
     exchange::{
-        AccountInfo, Binance, ExchangeError, ExchangeOrder, Fill, MarginBalances, RateLimitSnapshot,
+        AccountInfo, AlgoOrder, Binance, ExchangeError, ExchangeOrder, Fill, MarginBalances,
+        RateLimitSnapshot,
     },
     jev::Jev,
     market_stream::MarketStreamStatus,
@@ -22,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, Notify, RwLock};
+mod protection;
 
 pub struct Engine {
     pub mode: Mode,
@@ -78,6 +80,18 @@ impl From<&ExchangeOrder> for ExternalOrder {
         }
     }
 }
+impl From<&AlgoOrder> for ExternalOrder {
+    fn from(order: &AlgoOrder) -> Self {
+        Self {
+            symbol: order.symbol.clone(),
+            client_id: order.client_algo_id.clone(),
+            order_id: order.algo_id,
+            status: order.algo_status.clone(),
+            quantity: order.quantity,
+            executed_quantity: Decimal::ZERO,
+        }
+    }
+}
 #[derive(Serialize)]
 pub struct AccountDifference {
     pub symbol: String,
@@ -102,6 +116,7 @@ impl Drop for EngineTasks {
     }
 }
 pub struct Inner {
+    mode: Mode,
     pub config: Config,
     pub book: Book,
     pub paused: bool,
@@ -144,6 +159,7 @@ pub struct Snapshot {
     pub account_update_pending: bool,
     pub funding_sync_pending: bool,
     pub entry_data_pending: bool,
+    pub stop_protection_pending: bool,
     pub entry_blockers: Vec<String>,
     pub available_usdt: Decimal,
     pub margin_balances: Option<MarginBalances>,
@@ -154,6 +170,7 @@ pub struct Snapshot {
     pub pool: Vec<PoolCoin>,
     pub positions: Vec<Position>,
     pub pending: Vec<PendingOrder>,
+    pub stop_orders: Vec<StopOrder>,
     pub quotes: BTreeMap<String, Quote>,
     pub decisions: BTreeMap<String, Decision>,
     pub closed_trades: Vec<ClosedTrade>,
@@ -259,6 +276,11 @@ impl Inner {
         self.book.pool.contains_key(symbol)
             || self.book.positions.contains_key(symbol)
             || self.book.pending.values().any(|o| o.symbol == symbol)
+            || self
+                .book
+                .stop_orders
+                .values()
+                .any(|o| o.order.symbol == symbol)
     }
     fn market_symbols(&self) -> BTreeSet<String> {
         self.book
@@ -266,6 +288,7 @@ impl Inner {
             .keys()
             .chain(self.book.positions.keys())
             .chain(self.book.pending.values().map(|o| &o.symbol))
+            .chain(self.book.stop_orders.values().map(|o| &o.order.symbol))
             .cloned()
             .collect()
     }
@@ -305,6 +328,9 @@ impl Inner {
             && self.exposure() < self.config.max_exposure_usdt
     }
     fn entry_data_ready(&self) -> bool {
+        self.settlement_data_ready() && (self.mode == Mode::Paper || self.exchange_stops_ready())
+    }
+    fn settlement_data_ready(&self) -> bool {
         !self.funding_sync_pending
             && self.book.positions.values().all(|p| p.accounting_complete)
             && self
@@ -349,6 +375,9 @@ impl Inner {
                     position.symbol
                 ));
             }
+        }
+        if self.mode != Mode::Paper {
+            reasons.extend(self.exchange_stop_blockers());
         }
         reasons
     }
@@ -420,6 +449,11 @@ impl Inner {
     fn occupied(&self, symbol: &str) -> bool {
         self.book.positions.contains_key(symbol)
             || self.book.pending.values().any(|o| o.symbol == symbol)
+            || self
+                .book
+                .stop_orders
+                .values()
+                .any(|o| o.order.symbol == symbol)
             || self.external_positions.contains_key(symbol)
             || self.external_orders.iter().any(|s| s == symbol)
     }
@@ -533,6 +567,7 @@ impl Engine {
             account_notify: Notify::new(),
             market_stream: Mutex::new(MarketStreamStatus::default()),
             inner: Mutex::new(Inner {
+                mode,
                 config,
                 book,
                 paused: true,
@@ -625,7 +660,8 @@ impl Engine {
             account_sync_failed: i.account_sync_failed,
             account_update_pending: i.account_update_pending,
             funding_sync_pending: i.funding_sync_pending,
-            entry_data_pending: !i.entry_data_ready(),
+            entry_data_pending: !i.settlement_data_ready(),
+            stop_protection_pending: self.mode != Mode::Paper && !i.exchange_stops_ready(),
             entry_blockers: i.entry_blockers(),
             available_usdt: i.available,
             margin_balances: i.margin_balances.clone(),
@@ -648,6 +684,7 @@ impl Engine {
             pool: i.book.pool.values().cloned().collect(),
             positions: i.book.positions.values().cloned().collect(),
             pending: i.book.pending.values().cloned().collect(),
+            stop_orders: i.book.stop_orders.values().cloned().collect(),
             quotes: i.quotes.clone(),
             decisions: i.decisions.clone(),
             closed_trades: i
@@ -727,7 +764,7 @@ impl Engine {
         let mut i = self.inner.lock().await;
         if run {
             ensure!(
-                i.entry_data_ready(),
+                i.settlement_data_ready(),
                 "资金费或成交费用尚未核实：{}",
                 i.entry_blockers().join("；")
             );
@@ -746,6 +783,11 @@ impl Engine {
             ensure!(
                 i.external_positions.is_empty() && i.external_orders.is_empty(),
                 "存在外部持仓或订单，请先处理"
+            );
+            ensure!(
+                self.mode == Mode::Paper || i.exchange_stops_ready(),
+                "交易所止损尚未确认：{}",
+                i.exchange_stop_blockers().join("；")
             );
             ensure!(
                 jev_available,
@@ -867,6 +909,18 @@ impl Engine {
         self.mark_account_pending().await;
         match event {
             UserEvent::Order { order, .. } => {
+                // Triggered algo orders receive a separate regular-order client ID.
+                let resolve_stop = {
+                    let i = self.inner.lock().await;
+                    !i.book.pending.contains_key(&order.client_id)
+                        && i.book
+                            .stop_orders
+                            .values()
+                            .any(|s| s.order.symbol == order.symbol)
+                };
+                if resolve_stop {
+                    self.reconcile_exchange_stops().await?;
+                }
                 let local = self
                     .inner
                     .lock()
@@ -1604,6 +1658,15 @@ impl Engine {
         if remote.executed_qty < o.accounted_quantity {
             return Ok(());
         }
+        ensure!(
+            o.role == OrderRole::Entry
+                || position.is_some()
+                || remote.executed_qty == Decimal::ZERO,
+            "开仓成交记录尚未建立，保留平仓委托等待开仓核对"
+        );
+        // Protect confirmed fills before potentially slow fee/history reads.
+        self.protect_entry_fill(&o, &remote, position.as_ref())
+            .await;
         let fetch = remote.executed_qty > o.accounted_quantity
             || remote.executed_qty > Decimal::ZERO
                 && (remote.terminal()
@@ -1660,6 +1723,11 @@ impl Engine {
             return self.save_if_changed(&mut i, current.exchange_order_id.is_none());
         }
         let delta = (remote.executed_qty - current.accounted_quantity).max(Decimal::ZERO);
+        let native_stop_triggered = i
+            .book
+            .pending
+            .values()
+            .any(|order| order.symbol == o.symbol && order.role == OrderRole::StopLoss);
         if o.role == OrderRole::Entry
             && (delta > Decimal::ZERO || accounting.as_ref().is_some_and(|r| r.is_ok()))
         {
@@ -1706,7 +1774,7 @@ impl Engine {
                     signal_time: o.signal_time,
                     target_profit: o.target_profit,
                     stop_loss_usdt: o.stop_loss_usdt,
-                    stop_loss_triggered: false,
+                    stop_loss_triggered: native_stop_triggered,
                     entry_fee: Decimal::ZERO,
                     exit_fee: Decimal::ZERO,
                     realized_gross: Decimal::ZERO,
@@ -1861,6 +1929,17 @@ impl Engine {
                         fees
                     }),
                     "retry_after_ms": budget_wait.map(|wait| wait.as_millis() as u64)}),
+            );
+        }
+        if self.mode != Mode::Paper
+            && (o.role == OrderRole::Entry || o.role == OrderRole::TakeProfit && !remote.terminal())
+            && let Err(error) = self.ensure_exchange_stop(&o.symbol).await
+        {
+            self.event(
+                "warn",
+                Some(&o.symbol),
+                "交易所止损保护等待",
+                json!({"error":error.to_string()}),
             );
         }
         Ok(())
@@ -2054,6 +2133,7 @@ impl Engine {
             };
             // Persistence/settlement failures still abort this cycle. An account
             // read failure must not prevent confirmation of already sent orders.
+            self.reconcile_exchange_stops().await?;
             self.reconcile_pending().await?;
             let account = match startup {
                 Ok(()) => self.sync_account().await,
@@ -2070,6 +2150,26 @@ impl Engine {
                 // take-profit orders until the already queued reconciliation.
                 Ok(false) => degraded = true,
                 Ok(true) => {
+                    // Restore missing protection before funding endpoints can delay this cycle.
+                    let symbols: Vec<_> = self
+                        .inner
+                        .lock()
+                        .await
+                        .book
+                        .positions
+                        .keys()
+                        .cloned()
+                        .collect();
+                    for symbol in symbols {
+                        if let Err(error) = self.ensure_exchange_stop(&symbol).await {
+                            self.event(
+                                "warn",
+                                Some(&symbol),
+                                "交易所止损保护等待",
+                                json!({"error":error.to_string()}),
+                            );
+                        }
+                    }
                     match self.sync_funding().await {
                         Ok(()) => {
                             let mut i = self.inner.lock().await;
@@ -2092,6 +2192,7 @@ impl Engine {
         }
         if self.mode != Mode::Paper {
             self.cancel_closed_position_orders().await?;
+            self.cleanup_exchange_stops().await?;
         }
         self.finalize_closed().await?;
         let positions = self
@@ -2143,10 +2244,11 @@ impl Engine {
     }
     async fn sync_account(&self) -> Result<bool> {
         let generation = self.inner.lock().await.account_generation;
-        let (mut remote, mut orders, mut balances) = tokio::try_join!(
+        let (mut remote, mut orders, mut balances, mut algos) = tokio::try_join!(
             self.exchange.positions(),
             self.exchange.open_orders(),
             self.exchange.margin_balances(),
+            self.exchange.open_stop_orders(),
         )?;
         ensure!(
             remote.iter().all(|p| p.position_side == "BOTH"),
@@ -2180,11 +2282,13 @@ impl Engine {
             // A fill can land between the order query and the parallel account
             // reads, before its WebSocket event arrives. Confirm our orders and
             // take another full snapshot before latching an account difference.
+            self.reconcile_exchange_stops().await?;
             self.reconcile_pending().await?;
-            (remote, orders, balances) = tokio::try_join!(
+            (remote, orders, balances, algos) = tokio::try_join!(
                 self.exchange.positions(),
                 self.exchange.open_orders(),
                 self.exchange.margin_balances(),
+                self.exchange.open_stop_orders(),
             )?;
             ensure!(
                 remote.iter().all(|p| p.position_side == "BOTH"),
@@ -2208,6 +2312,10 @@ impl Engine {
                             .iter()
                             .filter(|o| o.symbol == p.symbol)
                             .all(|o| i.order_matches(o))
+                        && algos
+                            .iter()
+                            .filter(|o| o.symbol == p.symbol)
+                            .all(|o| i.algo_matches(o))
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -2238,10 +2346,11 @@ impl Engine {
             // History reads can outlive the first account snapshot. Publish a
             // repair only after a second complete read still proves flat, with
             // no newer account push having invalidated either read.
-            (remote, orders, balances) = tokio::try_join!(
+            (remote, orders, balances, algos) = tokio::try_join!(
                 self.exchange.positions(),
                 self.exchange.open_orders(),
                 self.exchange.margin_balances(),
+                self.exchange.open_stop_orders(),
             )?;
         }
         let mut i = self.inner.lock().await;
@@ -2260,6 +2369,9 @@ impl Engine {
                 || orders
                     .iter()
                     .any(|o| o.symbol == previous.symbol && !i.order_matches(o))
+                || algos
+                    .iter()
+                    .any(|o| o.symbol == previous.symbol && !i.algo_matches(o))
             {
                 errors.insert(previous.symbol, "核对期间账户再次变化，等待完整对账".into());
                 continue;
@@ -2318,11 +2430,23 @@ impl Engine {
             .iter()
             .filter(|o| !i.book.pending.contains_key(&o.client_order_id))
             .map(ExternalOrder::from)
+            .chain(
+                algos
+                    .iter()
+                    .filter(|o| !i.algo_matches(o))
+                    .map(ExternalOrder::from),
+            )
             .collect();
         i.external_orders = orders
             .iter()
             .filter(|o| !i.book.pending.contains_key(&o.client_order_id))
             .map(|o| o.symbol.clone())
+            .chain(
+                algos
+                    .iter()
+                    .filter(|o| !i.algo_matches(o))
+                    .map(|o| o.symbol.clone()),
+            )
             .collect();
         i.external_positions = external;
         i.account_reconciliation_errors = errors;
@@ -2482,6 +2606,20 @@ impl Engine {
             };
             if p.quantity <= Decimal::ZERO
                 || !p.stop_loss_triggered && p.stop_loss_usdt == Decimal::ZERO
+            {
+                return Ok(false);
+            }
+            // Confirmed native protection triggers at the exchange without waiting
+            // for this polling loop. Keep local market exits as an unprotected fallback.
+            if self.mode != Mode::Paper
+                && !p.stop_loss_triggered
+                && i.book.stop_orders.values().any(|s| {
+                    s.order.symbol == symbol
+                        && s.position_opened_at == p.opened_at
+                        && s.order.quantity == p.quantity
+                        && s.order.status == "NEW"
+                        && !s.cancel_requested
+                })
             {
                 return Ok(false);
             }
@@ -2796,6 +2934,11 @@ impl Engine {
                 p.quantity == Decimal::ZERO
                     && p.accounting_complete
                     && !i.book.pending.values().any(|o| o.symbol == p.symbol)
+                    && !i
+                        .book
+                        .stop_orders
+                        .values()
+                        .any(|o| o.order.symbol == p.symbol)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -2833,9 +2976,10 @@ impl Engine {
     }
     async fn confirm_exit(&self, symbol: &str) -> Result<ExitConfirmation> {
         let started = Instant::now();
-        let (positions, orders) = tokio::try_join!(
+        let (positions, orders, algos) = tokio::try_join!(
             self.exchange.positions_for(symbol),
             self.exchange.open_orders_for(symbol),
+            self.exchange.open_stop_orders_for(symbol),
         )?;
         let i = self.inner.lock().await;
         ensure!(
@@ -2845,6 +2989,10 @@ impl Engine {
             i.account_difference_reason(symbol)
         );
         let p = i.book.positions.get(symbol).context("持仓不存在")?;
+        ensure!(
+            algos.iter().all(|o| i.algo_matches(o)),
+            "存在未归属条件单，等待完整账户对账"
+        );
         ensure!(positions.len() == 1, "止损持仓数量或持仓模式尚未确认");
         let remote = &positions[0];
         ensure!(
@@ -2934,6 +3082,37 @@ impl Engine {
         } else {
             None
         };
+        if self.mode != Mode::Paper {
+            {
+                let i = self.inner.lock().await;
+                ensure!(
+                    !i.external_positions.contains_key(symbol)
+                        && !i.external_orders.contains(&symbol.to_string()),
+                    "账户差异尚未核对，保留交易所止损保护"
+                );
+                if !independently_checked {
+                    ensure!(
+                        !i.account_sync_failed
+                            && !i.account_update_pending
+                            && (0..15_000).contains(&(now_ms() - i.account_at)),
+                        "账户未对账，保留交易所止损保护"
+                    );
+                }
+            }
+            self.cancel_exchange_stops(symbol).await?;
+            ensure!(
+                !self
+                    .inner
+                    .lock()
+                    .await
+                    .book
+                    .pending
+                    .values()
+                    .any(|o| o.symbol == symbol
+                        && matches!(o.role, OrderRole::StopLoss | OrderRole::ManualClose)),
+                "交易所止损已触发，继续核对原平仓委托"
+            );
+        }
         let cancelled = !pending.is_empty();
         for o in pending {
             if self.mode == Mode::Paper {
@@ -3257,10 +3436,10 @@ fn quote_is_older(quote: &Quote, previous: &Quote) -> bool {
 mod tests {
     use super::*;
     use std::str::FromStr;
-    fn d(s: &str) -> Decimal {
+    pub(super) fn d(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()
     }
-    fn config() -> Config {
+    pub(super) fn config() -> Config {
         Config::default()
     }
     #[test]
@@ -3358,7 +3537,7 @@ mod tests {
                 ([("x-mbx-used-weight-1m", weight)], Json(value))
             }
         });
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Live,
             Store::open(":memory:", Mode::Live).unwrap(),
@@ -3414,7 +3593,7 @@ mod tests {
                         (StatusCode::OK, Json(value))
                     }
                 });
-                let (base, server) = crate::test_support::mock_server(app).await;
+                let (base, server) = crate::test_support::mock_server_with_algos(app).await;
                 let e = Engine::new(
                     Mode::Live,
                     Store::open(":memory:", Mode::Live).unwrap(),
@@ -3564,7 +3743,7 @@ mod tests {
                     "status":"PARTIALLY_FILLED","executedQty":"0.4","origQty":"1","avgPrice":"101"}])) }))
                 .route("/fapi/v2/account", get(|| async { Json(json!({"multiAssetsMargin":false,"availableBalance":"1000",
                     "assets":[{"asset":"USDT","availableBalance":"1000"}]})) }));
-            let (base, server) = crate::test_support::mock_server(app).await;
+            let (base, server) = crate::test_support::mock_server_with_algos(app).await;
             let e = Engine::new(
                 Mode::Live,
                 Store::open(":memory:", Mode::Live).unwrap(),
@@ -3753,7 +3932,7 @@ mod tests {
                         {"id":2,"orderId":42,"qty":"0.6","price":"101","commission":"0.03","commissionAsset":"USDT","realizedPnl":"0","time":1,"side":"BUY"}])
                 } else { json!([]) })
             }}));
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Live,
             Store::open(":memory:", Mode::Live).unwrap(),
@@ -3818,7 +3997,7 @@ mod tests {
                 }
             }
         }));
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Testnet,
             Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -3913,7 +4092,7 @@ mod tests {
                     } else { (StatusCode::OK, Json(json!([]))) }
                 }
             });
-            let (base, server) = crate::test_support::mock_server(app).await;
+            let (base, server) = crate::test_support::mock_server_with_algos(app).await;
             let e = Engine::new(
                 Mode::Testnet,
                 Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -4134,7 +4313,7 @@ mod tests {
                 async move { Json(body.lock().await.clone()) }
             }),
         );
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Paper,
             Store::open(":memory:", Mode::Paper).unwrap(),
@@ -4189,7 +4368,7 @@ mod tests {
                 Json(json!({"symbol":symbol,"bidPrice":"100","askPrice":"101","bidQty":"1","askQty":"1","time":101,"lastUpdateId":11}))
             }
         }));
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Paper,
             Store::open(":memory:", Mode::Paper).unwrap(),
@@ -4282,7 +4461,7 @@ mod tests {
                         }
                     }),
                 );
-            let (base, server) = crate::test_support::mock_server(app).await;
+            let (base, server) = crate::test_support::mock_server_with_algos(app).await;
             let e = Engine::new(
                 mode,
                 Store::open(":memory:", mode).unwrap(),
@@ -4379,7 +4558,7 @@ mod tests {
             "/fapi/v1/ticker/bookTicker",
             get(|| async { (StatusCode::TOO_MANY_REQUESTS, Json(json!({"code": -1003}))) }),
         );
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Paper,
             Store::open(":memory:", Mode::Paper).unwrap(),
@@ -4677,7 +4856,7 @@ mod tests {
                 }
             }),
         );
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Paper,
             Store::open(":memory:", Mode::Paper).unwrap(),
@@ -4746,7 +4925,7 @@ mod tests {
         assert!(e.snapshot().await.pending.is_empty());
         server.abort();
     }
-    fn entry(side: Action) -> PendingOrder {
+    pub(super) fn entry(side: Action) -> PendingOrder {
         PendingOrder {
             client_id: "test-entry".into(),
             exchange_order_id: None,
@@ -4767,7 +4946,7 @@ mod tests {
             leverage: 2,
         }
     }
-    async fn seed(e: &Engine) {
+    pub(super) async fn seed(e: &Engine) {
         let mut i = e.inner.lock().await;
         i.catalog.insert(
             "XUSDT".into(),
@@ -4965,7 +5144,7 @@ mod tests {
                         "commissionAsset":"USDT","realizedPnl":if stop {"-1.2"} else if filled == "1" {"1"} else {"0.4"},
                         "time":1,"side":"SELL"}]))
                 }));
-            let (url, server) = crate::test_support::mock_server(app).await;
+            let (url, server) = crate::test_support::mock_server_with_algos(app).await;
             let e = Engine::new(
                 Mode::Testnet,
                 Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -5246,7 +5425,7 @@ mod tests {
             .route("/fapi/v1/userTrades", get(move || async move { Json(json!([{"id":1,"orderId":42,"qty":"0.4","price":"101",
                 "commission":"0.00808","commissionAsset":if scenario == ExitScenario::UnsettledCancel {"BNB"} else {"USDT"},"realizedPnl":(side.sign() * d("0.4")).to_string(),"time":1,"side":side.exit_side()}])) }))
             .with_state(fixture.clone());
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Testnet,
             fixture.store.clone(),
@@ -5597,7 +5776,7 @@ mod tests {
             }}))
             .route("/fapi/v1/openOrders",get(||async{Json(json!([]))}))
             .route("/fapi/v2/account",get(||async{Json(json!({"multiAssetsMargin":false,"availableBalance":"1000","assets":[{"asset":"USDT","availableBalance":"1000"}]}))}));
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Testnet,
             Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -5691,7 +5870,7 @@ mod tests {
                         "status":"NEW","executedQty":"0","avgPrice":"0","origQty":"1","cumQuote":"0"}))
                 }
             }));
-        let (url, server) = crate::test_support::mock_server(app).await;
+        let (url, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Testnet,
             Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -5976,7 +6155,7 @@ mod tests {
             .route("/fapi/v1/order", get(move || { let v = response.clone(); async move { Json(v) } }).post(submit))
             .route("/fapi/v1/userTrades", get(|| async { Json(json!([{"id": 1, "orderId":42,"qty":"1","price":"100","commission":"0.05","commissionAsset":"USDT","realizedPnl":"0","time":1,"side":"BUY"}])) }))
             .with_state(submissions.clone());
-        let (url, server) = crate::test_support::mock_server(app).await;
+        let (url, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Testnet,
             Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -6041,7 +6220,7 @@ mod tests {
                 .route("/fapi/v1/openOrders", get(|| async { Json(json!([])) }))
                 .route("/fapi/v2/account", get(|| async { Json(json!({"multiAssetsMargin":false,
                     "availableBalance":"1000","assets":[{"asset":"USDC","availableBalance":"1000"}]})) }));
-            let (base, server) = crate::test_support::mock_server(app).await;
+            let (base, server) = crate::test_support::mock_server_with_protection(app).await;
             let (config, book) = legacy_split_book(accounted, original).await;
             let store = Store::open(":memory:", Mode::Live).unwrap();
             store.save(Mode::Live, &config, &book).unwrap();
@@ -6054,6 +6233,7 @@ mod tests {
             )
             .unwrap();
             assert!(!e.inner.lock().await.entry_data_ready());
+            seed_split_market(&e).await;
             e.reconcile_pending().await.unwrap();
             e.reconcile_pending().await.unwrap();
             assert!(e.sync_account().await.unwrap());
@@ -6079,6 +6259,16 @@ mod tests {
             assert!(!e.snapshot().await.paused);
             server.abort();
         }
+    }
+    async fn seed_split_market(e: &Engine) {
+        seed(e).await;
+        let mut i = e.inner.lock().await;
+        let mut rule = i.catalog["XUSDT"].clone();
+        rule.symbol = "WLDUSDC".into();
+        rule.tick_size = d("0.0001");
+        rule.last_price = d("0.5632");
+        rule.min_notional = d("5");
+        i.catalog.insert(rule.symbol.clone(), rule);
     }
     fn split_report(status: &str, executed: &str) -> Value {
         // Binance responses may omit price fields. Full fills are the price proof.
@@ -6138,7 +6328,7 @@ mod tests {
                 }),
             )
             .route("/fapi/v1/income", get(|| async { Json(json!([])) }));
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_protection(app).await;
         let (config, mut book) = legacy_split_book("987.3", "987.3").await;
         for (index, symbol) in ["BTCUSDC", "ETHUSDC", "ENAUSDC"].into_iter().enumerate() {
             let mut order = entry(Action::Long);
@@ -6158,6 +6348,7 @@ mod tests {
             Jev::mock(base),
         )
         .unwrap();
+        seed_split_market(&e).await;
         // The first report needs another REST read for fills. Later buffered
         // queries must keep polling until they release the shared dispatch lock.
         tokio::time::timeout(Duration::from_secs(5), e.manage_positions())
@@ -6222,7 +6413,7 @@ mod tests {
                 "availableBalance":"1000","assets":[{"asset":"USDC","availableBalance":"1000"}]}))
                 }),
             );
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_protection(app).await;
         let (config, book) = legacy_split_book("1775.8", "987.3").await;
         let store = Store::open(":memory:", Mode::Live).unwrap();
         store.save(Mode::Live, &config, &book).unwrap();
@@ -6234,6 +6425,7 @@ mod tests {
             Jev::mock(base),
         )
         .unwrap();
+        seed_split_market(&e).await;
         e.reconcile_pending().await.unwrap();
         let snapshot = e.snapshot().await;
         assert!(snapshot.pending.is_empty(), "{:?}", snapshot.entry_blockers);
@@ -6279,7 +6471,7 @@ mod tests {
                     async move { Json(split_fills(complete.load(Ordering::SeqCst))) }
                 }),
             );
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_protection(app).await;
         let (config, book) = legacy_split_book("1775.8", "987.3").await;
         let store = Store::open(":memory:", Mode::Live).unwrap();
         store.save(Mode::Live, &config, &book).unwrap();
@@ -6291,6 +6483,7 @@ mod tests {
             Jev::new().unwrap(),
         )
         .unwrap();
+        seed_split_market(&e).await;
         e.reconcile_pending().await.unwrap();
         let (_, saved) = store.load().unwrap().unwrap();
         assert_eq!(
@@ -6308,6 +6501,7 @@ mod tests {
             Jev::new().unwrap(),
         )
         .unwrap();
+        seed_split_market(&restored).await;
         restored.reconcile_pending().await.unwrap();
         restored.reconcile_pending().await.unwrap();
         assert_eq!(client_queries.load(Ordering::SeqCst), 1);
@@ -6343,7 +6537,7 @@ mod tests {
                     },
                 ),
             );
-            let (base, server) = crate::test_support::mock_server(app).await;
+            let (base, server) = crate::test_support::mock_server_with_algos(app).await;
             let (config, mut book) = legacy_split_book("1775.8", "987.3").await;
             if scenario == "wrong_id" {
                 book.pending
@@ -6388,7 +6582,7 @@ mod tests {
                 Json(json!({"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}))
             }),
         );
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let (config, book) = legacy_split_book("1775.8", "987.3").await;
         let store = Store::open(":memory:", Mode::Live).unwrap();
         store.save(Mode::Live, &config, &book).unwrap();
@@ -6562,7 +6756,7 @@ mod tests {
                     json!(trades)
                 })
             })).with_state(fixture.clone());
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let (config, mut book) = legacy_split_book("1775.8", "1775.8").await;
         book.pending.clear();
         book.funding_last_poll = now_ms();
@@ -6756,7 +6950,7 @@ mod tests {
                 async move { Json(split_fills(state.load(Ordering::SeqCst))) }
             }),
         );
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Live,
             Store::open(":memory:", Mode::Live).unwrap(),
@@ -6824,7 +7018,7 @@ mod tests {
                     }
                 }),
             );
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_protection(app).await;
         let (config, mut book) = legacy_split_book("1775.8", "987.3").await;
         let p = book.positions.get_mut("WLDUSDC").unwrap();
         p.quantity -= d("100");
@@ -6844,6 +7038,7 @@ mod tests {
         .unwrap();
         let full: ExchangeOrder = serde_json::from_value(split_report("FILLED", "1775.8")).unwrap();
         e.inner.lock().await.paused = false;
+        seed_split_market(&e).await;
         e.apply_order(full.clone()).await.unwrap();
         assert!(!e.inner.lock().await.entry_data_ready());
         assert!(!e.snapshot().await.paused);
@@ -6877,7 +7072,7 @@ mod tests {
                     Json(value)
                 }),
             );
-            let (base, server) = crate::test_support::mock_server(app).await;
+            let (base, server) = crate::test_support::mock_server_with_algos(app).await;
             let (config, book) = legacy_split_book("1775.8", "1775.8").await;
             let store = Store::open(":memory:", Mode::Live).unwrap();
             store.save(Mode::Live, &config, &book).unwrap();
@@ -6912,7 +7107,7 @@ mod tests {
             Json(json!({"symbol":"XUSDT","clientOrderId":query["origClientOrderId"],"orderId":42,
                 "status":"NEW","executedQty":"0","origQty":if query["origClientOrderId"] == "bad" { "2" } else { "1" }}))
         }));
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Live,
             Store::open(":memory:", Mode::Live).unwrap(),
@@ -6963,7 +7158,7 @@ mod tests {
                 }
             }),
         );
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Testnet,
             Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -7016,7 +7211,7 @@ mod tests {
                 )
             }),
         );
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let old = paper();
         seed(&old).await;
         old.paper_entry(entry(Action::Long)).await.unwrap();
@@ -7066,7 +7261,7 @@ mod tests {
                 "qty":if first {"0.2"} else {"0.3"},"price":"101","commission":if first {"0.01"} else {"0.02"},
                 "commissionAsset":"USDT","realizedPnl":if first {"0.2"} else {"0.3"},"time":1,"side":"SELL"}]))
         }));
-        let (base, server) = crate::test_support::mock_server(app).await;
+        let (base, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Testnet,
             Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -7118,7 +7313,7 @@ mod tests {
             ("XUSDC", "BNB"),
         ] {
             let app = Router::new().route("/fapi/v1/userTrades", get(move || async move { Json(json!([{"id": 1, "orderId":42,"qty":"1","price":"100","commission":"0.001","commissionAsset":commission_asset,"realizedPnl":"0","time":1,"side":"BUY"}])) }));
-            let (url, server) = crate::test_support::mock_server(app).await;
+            let (url, server) = crate::test_support::mock_server_with_algos(app).await;
             let e = Engine::new(
                 Mode::Testnet,
                 Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -7166,7 +7361,7 @@ mod tests {
                     )
                 }),
             );
-            let (base, server) = crate::test_support::mock_server(app).await;
+            let (base, server) = crate::test_support::mock_server_with_algos(app).await;
             let e = Engine::new(
                 Mode::Testnet,
                 Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -7331,7 +7526,7 @@ mod tests {
                     }))
                 }),
             );
-        let (url, server) = crate::test_support::mock_server(app).await;
+        let (url, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Testnet,
             Store::open(":memory:", Mode::Testnet).unwrap(),
@@ -7370,7 +7565,7 @@ mod tests {
                 {"tranId":1, "symbol":"XUSDC", "income":"-0.01", "asset":"USDC", "time":now_ms()},
                 {"tranId":2, "symbol":"OTHERBTC", "income":"-1", "asset":"BTC", "time":now_ms()}
             ])) }));
-        let (url, server) = crate::test_support::mock_server(app).await;
+        let (url, server) = crate::test_support::mock_server_with_algos(app).await;
         let e = Engine::new(
             Mode::Testnet,
             Store::open(":memory:", Mode::Testnet).unwrap(),

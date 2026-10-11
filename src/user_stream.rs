@@ -105,7 +105,9 @@ pub(crate) fn parse_event(value: Value) -> Result<UserEvent> {
                 order,
             })
         }
-        Some("ACCOUNT_UPDATE" | "ACCOUNT_CONFIG_UPDATE" | "TRADE_LITE") => Ok(UserEvent::Account),
+        Some("ACCOUNT_UPDATE" | "ACCOUNT_CONFIG_UPDATE" | "TRADE_LITE" | "ALGO_UPDATE") => {
+            Ok(UserEvent::Account)
+        }
         Some("MARGIN_CALL") => Ok(UserEvent::Risk),
         _ => Ok(UserEvent::Other),
     }

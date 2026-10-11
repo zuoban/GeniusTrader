@@ -175,6 +175,35 @@ impl Position {
     pub fn estimated_exit_net(&self, price: Decimal) -> Decimal {
         self.net_realized() + self.unrealized(price) - self.quantity * price * self.taker_fee
     }
+    /// Round toward an earlier trigger so tick precision does not increase the loss budget.
+    pub fn stop_price(&self, tick: Decimal) -> Result<Decimal> {
+        ensure!(
+            self.quantity > Decimal::ZERO
+                && tick > Decimal::ZERO
+                && self.stop_loss_usdt > Decimal::ZERO
+                && self.taker_fee >= Decimal::ZERO
+                && self.taker_fee < Decimal::ONE,
+            "止损数量、金额或费率无效"
+        );
+        let net = self.net_realized();
+        let raw = match self.side {
+            Action::Long => {
+                (self.quantity * self.entry_price - self.stop_loss_usdt - net)
+                    / (self.quantity * (Decimal::ONE - self.taker_fee))
+            }
+            Action::Short => {
+                (self.quantity * self.entry_price + self.stop_loss_usdt + net)
+                    / (self.quantity * (Decimal::ONE + self.taker_fee))
+            }
+            Action::Wait => anyhow::bail!("WAIT is not a position"),
+        };
+        ensure!(raw > Decimal::ZERO, "止损触发价必须大于零");
+        Ok(if self.side == Action::Long {
+            ceil_step(raw, tick)
+        } else {
+            floor_step(raw, tick)
+        })
+    }
 }
 pub fn floor_step(v: Decimal, step: Decimal) -> Decimal {
     (v / step).floor() * step
@@ -215,11 +244,25 @@ pub struct PendingOrder {
     #[serde(default = "default_leverage")]
     pub leverage: u8,
 }
+/// An exchange conditional intent is distinct from the regular order it creates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopOrder {
+    #[serde(flatten)]
+    pub order: PendingOrder,
+    pub algo_id: Option<i64>,
+    pub actual_order_id: Option<i64>,
+    pub trigger_price: Decimal,
+    pub position_opened_at: i64,
+    #[serde(default)]
+    pub cancel_requested: bool,
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Book {
     pub pool: BTreeMap<String, PoolCoin>,
     pub positions: BTreeMap<String, Position>,
     pub pending: BTreeMap<String, PendingOrder>,
+    #[serde(default)]
+    pub stop_orders: BTreeMap<String, StopOrder>,
     pub last_bar: BTreeMap<String, i64>,
     pub cooldown_until: BTreeMap<String, i64>,
     #[serde(default, skip_serializing)]
@@ -340,6 +383,31 @@ mod tests {
             p.funding_cost = d("-0.07");
             assert_eq!(p.estimated_exit_net(price), expected + d("0.14"));
         }
+    }
+    #[test]
+    fn stop_prices_cover_net_costs_and_round_toward_earlier_triggers() {
+        for side in [Action::Long, Action::Short] {
+            let mut p = position(side);
+            p.stop_loss_usdt = d("10");
+            p.quantity = d("0.4");
+            p.realized_gross = d("0.3");
+            p.exit_fee = d("0.012");
+            for funding in [d("0.07"), d("-0.07")] {
+                p.funding_cost = funding;
+                let price = p.stop_price(d("0.01")).unwrap();
+                assert!(p.estimated_exit_net(price) >= -p.stop_loss_usdt);
+                let next_tick = price - side.sign() * d("0.01");
+                assert!(p.estimated_exit_net(next_tick) < -p.stop_loss_usdt);
+            }
+        }
+        let mut p = position(Action::Long);
+        p.symbol = "TIAUSDC".into();
+        p.quantity = d("1617");
+        p.entry_price = d("0.6179607");
+        p.entry_fee = d("0.39969698076");
+        p.taker_fee = d("0.0004");
+        p.stop_loss_usdt = d("10");
+        assert_eq!(p.stop_price(d("0.0001")).unwrap(), d("0.6123"));
     }
     #[test]
     fn old_positions_restore_with_stop_loss_disabled() {
