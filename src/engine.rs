@@ -105,6 +105,7 @@ pub struct Inner {
     pub config: Config,
     pub book: Book,
     pub paused: bool,
+    pub scan_pause_reason: Option<String>,
     pub catalog: BTreeMap<String, SymbolInfo>,
     pub quotes: BTreeMap<String, Quote>,
     pub market_at: i64,
@@ -135,6 +136,7 @@ pub struct Inner {
 pub struct Snapshot {
     pub mode: Mode,
     pub paused: bool,
+    pub scan_pause_reason: Option<String>,
     pub health: String,
     pub market_at: i64,
     pub account_at: i64,
@@ -168,6 +170,15 @@ pub struct Snapshot {
     pub market_stream: MarketStreamStatus,
 }
 impl Inner {
+    fn pause_entries(&mut self, reason: String) -> bool {
+        let changed = !self.paused || self.scan_pause_reason.as_ref() != Some(&reason);
+        self.paused = true;
+        self.scan_pause_reason = Some(reason);
+        if changed {
+            self.revision += 1;
+        }
+        changed
+    }
     fn order_matches(&self, remote: &ExchangeOrder) -> bool {
         self.book
             .pending
@@ -282,6 +293,8 @@ impl Inner {
     }
     fn scan_allowed(&self, mode: Mode, now: i64) -> bool {
         !self.paused
+            && self.external_positions.is_empty()
+            && self.external_orders.is_empty()
             && self.entry_data_ready()
             && (0..15_000).contains(&(now - self.market_at))
             && (mode == Mode::Paper
@@ -523,6 +536,7 @@ impl Engine {
                 config,
                 book,
                 paused: true,
+                scan_pause_reason: Some("服务启动，等待手动启动扫描".into()),
                 catalog: BTreeMap::new(),
                 quotes: BTreeMap::new(),
                 market_at: 0,
@@ -604,6 +618,7 @@ impl Engine {
         Snapshot {
             mode: self.mode,
             paused: i.paused,
+            scan_pause_reason: i.paused.then(|| i.scan_pause_reason.clone()).flatten(),
             health: i.health.clone(),
             market_at: i.market_at,
             account_at: i.account_at,
@@ -741,6 +756,7 @@ impl Engine {
             }
         }
         i.paused = !run;
+        i.scan_pause_reason = (!run).then(|| "手动暂停新增开仓".into());
         i.revision += 1;
         drop(i);
         self.event(
@@ -835,9 +851,7 @@ impl Engine {
             let mut i = self.inner.lock().await;
             i.account_sync_failed = true;
             i.account_generation = i.account_generation.saturating_add(1);
-            i.paused = true;
-            i.revision += 1;
-            i.health = "账户推送中断，暂停新增开仓，REST 继续核对".into();
+            i.health = "账户推送中断，等待完整对账后自动继续；REST 继续核对".into();
         }
         self.event("warn", None, "账户推送中断，等待重连与完整对账", json!({}));
         self.account_notify.notify_one();
@@ -879,6 +893,16 @@ impl Engine {
                     }
                 } else if !order.report().terminal() {
                     let mut i = self.inner.lock().await;
+                    if i.book
+                        .positions
+                        .get(&order.symbol)
+                        .is_some_and(|position| position.owned_order_ids.contains(&order.order_id))
+                    {
+                        // REST may have settled this order before a delayed NEW
+                        // push arrives. It is still ours; the pending full read
+                        // will confirm its current state.
+                        return Ok(());
+                    }
                     let detail = ExternalOrder::from(&order.report());
                     i.external_order_details
                         .retain(|o| o.order_id != detail.order_id || o.symbol != detail.symbol);
@@ -886,16 +910,16 @@ impl Engine {
                     if !i.external_orders.contains(&order.symbol) {
                         i.external_orders.push(order.symbol);
                     }
-                    i.paused = true;
-                    i.revision += 1;
                     i.health = "收到外部订单推送，暂停新开仓，等待完整对账".into();
+                    let reason = i.health.clone();
+                    i.pause_entries(reason);
                 }
             }
             UserEvent::Risk => {
                 let mut i = self.inner.lock().await;
-                i.paused = true;
-                i.revision += 1;
                 i.health = "收到保证金风险推送，暂停新开仓，等待完整对账".into();
+                let reason = i.health.clone();
+                i.pause_entries(reason);
             }
             UserEvent::Account => {}
             UserEvent::Expired | UserEvent::Other => return Ok(()),
@@ -944,11 +968,24 @@ impl Engine {
             // reconciliation succeeds; a local unsent request keeps user intent.
             return;
         }
+        if error
+            .downcast_ref::<ExchangeError>()
+            .is_some_and(ExchangeError::recoverable_sync_failure)
+        {
+            self.event(
+                "warn",
+                None,
+                "同步暂时不可用，等待恢复后自动继续",
+                json!({"context": message, "error": error.to_string()}),
+            );
+            self.inner.lock().await.health = format!("等待同步恢复：{message}: {error}");
+            return;
+        }
         self.event("error", None, message, json!({"error": error.to_string()}));
         let mut i = self.inner.lock().await;
         i.health = format!("{message}: {error}");
-        i.paused = true;
-        i.revision += 1;
+        let reason = i.health.clone();
+        i.pause_entries(reason);
     }
     pub(crate) async fn market_symbols(&self) -> BTreeSet<String> {
         self.inner.lock().await.market_symbols()
@@ -1770,6 +1807,12 @@ impl Engine {
             );
         }
         if fetch && !settled {
+            let sync_wait = fills
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .or_else(|| accounting.as_ref().and_then(|result| result.as_ref().err()))
+                .and_then(|error| error.downcast_ref::<ExchangeError>())
+                .is_some_and(ExchangeError::recoverable_sync_failure);
             let budget_wait = fills
                 .as_ref()
                 .and_then(|result| {
@@ -1787,15 +1830,15 @@ impl Engine {
                         .and_then(ExchangeError::budget_retry_after)
                 });
             let mut i = self.inner.lock().await;
-            if budget_wait.is_none() && !incomplete_fills {
-                i.paused = true;
-                i.revision += 1;
-            }
             i.health = format!(
                 "{} 成交费用尚未核实：{}",
                 o.symbol,
                 settlement_issue.as_deref().unwrap_or("等待重新查询")
             );
+            if !sync_wait && !incomplete_fills {
+                let reason = i.health.clone();
+                i.pause_entries(reason);
+            }
             drop(i);
             self.event(
                 "warn",
@@ -2020,7 +2063,7 @@ impl Engine {
                 Err(error) => {
                     degraded = true;
                     self.inner.lock().await.account_sync_failed = true;
-                    self.fault("账户同步失败，暂停新开仓；止损需按币对独立核对", error)
+                    self.fault("账户同步失败，等待完整对账；止损需按币对独立核对", error)
                         .await;
                 }
                 // An event superseding a read is normal; block entries and new
@@ -2109,6 +2152,45 @@ impl Engine {
             remote.iter().all(|p| p.position_side == "BOTH"),
             "账户出现双向持仓"
         );
+        let order_recheck = {
+            let i = self.inner.lock().await;
+            if generation != i.account_generation {
+                return Ok(false);
+            }
+            i.book.pending.values().any(|order| {
+                let local = i
+                    .book
+                    .positions
+                    .get(&order.symbol)
+                    .map_or(Decimal::ZERO, |p| p.side.sign() * p.quantity);
+                let actual = remote
+                    .iter()
+                    .find(|p| p.symbol == order.symbol)
+                    .map_or(Decimal::ZERO, |p| p.position_amt);
+                local != actual
+            }) || remote.iter().any(|position| {
+                position.position_amt != Decimal::ZERO
+                    && i.book.positions.get(&position.symbol).is_some_and(|local| {
+                        local.quantity > Decimal::ZERO
+                            && local.side.sign() * local.quantity != position.position_amt
+                    })
+            })
+        };
+        if order_recheck {
+            // A fill can land between the order query and the parallel account
+            // reads, before its WebSocket event arrives. Confirm our orders and
+            // take another full snapshot before latching an account difference.
+            self.reconcile_pending().await?;
+            (remote, orders, balances) = tokio::try_join!(
+                self.exchange.positions(),
+                self.exchange.open_orders(),
+                self.exchange.margin_balances(),
+            )?;
+            ensure!(
+                remote.iter().all(|p| p.position_side == "BOTH"),
+                "账户出现双向持仓"
+            );
+        }
         let candidates = {
             let i = self.inner.lock().await;
             if generation != i.account_generation {
@@ -2196,9 +2278,9 @@ impl Engine {
             }
         }
         if !repaired.is_empty() {
-            i.paused = true;
-            i.revision += 1;
             i.health = "已核实交易所平仓并结算，新增开仓已暂停".into();
+            let reason = i.health.clone();
+            i.pause_entries(reason);
             self.save(&mut i)?;
         }
         let mut external = BTreeMap::new();
@@ -2258,11 +2340,30 @@ impl Engine {
         i.account_at = now_ms();
         i.account_sync_failed = false;
         i.account_update_pending = false;
-        if !i.external_positions.is_empty() || !i.external_orders.is_empty() {
-            i.paused = true;
+        let pause_detail = if !i.external_positions.is_empty() || !i.external_orders.is_empty() {
             i.health = "账户与系统记录不一致，暂停新开仓，保留订单".into();
-        }
+            let reason = i
+                .account_differences()
+                .iter()
+                .map(|difference| i.account_difference_reason(&difference.symbol))
+                .collect::<Vec<_>>()
+                .join("；");
+            let changed = i.pause_entries(format!("账户差异：{reason}"));
+            changed.then(
+                || json!({"reason":i.scan_pause_reason,"differences":i.account_differences()}),
+            )
+        } else {
+            None
+        };
         drop(i);
+        if let Some(detail) = pause_detail {
+            self.event(
+                "warn",
+                None,
+                "账户差异已确认，暂停新增开仓，需人工核对",
+                detail,
+            );
+        }
         for (previous, accounting) in repaired {
             self.event(
                 "trade",
@@ -3285,6 +3386,250 @@ mod tests {
         (e, limited, server)
     }
     #[tokio::test]
+    async fn temporary_sync_failures_recover_without_overriding_a_manual_pause() {
+        use axum::{
+            Json, Router,
+            http::{StatusCode, Uri},
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for path in ["/fapi/v2/account", "/fapi/v1/income", "/fapi/v1/userTrades"] {
+            for manual_pause in [false, true] {
+                let failed = Arc::new(AtomicBool::new(true));
+                let state = failed.clone();
+                let app = Router::new().fallback(move |uri: Uri| {
+                    let state = state.clone();
+                    async move {
+                        if uri.path() == path && state.load(Ordering::SeqCst) {
+                            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"code":-1000})));
+                        }
+                        let value = match uri.path() {
+                            "/fapi/v2/account" => json!({"multiAssetsMargin":false,"availableBalance":"1000",
+                                "assets":[{"asset":"USDT","availableBalance":"1000"}]}),
+                            "/fapi/v1/order" => json!({"symbol":"XUSDT","clientOrderId":"test-entry","orderId":42,
+                                "status":"FILLED","executedQty":"1","origQty":"1","avgPrice":"100","cumQuote":"100"}),
+                            "/fapi/v1/userTrades" => json!([{"id":1,"orderId":42,"qty":"1","price":"100",
+                                "commission":"0.05","commissionAsset":"USDT","realizedPnl":"0","time":1,"side":"BUY"}]),
+                            _ => json!([]),
+                        };
+                        (StatusCode::OK, Json(value))
+                    }
+                });
+                let (base, server) = crate::test_support::mock_server(app).await;
+                let e = Engine::new(
+                    Mode::Live,
+                    Store::open(":memory:", Mode::Live).unwrap(),
+                    config(),
+                    Binance::mock(base.clone()),
+                    Jev::mock(base),
+                )
+                .unwrap();
+                seed(&e).await;
+                {
+                    let mut i = e.inner.lock().await;
+                    i.paused = false;
+                    i.account_at = now_ms();
+                    i.book.funding_last_poll = if path == "/fapi/v1/income" {
+                        0
+                    } else {
+                        now_ms()
+                    };
+                    if path == "/fapi/v1/userTrades" {
+                        let order = entry(Action::Long);
+                        i.book.pending.insert(order.client_id.clone(), order);
+                    }
+                }
+                if path == "/fapi/v1/userTrades" {
+                    e.reconcile_pending().await.unwrap();
+                } else {
+                    e.manage_positions().await.unwrap();
+                }
+                {
+                    let i = e.inner.lock().await;
+                    assert!(!i.paused, "{path}");
+                    assert!(!i.scan_allowed(Mode::Live, now_ms()), "{path}");
+                    assert_eq!(i.account_sync_failed, path == "/fapi/v2/account");
+                    assert_eq!(i.funding_sync_pending, path == "/fapi/v1/income");
+                    assert_eq!(!i.entry_data_ready(), path != "/fapi/v2/account");
+                }
+                assert!(e.set_running(true).await.is_err());
+                if manual_pause {
+                    e.set_running(false).await.unwrap();
+                }
+                failed.store(false, Ordering::SeqCst);
+                if path == "/fapi/v1/userTrades" {
+                    e.reconcile_pending().await.unwrap();
+                    let i = e.inner.lock().await;
+                    assert_eq!(i.book.positions["XUSDT"].entry_fee, d("0.05"));
+                    assert!(i.book.positions["XUSDT"].accounting_complete);
+                    assert!(i.book.pending.is_empty());
+                } else {
+                    e.manage_positions().await.unwrap();
+                }
+                let i = e.inner.lock().await;
+                assert!(!i.account_sync_failed && !i.funding_sync_pending);
+                assert!(i.entry_data_ready());
+                assert_eq!(i.paused, manual_pause);
+                assert_eq!(i.scan_allowed(Mode::Live, now_ms()), !manual_pause);
+                server.abort();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn delayed_new_push_for_a_settled_system_order_does_not_become_an_external_order() {
+        for known in [true, false] {
+            let e = paper();
+            seed(&e).await;
+            e.paper_entry(entry(Action::Long)).await.unwrap();
+            {
+                let mut i = e.inner.lock().await;
+                i.paused = false;
+                i.book.positions.get_mut("XUSDT").unwrap().owned_order_ids = vec![42];
+            }
+            let order = crate::user_stream::UserOrder {
+                symbol: "XUSDT".into(),
+                client_id: "already-settled-entry".into(),
+                order_id: if known { 42 } else { 99 },
+                quantity: Decimal::ONE,
+                filled: Decimal::ZERO,
+                average: Decimal::ZERO,
+                status: "NEW".into(),
+                side: "BUY".into(),
+                position_side: "BOTH".into(),
+            };
+            e.handle_user_event(UserEvent::Order {
+                event_at: now_ms(),
+                transaction_at: now_ms(),
+                order,
+            })
+            .await
+            .unwrap();
+            let s = e.snapshot().await;
+            assert!(s.account_update_pending);
+            assert_eq!(s.paused, !known);
+            assert_eq!(s.external_orders.is_empty(), known);
+            if !known {
+                assert!(s.scan_pause_reason.unwrap().contains("外部订单推送"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn stream_gap_blocks_entries_until_rest_recovers_and_preserves_manual_pause() {
+        for manual_pause in [false, true] {
+            let (e, _, server) = read_budget_engine("unused", "0").await;
+            e.stream_gap().await;
+            {
+                let i = e.inner.lock().await;
+                assert!(!i.paused && i.account_sync_failed);
+                assert!(!i.scan_allowed(Mode::Live, now_ms()));
+            }
+            if manual_pause {
+                e.set_running(false).await.unwrap();
+            }
+            e.handle_user_event(UserEvent::Account).await.unwrap();
+            e.manage_positions().await.unwrap();
+            let i = e.inner.lock().await;
+            assert!(!i.account_sync_failed && !i.account_update_pending);
+            assert_eq!(i.paused, manual_pause);
+            assert_eq!(i.scan_allowed(Mode::Live, now_ms()), !manual_pause);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn account_rechecks_our_fills_before_pausing_for_a_quantity_difference() {
+        use axum::{Json, Router, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (quantity, manual_pause) in [("0.6", false), ("0.6", true), ("0.5", false)] {
+            let queries = Arc::new(AtomicUsize::new(0));
+            let counter = queries.clone();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let reader = reads.clone();
+            let app = Router::new()
+                .route("/fapi/v1/order", get(move || {
+                    let counter = counter.clone(); async move {
+                        let filled = counter.fetch_add(1, Ordering::SeqCst) > 0;
+                        Json(json!({"symbol":"XUSDT","clientOrderId":"test-tp","orderId":43,
+                            "status":if filled {"PARTIALLY_FILLED"} else {"NEW"},
+                            "executedQty":if filled {"0.4"} else {"0"},"origQty":"1","avgPrice":"101"}))
+                    }
+                }))
+                .route("/fapi/v1/userTrades", get(|| async { Json(json!([{"id":2,"orderId":43,"qty":"0.4","price":"101",
+                    "commission":"0.00808","commissionAsset":"USDT","realizedPnl":"0.4","time":1,"side":"SELL"}])) }))
+                .route("/fapi/v3/positionRisk", get(move || {
+                    let reader = reader.clone(); async move {
+                        reader.fetch_add(1, Ordering::SeqCst);
+                        Json(json!([{"symbol":"XUSDT","positionAmt":quantity,"entryPrice":"100","positionSide":"BOTH"}]))
+                    }
+                }))
+                .route("/fapi/v1/openOrders", get(|| async { Json(json!([{"symbol":"XUSDT","clientOrderId":"test-tp","orderId":43,
+                    "status":"PARTIALLY_FILLED","executedQty":"0.4","origQty":"1","avgPrice":"101"}])) }))
+                .route("/fapi/v2/account", get(|| async { Json(json!({"multiAssetsMargin":false,"availableBalance":"1000",
+                    "assets":[{"asset":"USDT","availableBalance":"1000"}]})) }));
+            let (base, server) = crate::test_support::mock_server(app).await;
+            let e = Engine::new(
+                Mode::Live,
+                Store::open(":memory:", Mode::Live).unwrap(),
+                config(),
+                Binance::mock(base.clone()),
+                Jev::mock(base),
+            )
+            .unwrap();
+            seed(&e).await;
+            e.paper_entry(entry(Action::Long)).await.unwrap();
+            {
+                let mut i = e.inner.lock().await;
+                i.paused = false;
+                i.account_at = now_ms();
+                i.book.funding_last_poll = now_ms();
+                let mut tp = entry(Action::Long);
+                tp.client_id = "test-tp".into();
+                tp.role = OrderRole::TakeProfit;
+                tp.status = "NEW".into();
+                tp.exchange_order_id = Some(43);
+                tp.price = Some(d("101"));
+                i.book.pending.insert(tp.client_id.clone(), tp);
+                i.book.positions.get_mut("XUSDT").unwrap().tp_client_id = Some("test-tp".into());
+            }
+            if manual_pause {
+                e.set_running(false).await.unwrap();
+            }
+            e.manage_positions().await.unwrap();
+            let s = e.snapshot().await;
+            assert_eq!(queries.load(Ordering::SeqCst), 2);
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+            assert_eq!(s.positions[0].quantity, d("0.6"));
+            assert_eq!(s.positions[0].exit_fee, d("0.00808"));
+            assert_eq!(s.paused, manual_pause || quantity == "0.5");
+            assert!(!s.account_sync_failed && !s.account_update_pending);
+            if quantity == "0.5" {
+                assert_eq!(s.external_positions["XUSDT"], d("0.5"));
+                assert!(
+                    s.scan_pause_reason
+                        .as_ref()
+                        .unwrap()
+                        .contains("本地数量 0.6")
+                );
+                assert!(
+                    e.store
+                        .events(10)
+                        .unwrap()
+                        .iter()
+                        .any(|event| event.message.contains("账户差异已确认"))
+                );
+                // A later healthy read must not erase the reason for a hard pause.
+                e.inner.lock().await.external_positions.clear();
+                e.inner.lock().await.market_health(Mode::Live);
+                assert_eq!(e.snapshot().await.scan_pause_reason, s.scan_pause_reason);
+            } else {
+                assert!(s.external_positions.is_empty());
+                assert_eq!(
+                    e.inner.lock().await.scan_allowed(Mode::Live, now_ms()),
+                    !manual_pause
+                );
+            }
+            server.abort();
+        }
+    }
+    #[tokio::test]
     async fn account_budget_wait_blocks_entries_then_recovers_without_changing_scan_intent() {
         for manual_pause in [false, true] {
             let (e, limited, server) = read_budget_engine("/fapi/v1/time", "2386").await;
@@ -4028,7 +4373,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn market_http_failure_and_cooldown_still_require_manual_restart() {
+    async fn market_http_limit_and_cooldown_keep_scan_intent_but_stale_quotes_block_entries() {
         use axum::{Json, Router, http::StatusCode, routing::get};
         let app = Router::new().route(
             "/fapi/v1/ticker/bookTicker",
@@ -4062,8 +4407,12 @@ mod tests {
                     .is_none()
             );
             e.fault("行情同步失败", error).await;
-            assert!(e.snapshot().await.paused);
+            assert!(!e.snapshot().await.paused);
             assert!(e.inner.lock().await.market_retry_at.is_none());
+            let mut i = e.inner.lock().await;
+            i.market_at = now_ms() - 16_000;
+            i.quotes.get_mut("XUSDT").unwrap().time = i.market_at;
+            assert!(!i.scan_allowed(Mode::Paper, now_ms()));
         }
         server.abort();
     }
@@ -4976,7 +5325,7 @@ mod tests {
                 assert_eq!(fixture.submitted.lock().await.len(), 1);
                 assert_eq!(fixture.submitted.lock().await[0]["quantity"], "1");
                 assert_eq!(fixture.confirmations.load(Ordering::SeqCst), 1);
-                assert!(snapshot.paused && snapshot.account_sync_failed);
+                assert!(!snapshot.paused && snapshot.account_sync_failed);
                 assert!(snapshot.health.contains("账户同步失败"));
                 assert_eq!(snapshot.account_at, account_at);
                 assert_eq!(snapshot.available_usdt, d("321"));
@@ -5141,7 +5490,7 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
-    async fn only_complete_account_recovery_clears_failure_and_does_not_resume_entries() {
+    async fn only_complete_account_recovery_clears_failure_and_restores_scan_readiness() {
         use std::sync::atomic::Ordering;
         let (e, fixture, server) = exit_fixture(ExitScenario::BalanceError, Action::Long).await;
         {
@@ -5166,7 +5515,8 @@ mod tests {
         e.sync_account().await.unwrap();
         let snapshot = e.snapshot().await;
         assert!(!snapshot.account_sync_failed);
-        assert!(snapshot.paused);
+        assert!(!snapshot.paused);
+        assert!(snapshot.scan_pause_reason.is_none());
         assert_eq!(snapshot.available_usdt, d("1000"));
         server.abort();
     }
@@ -6277,7 +6627,10 @@ mod tests {
                 fixture.cancellations.load(Ordering::SeqCst),
                 usize::from(scenario == "tp")
             );
-            assert_eq!(fixture.account_reads.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                fixture.account_reads.load(Ordering::SeqCst),
+                if scenario == "tp" { 3 } else { 2 }
+            );
             e.manage_positions().await.unwrap();
             assert_eq!(e.snapshot().await.closed_trades.len(), 1);
             assert_eq!(fixture.history_reads.load(Ordering::SeqCst), 1);

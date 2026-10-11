@@ -167,6 +167,18 @@ impl std::fmt::Display for ExchangeError {
 }
 impl std::error::Error for ExchangeError {}
 impl ExchangeError {
+    pub(crate) fn recoverable_sync_failure(&self) -> bool {
+        // This only controls background reconciliation. Order submission keeps
+        // its existing uncertainty handling and is never retried here.
+        self.kind.retryable()
+            || matches!(
+                self.kind,
+                ExchangeErrorKind::Budget(_) | ExchangeErrorKind::Cooldown(_)
+            )
+            || self.kind == ExchangeErrorKind::Api
+                && (matches!(self.status, 418 | 429 | 500..=599)
+                    || matches!(self.code, -1000 | -1003 | -1006 | -1007 | -1015))
+    }
     pub(crate) fn budget_retry_after(&self) -> Option<Duration> {
         match self.kind {
             ExchangeErrorKind::Budget(wait) => Some(wait),
@@ -1254,6 +1266,46 @@ impl Binance {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sync_recovery_distinguishes_temporary_failures_from_invalid_data_and_permissions() {
+        use super::{ExchangeError, ExchangeErrorKind};
+        use std::time::Duration;
+        for (kind, status, code, recoverable) in [
+            (ExchangeErrorKind::RequestTimeout, 0, 0, true),
+            (ExchangeErrorKind::ConnectionInterrupted, 0, 0, true),
+            (ExchangeErrorKind::ResponseTimeout, 200, 0, true),
+            (ExchangeErrorKind::IncompleteJson, 200, 0, true),
+            (
+                ExchangeErrorKind::Budget(Duration::from_secs(1)),
+                0,
+                0,
+                true,
+            ),
+            (
+                ExchangeErrorKind::Cooldown(Duration::from_secs(1)),
+                429,
+                -1003,
+                true,
+            ),
+            (ExchangeErrorKind::Api, 429, -1003, true),
+            (ExchangeErrorKind::Api, 503, -1000, true),
+            (ExchangeErrorKind::Api, 400, -1000, true),
+            (ExchangeErrorKind::Api, 403, -2015, false),
+            (ExchangeErrorKind::Api, 400, -1021, false),
+            (ExchangeErrorKind::Tls, 0, 0, false),
+            (ExchangeErrorKind::InvalidJson, 200, 0, false),
+            (ExchangeErrorKind::CooldownPersistence, 0, 0, false),
+        ] {
+            let error = ExchangeError {
+                kind,
+                status,
+                code,
+                uncertain: false,
+                path: "/fapi/v2/account",
+            };
+            assert_eq!(error.recoverable_sync_failure(), recoverable, "{kind:?}");
+        }
+    }
     use super::*;
     #[tokio::test]
     async fn lifetime_trade_queries_split_seven_day_windows_and_reject_truncated_history() {

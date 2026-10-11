@@ -107,7 +107,7 @@ function renderMonitoring(){
   const status=s.account_sync_failed?'账户同步异常':s.account_update_pending?'账户对账中':differences?'账户差异待核对':s.funding_sync_pending?'资金费核对中':s.entry_data_pending?'成交费用核对中':stale?'数据待更新':s.paused?'新增开仓已暂停':'运行中';
   $('monitor-state').textContent=limit?.cooldown_persistence_pending?'退避状态待保存':cooldown>0?'限流退避':status;
   $('monitor-state').className='monitor-state'+(limit?.cooldown_persistence_pending||cooldown>0||s.account_sync_failed||differences||s.entry_data_pending||stale?' uncertain':'');
-  $('monitor-freshness').textContent='行情 '+age(s.market_at)+' · '+(s.mode==='paper'?'模拟账户': '完整账户 '+age(s.account_at))+' · 异常轮次包含风控等待，累计次数在引擎重启后重置';
+  $('monitor-freshness').textContent='行情 '+age(s.market_at)+' · '+(s.mode==='paper'?'模拟账户': '完整账户 '+age(s.account_at))+(s.paused&&s.scan_pause_reason?' · 暂停原因：'+s.scan_pause_reason:'')+' · 异常轮次包含风控等待，累计次数在引擎重启后重置';
 }
 function render(){
   const s=state,c=s.config;

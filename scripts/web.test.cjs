@@ -173,6 +173,15 @@ test('monitoring distinguishes funding and fill reconciliation from a user pause
   assert.equal(h.element('monitor-state').textContent,'新增开仓已暂停');
 });
 
+test('monitoring preserves the hard pause reason after data recovers and renders it as text',async()=>{
+  const h=await dashboard();
+  h.run(`state={mode:'live',paused:true,scan_pause_reason:'账户差异：<order> 本地数量 0.6，交易所数量 0.5',market_at:Date.now(),account_at:Date.now()};renderMonitoring();`);
+  assert.equal(h.element('monitor-state').textContent,'新增开仓已暂停');
+  assert.match(h.element('monitor-freshness').textContent,/暂停原因：账户差异：<order> 本地数量 0.6/);
+  h.run('state.paused=false;renderMonitoring();');
+  assert.doesNotMatch(h.element('monitor-freshness').textContent,/暂停原因/);
+});
+
 test('monitoring handles absent metrics and paper mode without misleading values',async()=>{
   const h=await dashboard();
   h.run("state={mode:'paper',paused:true,market_at:0,account_at:0};renderMonitoring();");
