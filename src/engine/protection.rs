@@ -277,11 +277,10 @@ impl Engine {
         };
         {
             let i = self.inner.lock().await;
-            if !i
-                .book
+            if i.book
                 .stop_orders
                 .get(&keep_id)
-                .is_some_and(|s| s.order.status == "NEW")
+                .is_none_or(|s| s.order.status != "NEW")
             {
                 ensure!(
                     i.book
