@@ -25,6 +25,13 @@ use std::{
 use tokio::sync::{Mutex, Notify, RwLock};
 mod protection;
 
+const ACCOUNT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+struct AccountPoll {
+    next: Instant,
+    order_revision: u64,
+    sequence: u64,
+}
+
 pub struct Engine {
     pub mode: Mode,
     pub store: Store,
@@ -130,6 +137,8 @@ pub struct Inner {
     pub funding_sync_pending: bool,
     funding_sync_error: Option<String>,
     account_generation: u64,
+    order_revision: u64,
+    account_poll: Option<AccountPoll>,
     pub available: Decimal,
     realized_net: Decimal,
     pub margin_balances: Option<MarginBalances>,
@@ -581,6 +590,8 @@ impl Engine {
                 funding_sync_pending: false,
                 funding_sync_error: None,
                 account_generation: 0,
+                order_revision: 0,
+                account_poll: None,
                 available,
                 realized_net,
                 margin_balances: None,
@@ -1199,16 +1210,24 @@ impl Engine {
         jev.decide(symbol, bars, quote, c).await
     }
     async fn evaluate_coin(&self, coin: PoolCoin, revision: u64) -> Result<()> {
+        self.evaluate_coin_with_clock(coin, revision, now_ms).await
+    }
+    async fn evaluate_coin_with_clock(
+        &self,
+        coin: PoolCoin,
+        revision: u64,
+        now: impl Fn() -> i64,
+    ) -> Result<()> {
         let mut c = self.inner.lock().await.config.for_coin(&coin)?;
         {
             let i = self.inner.lock().await;
-            let expected_close = now_ms() / BAR_MS * BAR_MS - 1;
+            let expected_close = now() / BAR_MS * BAR_MS - 1;
             if i.paused
                 || !i.entry_data_ready()
                 || i.revision != revision
                 || i.occupied(&coin.symbol)
                 || i.slots() >= i.config.max_positions
-                || now_ms() - expected_close > c.signal_max_age_seconds as i64 * 1000
+                || now() - expected_close > c.signal_max_age_seconds as i64 * 1000
                 || i.book
                     .last_bar
                     .get(&coin.symbol)
@@ -1219,14 +1238,21 @@ impl Engine {
         }
         let bars = self
             .exchange
-            .candles(&coin.symbol, c.jev.lookback_bars + 1)
+            .candles(&coin.symbol, c.jev.lookback_bars)
             .await?;
-        strategy::validate_bars(&bars, now_ms())?;
+        strategy::validate_bars(&bars, now())?;
         let bar = bars.last().context("无 K 线")?.close_time;
         ensure!(
-            now_ms() - bar <= c.signal_max_age_seconds as i64 * 1000,
+            now() - bar <= c.signal_max_age_seconds as i64 * 1000,
             "最新收盘信号已过期"
         );
+        // Resolve quota-sensitive reads before claiming the bar. An unsent fee
+        // request must be retryable on this same signal after budget recovery.
+        let (maker_fee, taker_fee) = if self.mode == Mode::Paper {
+            (c.maker_fee, c.taker_fee)
+        } else {
+            self.exchange.fees(&coin.symbol).await?
+        };
         let quote = {
             let mut i = self.inner.lock().await;
             if i.paused
@@ -1245,15 +1271,10 @@ impl Engine {
                 return Ok(());
             }
             let quote = i.quotes.get(&coin.symbol).context("无盘口")?.clone();
-            ensure_entry_quote(&quote, c.max_spread_bps, now_ms())?;
+            ensure_entry_quote(&quote, c.max_spread_bps, now())?;
             i.book.last_bar.insert(coin.symbol.clone(), bar);
             self.save(&mut i)?;
             quote
-        };
-        let (maker_fee, taker_fee) = if self.mode == Mode::Paper {
-            (c.maker_fee, c.taker_fee)
-        } else {
-            self.exchange.fees(&coin.symbol).await?
         };
         c.maker_fee = maker_fee;
         c.taker_fee = taker_fee;
@@ -1282,15 +1303,15 @@ impl Engine {
                 return Ok(());
             }
             ensure!(
-                now_ms() - bar <= c.signal_max_age_seconds as i64 * 1000
-                    && now_ms() - i.market_at < 15_000,
+                now() - bar <= c.signal_max_age_seconds as i64 * 1000
+                    && now() - i.market_at < 15_000,
                 "决策已过期"
             );
             if self.mode != Mode::Paper {
                 ensure!(
                     !i.account_sync_failed
                         && !i.account_update_pending
-                        && (0..15_000).contains(&(now_ms() - i.account_at)),
+                        && (0..15_000).contains(&(now() - i.account_at)),
                     "账户对账过期或同步失败"
                 );
             }
@@ -1309,7 +1330,7 @@ impl Engine {
                 "已有敞口缺少盘口，暂停新增仓位"
             );
             let q = i.quotes.get(&coin.symbol).context("无盘口")?;
-            ensure_entry_quote(q, c.max_spread_bps, now_ms())?;
+            ensure_entry_quote(q, c.max_spread_bps, now())?;
             let price = if decision.action == Action::Long {
                 q.ask
             } else {
@@ -1337,7 +1358,7 @@ impl Engine {
                 role: OrderRole::Entry,
                 quantity: qty,
                 price: None,
-                created_at: now_ms(),
+                created_at: now(),
                 signal_time: bar,
                 target_profit: c.profit_usdt,
                 stop_loss_usdt: c.stop_loss_usdt,
@@ -1722,6 +1743,7 @@ impl Engine {
         {
             return self.save_if_changed(&mut i, current.exchange_order_id.is_none());
         }
+        i.order_revision = i.order_revision.saturating_add(1);
         let delta = (remote.executed_qty - current.accounted_quantity).max(Decimal::ZERO);
         let native_stop_triggered = i
             .book
@@ -2136,7 +2158,7 @@ impl Engine {
             self.reconcile_exchange_stops().await?;
             self.reconcile_pending().await?;
             let account = match startup {
-                Ok(()) => self.sync_account().await,
+                Ok(()) => self.sync_account_if_due().await,
                 Err(error) => Err(error),
             };
             match account {
@@ -2241,6 +2263,34 @@ impl Engine {
             self.finalize_closed().await?;
         }
         Ok(degraded)
+    }
+    async fn sync_account_if_due(&self) -> Result<bool> {
+        let connected = self.user_stream.lock().await.connected;
+        let i = self.inner.lock().await;
+        let unchanged = i.account_poll.as_ref().is_some_and(|poll| {
+            Instant::now() < poll.next
+                && poll.order_revision == i.order_revision
+                && poll.sequence == i.book.sequence
+        });
+        let ready = !i.account_sync_failed
+            && !i.account_update_pending
+            && (0..10_000).contains(&(now_ms() - i.account_at))
+            && i.external_orders.is_empty()
+            && i.external_positions.is_empty()
+            && i.book.pending.values().all(|order| {
+                matches!(order.status.as_str(), "NEW" | "PARTIALLY_FILLED")
+                    && order.settlement_issue.is_none()
+            })
+            && i.book.stop_orders.values().all(|stop| {
+                stop.order.status == "NEW"
+                    && stop.order.settlement_issue.is_none()
+                    && !stop.cancel_requested
+            });
+        drop(i);
+        if connected && unchanged && ready {
+            return Ok(true);
+        }
+        self.sync_account().await
     }
     async fn sync_account(&self) -> Result<bool> {
         let generation = self.inner.lock().await.account_generation;
@@ -2462,6 +2512,27 @@ impl Engine {
         };
         i.margin_balances = Some(balances);
         i.account_at = now_ms();
+        let now = Instant::now();
+        // Advance the existing deadline by whole periods. Resetting it to the
+        // response time each cycle would drift into a 15-second polling cadence.
+        let next = i
+            .account_poll
+            .as_ref()
+            .map_or(now + ACCOUNT_POLL_INTERVAL, |poll| {
+                if now >= poll.next {
+                    let periods = now.duration_since(poll.next).as_secs()
+                        / ACCOUNT_POLL_INTERVAL.as_secs()
+                        + 1;
+                    poll.next + Duration::from_secs(periods * ACCOUNT_POLL_INTERVAL.as_secs())
+                } else {
+                    now + ACCOUNT_POLL_INTERVAL
+                }
+            });
+        i.account_poll = Some(AccountPoll {
+            next,
+            order_revision: i.order_revision,
+            sequence: i.book.sequence,
+        });
         i.account_sync_failed = false;
         i.account_update_pending = false;
         let pause_detail = if !i.external_positions.is_empty() || !i.external_orders.is_empty() {
@@ -3441,6 +3512,174 @@ mod tests {
     }
     pub(super) fn config() -> Config {
         Config::default()
+    }
+    #[tokio::test]
+    async fn healthy_account_polling_saves_weight_without_delaying_order_queries() {
+        use axum::{Json, Router, http::Uri};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let calls = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
+        let reads = calls.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let app = Router::new().fallback(move |uri: Uri| {
+            let reads = reads.clone();
+            let flag = flag.clone();
+            async move {
+                *reads.lock().await.entry(uri.path().into()).or_default() += 1;
+                let order = json!({"symbol":"XUSDT", "clientOrderId":"test-entry", "orderId":42,
+                    "status":if flag.load(Ordering::SeqCst) {"CANCELED"} else {"NEW"},
+                    "executedQty":"0", "origQty":"1"});
+                Json(match uri.path() {
+                    "/fapi/v1/order" => order,
+                    "/fapi/v1/openOrders" if !flag.load(Ordering::SeqCst) => json!([order]),
+                    "/fapi/v2/account" => {
+                        json!({"multiAssetsMargin":false,"availableBalance":"1000",
+                        "assets":[{"asset":"USDT","availableBalance":"1000"}]})
+                    }
+                    _ => json!([]),
+                })
+            }
+        });
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Testnet,
+            Store::open(":memory:", Mode::Testnet).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        e.user_stream.lock().await.connected = true;
+        {
+            let mut i = e.inner.lock().await;
+            i.account_at = now_ms();
+            i.book.funding_last_poll = now_ms();
+            let mut order = entry(Action::Long);
+            order.status = "NEW".into();
+            order.exchange_order_id = Some(42);
+            i.book.pending.insert(order.client_id.clone(), order);
+        }
+        e.manage_positions_once().await.unwrap();
+        assert_eq!(
+            e.exchange.rate_limit_snapshot().await.estimated_used_weight,
+            91
+        );
+        let account_at = e.inner.lock().await.account_at;
+        e.manage_positions_once().await.unwrap();
+        assert_eq!(
+            e.exchange.rate_limit_snapshot().await.estimated_used_weight,
+            92
+        );
+        assert_eq!(e.inner.lock().await.account_at, account_at);
+        assert_eq!(calls.lock().await["/fapi/v1/order"], 2);
+        assert_eq!(calls.lock().await["/fapi/v1/openOrders"], 1);
+        // A changed REST order report forces a full read before the ten-second deadline.
+        cancelled.store(true, Ordering::SeqCst);
+        e.manage_positions_once().await.unwrap();
+        assert!(e.inner.lock().await.book.pending.is_empty());
+        assert_eq!(calls.lock().await["/fapi/v1/openOrders"], 2);
+        e.handle_user_event(UserEvent::Account).await.unwrap();
+        e.manage_positions_once().await.unwrap();
+        assert_eq!(calls.lock().await["/fapi/v1/openOrders"], 3);
+        e.user_stream.lock().await.connected = false;
+        e.manage_positions_once().await.unwrap();
+        assert_eq!(calls.lock().await["/fapi/v1/openOrders"], 4);
+        e.user_stream.lock().await.connected = true;
+        let deadline = Instant::now() - Duration::from_secs(3);
+        {
+            let mut i = e.inner.lock().await;
+            i.account_poll.as_mut().unwrap().next = deadline;
+        }
+        e.manage_positions_once().await.unwrap();
+        assert_eq!(calls.lock().await["/fapi/v1/openOrders"], 5);
+        assert_eq!(
+            e.inner.lock().await.account_poll.as_ref().unwrap().next,
+            deadline + ACCOUNT_POLL_INTERVAL
+        );
+        // A local submission changes the sequence even before a push arrives.
+        e.inner.lock().await.book.sequence += 1;
+        e.manage_positions_once().await.unwrap();
+        assert_eq!(calls.lock().await["/fapi/v1/openOrders"], 6);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn fee_budget_recovery_retries_the_same_bar_without_refetching_history() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let candles = Arc::new(AtomicUsize::new(0));
+        let fees = Arc::new(AtomicUsize::new(0));
+        let reads = candles.clone();
+        let charges = fees.clone();
+        let fixed = now_ms() / BAR_MS * BAR_MS + 10_000;
+        let app = Router::new()
+            .route("/fapi/v1/time", get(move || async move { Json(json!({"serverTime": fixed})) }))
+            .route("/fapi/v1/klines", get(move |Query(q): Query<BTreeMap<String, String>>| {
+                let reads = reads.clone(); async move {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    let end: i64 = q["endTime"].parse().unwrap();
+                    let limit: usize = q["limit"].parse().unwrap();
+                    let start = end + 1 - limit as i64 * BAR_MS;
+                    ([("x-mbx-used-weight-1m", "2150")], Json((0..limit).map(|i| {
+                        let open = start + i as i64 * BAR_MS;
+                        json!([open,"100","101","99","100","10",open+BAR_MS-1])
+                    }).collect::<Vec<_>>()))
+                }
+            }))
+            .route("/fapi/v1/commissionRate", get(move || {
+                let charges = charges.clone(); async move {
+                    charges.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"symbol":"XUSDT","makerCommissionRate":"0.0002","takerCommissionRate":"0.0005"}))
+                }
+            }));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let e = Engine::new(
+            Mode::Live,
+            Store::open(":memory:", Mode::Live).unwrap(),
+            config(),
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        e.exchange.sync_time().await.unwrap();
+        seed(&e).await;
+        let coin = PoolCoin {
+            symbol: "XUSDT".into(),
+            enabled: true,
+            config: None,
+        };
+        {
+            let mut i = e.inner.lock().await;
+            i.paused = false;
+            i.account_at = fixed;
+            i.market_at = fixed;
+            i.quotes.get_mut("XUSDT").unwrap().time = fixed;
+            i.book.pool.insert(coin.symbol.clone(), coin.clone());
+        }
+        let revision = e.inner.lock().await.revision;
+        let error = e
+            .evaluate_coin_with_clock(coin.clone(), revision, || fixed)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<ExchangeError>()
+                .unwrap()
+                .budget_retry_after()
+                .is_some()
+        );
+        assert!(!e.inner.lock().await.book.last_bar.contains_key("XUSDT"));
+        assert_eq!(fees.load(Ordering::SeqCst), 0);
+        e.exchange.expire_mock_weight_window().await;
+        // With no Jev key this ends at decision, after the signal is claimed.
+        assert!(
+            e.evaluate_coin_with_clock(coin, revision, || fixed)
+                .await
+                .is_err()
+        );
+        assert!(e.inner.lock().await.book.last_bar.contains_key("XUSDT"));
+        assert_eq!(fees.load(Ordering::SeqCst), 1);
+        assert_eq!(candles.load(Ordering::SeqCst), 1);
+        server.abort();
     }
     #[test]
     fn entry_quote_checks_preserve_age_and_spread_boundaries() {

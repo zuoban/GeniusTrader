@@ -24,6 +24,13 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+const FEE_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+type SymbolCache<T> = Mutex<BTreeMap<String, Arc<Mutex<T>>>>;
+struct CachedFees {
+    at: Instant,
+    rates: (Decimal, Decimal),
+}
+
 #[derive(Debug)]
 pub struct ExchangeError {
     pub code: i64,
@@ -228,6 +235,8 @@ pub struct Binance {
     offset: AtomicI64,
     throttle: Arc<Mutex<RequestThrottle>>,
     position_mode_lock: Mutex<()>,
+    fee_cache: SymbolCache<Option<CachedFees>>,
+    candle_cache: SymbolCache<Vec<Candle>>,
     cooldown_store: Option<Store>,
     #[cfg(test)]
     pub(crate) stream_base: Option<String>,
@@ -421,6 +430,8 @@ impl Binance {
             offset: AtomicI64::new(0),
             throttle,
             position_mode_lock: Mutex::new(()),
+            fee_cache: Mutex::new(BTreeMap::new()),
+            candle_cache: Mutex::new(BTreeMap::new()),
             cooldown_store: None,
             stream_base: None,
         }
@@ -451,6 +462,8 @@ impl Binance {
             offset: AtomicI64::new(0),
             throttle,
             position_mode_lock: Mutex::new(()),
+            fee_cache: Mutex::new(BTreeMap::new()),
+            candle_cache: Mutex::new(BTreeMap::new()),
             cooldown_store: None,
             #[cfg(test)]
             stream_base: None,
@@ -932,25 +945,84 @@ impl Binance {
         Ok(out)
     }
     pub async fn candles(&self, symbol: &str, limit: usize) -> Result<Vec<Candle>> {
-        let v = self
-            .request(
-                Method::GET,
-                "/fapi/v1/klines",
-                vec![
-                    ("symbol".into(), symbol.into()),
-                    ("interval".into(), "5m".into()),
-                    ("limit".into(), limit.to_string()),
-                ],
-                false,
-            )
-            .await?;
+        ensure!((100..=1500).contains(&limit), "K 线回看数量无效");
+        let cache = self
+            .candle_cache
+            .lock()
+            .await
+            .entry(symbol.into())
+            .or_default()
+            .clone();
+        // Only requests for the same symbol wait on this lock. Different symbols
+        // retain the scanner's concurrency, without duplicating a cache miss.
+        let mut cached = cache.lock().await;
         let now = now_ms() + self.offset.load(Ordering::Relaxed);
+        let end = now / BAR_MS * BAR_MS - 1;
+        let incremental = cached.len() >= limit
+            && cached.last().is_some_and(|bar| {
+                bar.close_time <= end && (end - bar.close_time) / BAR_MS < limit as i64
+            });
+        let mut bars = if incremental { cached.clone() } else { vec![] };
+        if incremental && bars.last().is_some_and(|bar| bar.close_time == end) {
+            return Ok(bars.split_off(bars.len() - limit));
+        }
+        if incremental {
+            let start = bars.last().unwrap().open_time + BAR_MS;
+            let missing = ((end + 1 - start) / BAR_MS) as usize;
+            bars.extend(
+                self.fetch_candles(symbol, missing, Some(start), end)
+                    .await?,
+            );
+        } else {
+            // 499 + 1 costs 3 weight, whereas a 500-row request costs 5.
+            // Fetch backwards using endTime so no slot is spent on an open bar.
+            let mut remaining = limit;
+            let mut page_end = end;
+            while remaining > 0 {
+                let page = self
+                    .fetch_candles(symbol, remaining.min(499), None, page_end)
+                    .await?;
+                ensure!(!page.is_empty(), "K 线尚未完成预热");
+                page_end = page[0].open_time - 1;
+                remaining = remaining.saturating_sub(page.len());
+                bars.splice(0..0, page);
+            }
+        }
+        ensure!(bars.len() >= limit, "K 线尚未完成预热");
+        let bars = bars.split_off(bars.len() - limit);
+        crate::strategy::validate_bars(&bars, now)?;
+        ensure!(
+            bars.last().unwrap().close_time == end,
+            "最新收盘 K 线尚未更新"
+        );
+        *cached = bars.clone();
+        Ok(bars)
+    }
+    async fn fetch_candles(
+        &self,
+        symbol: &str,
+        limit: usize,
+        start: Option<i64>,
+        end: i64,
+    ) -> Result<Vec<Candle>> {
+        let mut params = vec![
+            ("symbol".into(), symbol.into()),
+            ("interval".into(), "5m".into()),
+            ("limit".into(), limit.to_string()),
+            ("endTime".into(), end.to_string()),
+        ];
+        if let Some(start) = start {
+            params.push(("startTime".into(), start.to_string()));
+        }
+        let v = self
+            .request(Method::GET, "/fapi/v1/klines", params, false)
+            .await?;
         let mut out = vec![];
         for row in v.as_array().context("invalid candles")? {
             let a = row.as_array().context("invalid candle")?;
             ensure!(a.len() >= 7, "short candle");
             let close_time = a[6].as_i64().context("missing closeTime")?;
-            if close_time >= now {
+            if close_time > end {
                 continue;
             }
             out.push(Candle {
@@ -963,6 +1035,12 @@ impl Binance {
                 volume: num(&a[5])?,
             });
         }
+        ensure!(out.len() == limit, "K 线返回数量不足或超出请求范围");
+        ensure!(
+            out.iter()
+                .all(|bar| start.is_none_or(|start| bar.open_time >= start)),
+            "K 线返回时间超出请求范围"
+        );
         Ok(out)
     }
     pub async fn preflight(&self) -> Result<Decimal> {
@@ -1131,6 +1209,19 @@ impl Binance {
         )?)
     }
     pub async fn fees(&self, symbol: &str) -> Result<(Decimal, Decimal)> {
+        let cache = self
+            .fee_cache
+            .lock()
+            .await
+            .entry(symbol.into())
+            .or_default()
+            .clone();
+        let mut cached = cache.lock().await;
+        if let Some(fees) = cached.as_ref()
+            && fees.at.elapsed() < FEE_CACHE_TTL
+        {
+            return Ok(fees.rates);
+        }
         let v = self
             .request(
                 Method::GET,
@@ -1139,10 +1230,16 @@ impl Binance {
                 true,
             )
             .await?;
-        Ok((
+        ensure!(v["symbol"].as_str() == Some(symbol), "手续费率币对不一致");
+        let rates = (
             decimal(&v["makerCommissionRate"])?,
             decimal(&v["takerCommissionRate"])?,
-        ))
+        );
+        *cached = Some(CachedFees {
+            at: Instant::now(),
+            rates,
+        });
+        Ok(rates)
     }
     pub async fn leverage(&self, symbol: &str, leverage: u8) -> Result<()> {
         self.request(
@@ -1429,6 +1526,207 @@ mod tests {
         }
     }
     use super::*;
+    #[tokio::test]
+    async fn fee_cache_coalesces_requests_and_isolates_symbols_and_clients() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route("/fapi/v1/commissionRate", get(move |Query(q): Query<BTreeMap<String, String>>| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Json(serde_json::json!({"symbol": q["symbol"], "makerCommissionRate":"0.0002", "takerCommissionRate":"0.0004"}))
+            }
+        }));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let exchange = Binance::mock(base.clone());
+        let results = tokio::join!(
+            exchange.fees("BTCUSDT"),
+            exchange.fees("BTCUSDT"),
+            exchange.fees("BTCUSDT")
+        );
+        assert_eq!(results.0.unwrap(), results.1.unwrap());
+        results.2.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            exchange.rate_limit_snapshot().await.estimated_used_weight,
+            20
+        );
+        exchange.fees("BTCUSDC").await.unwrap();
+        // Replacing credentials creates a client with an empty account-specific cache.
+        Binance::mock(base).fees("BTCUSDT").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn expired_or_invalid_fee_rates_do_not_fall_back_or_enter_the_cache() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route("/fapi/v1/commissionRate", get(move |Query(q): Query<BTreeMap<String, String>>| {
+            let count = count.clone(); async move {
+                let call = count.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({"symbol": if call == 1 {"WRONGUSDT"} else {&q["symbol"]},
+                    "makerCommissionRate":"0.0002", "takerCommissionRate": if call >= 2 {"0.0005"} else {"0.0004"}}))
+            }
+        }));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let exchange = Binance::mock(base);
+        exchange.fees("BTCUSDT").await.unwrap();
+        let cache = exchange.fee_cache.lock().await["BTCUSDT"].clone();
+        cache.lock().await.as_mut().unwrap().at = Instant::now() - FEE_CACHE_TTL;
+        assert!(exchange.fees("BTCUSDT").await.is_err());
+        let rates = exchange.fees("BTCUSDT").await.unwrap();
+        assert_eq!(rates.1, Decimal::from_str("0.0005").unwrap());
+        exchange.fees("BTCUSDT").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn candle_cache_preserves_the_full_lookback_and_only_fetches_new_closed_bars() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let calls = queries.clone();
+        let app = Router::new().route(
+            "/fapi/v1/klines",
+            get(move |Query(q): Query<BTreeMap<String, String>>| {
+                let calls = calls.clone();
+                async move {
+                    let end: i64 = q["endTime"].parse().unwrap();
+                    let limit: usize = q["limit"].parse().unwrap();
+                    let start = end + 1 - limit as i64 * BAR_MS;
+                    if let Some(requested_start) = q.get("startTime") {
+                        assert_eq!(requested_start.parse::<i64>().unwrap(), start);
+                    }
+                    calls.lock().await.push(q);
+                    Json(
+                        (0..limit)
+                            .map(|i| {
+                                let open = start + i as i64 * BAR_MS;
+                                serde_json::json!([
+                                    open,
+                                    "100.125",
+                                    "101",
+                                    "99",
+                                    "100.25",
+                                    "10.125",
+                                    open + BAR_MS - 1
+                                ])
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let exchange = Binance::mock(base);
+        // Pin exchange time away from a real bar boundary.
+        let fixed = now_ms() / BAR_MS * BAR_MS + 10_000;
+        exchange.offset.store(fixed - now_ms(), Ordering::Relaxed);
+        let initial = exchange.candles("BTCUSDT", 500).await.unwrap();
+        assert_eq!(initial.len(), 500);
+        assert_eq!(
+            initial.last().unwrap().close_time,
+            fixed / BAR_MS * BAR_MS - 1
+        );
+        assert_eq!(
+            exchange.rate_limit_snapshot().await.estimated_used_weight,
+            3
+        );
+        let same = exchange.candles("BTCUSDT", 500).await.unwrap();
+        assert_eq!(same[0].open_time, initial[0].open_time);
+        assert_eq!(same[0].volume, initial[0].volume);
+        assert_eq!(queries.lock().await.len(), 2);
+        exchange.offset.fetch_add(BAR_MS, Ordering::Relaxed);
+        let next = exchange.candles("BTCUSDT", 500).await.unwrap();
+        assert_eq!(next.len(), 500);
+        assert_eq!(next[0].open_time, initial[1].open_time);
+        assert_eq!(
+            next.last().unwrap().close_time,
+            initial.last().unwrap().close_time + BAR_MS
+        );
+        assert_eq!(
+            exchange.rate_limit_snapshot().await.estimated_used_weight,
+            4
+        );
+        let q = queries.lock().await;
+        assert_eq!(
+            q.iter().map(|q| q["limit"].as_str()).collect::<Vec<_>>(),
+            ["499", "1", "1"]
+        );
+        assert!(q[2].contains_key("startTime"));
+        drop(q);
+        // Increasing lookback beyond the cached history triggers a complete warmup.
+        exchange.candles("BTCUSDT", 600).await.unwrap();
+        assert_eq!(queries.lock().await.len(), 5);
+        // Time moving backwards must not publish bars from the future cache.
+        exchange.offset.fetch_sub(2 * BAR_MS, Ordering::Relaxed);
+        let rewound = exchange.candles("BTCUSDT", 120).await.unwrap();
+        assert_eq!(
+            rewound.last().unwrap().close_time,
+            initial.last().unwrap().close_time - BAR_MS
+        );
+        assert!(
+            !queries
+                .lock()
+                .await
+                .last()
+                .unwrap()
+                .contains_key("startTime")
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn incomplete_candle_updates_leave_validated_history_intact_for_retry() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use std::sync::atomic::AtomicBool;
+        let incomplete = Arc::new(AtomicBool::new(false));
+        let flag = incomplete.clone();
+        let app = Router::new().route(
+            "/fapi/v1/klines",
+            get(move |Query(q): Query<BTreeMap<String, String>>| {
+                let flag = flag.clone();
+                async move {
+                    let end: i64 = q["endTime"].parse().unwrap();
+                    let limit: usize = q["limit"].parse().unwrap();
+                    let start = end + 1 - limit as i64 * BAR_MS;
+                    Json(
+                        (0..limit)
+                            .map(|i| {
+                                let open = start + i as i64 * BAR_MS;
+                                let close = if flag.load(Ordering::SeqCst) {
+                                    open + BAR_MS
+                                } else {
+                                    open + BAR_MS - 1
+                                };
+                                serde_json::json!([open, "100", "101", "99", "100", "10", close])
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let exchange = Binance::mock(base);
+        let fixed = now_ms() / BAR_MS * BAR_MS + 10_000;
+        exchange.offset.store(fixed - now_ms(), Ordering::Relaxed);
+        let original = exchange.candles("BTCUSDT", 120).await.unwrap();
+        let last = original.last().unwrap().close_time;
+        exchange.offset.fetch_add(2 * BAR_MS, Ordering::Relaxed);
+        incomplete.store(true, Ordering::SeqCst);
+        assert!(exchange.candles("BTCUSDT", 120).await.is_err());
+        let cache = exchange.candle_cache.lock().await["BTCUSDT"].clone();
+        assert_eq!(cache.lock().await.last().unwrap().close_time, last);
+        incomplete.store(false, Ordering::SeqCst);
+        let updated = exchange.candles("BTCUSDT", 120).await.unwrap();
+        assert_eq!(updated.len(), 120);
+        assert_eq!(updated.last().unwrap().close_time, last + 2 * BAR_MS);
+        crate::strategy::validate_bars(&updated, fixed + 2 * BAR_MS).unwrap();
+        server.abort();
+    }
     #[tokio::test]
     async fn lifetime_trade_queries_split_seven_day_windows_and_reject_truncated_history() {
         use axum::{Json, Router, extract::Query, routing::get};

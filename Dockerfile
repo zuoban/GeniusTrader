@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo test --locked && cargo build --locked --release
 
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
-ARG VERSION=0.1.15
+ARG VERSION=0.1.16
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Genius Trader" \
       org.opencontainers.image.description="Binance USD-M futures service with a local Chinese console and Jev decisions" \

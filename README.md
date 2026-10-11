@@ -40,14 +40,14 @@ rtk proxy sh scripts/cargo.sh run --locked
 
 ## GitHub Packages 容器
 
-镜像：`ghcr.io/zuoban/geniustrader:0.1.15`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
+镜像：`ghcr.io/zuoban/geniustrader:0.1.16`，同时支持 Linux AMD64 和 ARM64；`latest` 指向最近一次发布。镜像为公开包，可匿名拉取，无需 GitHub 账号、PAT 或 `docker login`。
 
 ```sh
-rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.15
+rtk proxy docker pull ghcr.io/zuoban/geniustrader:0.1.16
 rtk proxy docker run -d --name genius-trader \
   --publish 8787:8787 \
   --mount type=volume,source=genius-trader-data,target=/app/data \
-  ghcr.io/zuoban/geniustrader:0.1.15
+  ghcr.io/zuoban/geniustrader:0.1.16
 ```
 
 本机打开 http://127.0.0.1:8787，服务器部署则打开 `http://服务器IPv4:8787`，首次仍为暂停的 paper 模式，并要求设置管理员密码。容器以 UID/GID 10001 运行，SQLite 和密钥持久化在数据卷；重建容器时保留同一个卷。宿主机的 8787 端口需要可用。数据库中的端口若改为其他值，下次启动时需同步修改端口映射。
@@ -78,7 +78,7 @@ rtk proxy docker compose up -d
 rtk proxy docker compose ps
 ```
 
-`compose.yaml` 使用 `0.1.15` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
+`compose.yaml` 使用 `0.1.16` 公开镜像，通过 `8787:8787` 映射宿主机端口，支持 `http://服务器IPv4:8787` 访问。数据库保存在外部数据卷 `genius-trader-data`；该卷先创建一次，以后重建或停止 Compose 项目时继续保留。之前通过 `docker run` 使用同名卷时可直接复用，但切换部署方式前需要停止使用该数据库的旧容器，避免同一数据库运行两个实例。
 
 打开 `http://服务器IPv4:8787`（本机部署使用 http://127.0.0.1:8787），首次设置管理员密码并在页面配置账户。首次默认 paper 模式并暂停新增开仓；每次重启仍暂停新增开仓。若宿主机 8787 端口被占用，将 `ports` 改成 `"8877:8787"`，再访问 `http://服务器IPv4:8877`；容器端口仍为 8787。
 
@@ -229,7 +229,7 @@ flowchart TD
 
 行情接入 [USD-M 公共 bookTicker WebSocket](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public)，按 [当前连接规范](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Connect)使用 `wss://fstream.binance.com/public/stream`；测试模式使用 `wss://demo-fstream.binance.com/stream`。模拟模式也接收真实公共报价，无需账户密钥。订阅覆盖币池、持仓和待确认订单，即使币对已停用或移出币池，仍保留持仓风控需要的报价。每 2 秒检查订阅变化，先退订再新增；订阅确认超过 8 秒、格式异常或断线时重连，单连接超过 1024 个币对时使用 REST 兜底。每 30 秒发送心跳，90 秒无帧或连接接近 24 小时时重连，指数退避最长 60 秒；握手也遵守共享限流退避。
 
-REST 持续兜底：每 2 秒检查各币对报价，行情连接健康时只补取缺失或超过 8 秒未更新的币对，断线时补取全部所需币对。一至两个币对使用单币查询，三个及以上使用一次全市场查询，返回结果只保留仍被币池、持仓或订单需要的币对。行情时效取所需币对中最早的接收时间，避免活跃币对掩盖其他币对的过期报价。订单/仓位目标周期 5 秒，扫描目标周期 10 秒；账户事件也会唤醒持仓管理，并合并短时间内的事件。网络和节流会影响实际周期；所有入场仅使用已收盘 5 分钟 K 线。持仓管理与 Jev 请求独立运行。目前没有历史回测器。
+REST 持续兜底：每 2 秒检查各币对报价，行情连接健康时只补取缺失或超过 8 秒未更新的币对，断线时补取全部所需币对。一至两个币对使用单币查询，三个及以上使用一次全市场查询，返回结果只保留仍被币池、持仓或订单需要的币对。行情时效取所需币对中最早的接收时间，避免活跃币对掩盖其他币对的过期报价。订单查询和本地止损目标周期仍为 5 秒，扫描目标周期 10 秒；账户推送正常、无差异、无未确认订单且本地委托未变化时，完整账户对账改为约 10 秒一次，期间保留原快照时间，不伪造刷新。账户事件、订单状态变化、新委托、同步失败或推送断线都会立即恢复完整读取，并合并短时间内的事件。网络和节流会影响实际周期；所有入场仅使用已收盘 5 分钟 K 线。持仓管理与 Jev 请求独立运行。目前没有历史回测器。
 
 行情 REST 请求因本地权重预算不足而未发送时，保留扫描启动状态，记录一次等待事件，并在预计额度释放后自动重试；等待期间仍每 2 秒更新 WebSocket 行情时效。网络故障、超时、服务暂时不可用及服务端限流退避也保留扫描启动状态。盘口超过 15 秒时暂不扫描，报价恢复且账户与费用核对完成后自动继续；手动暂停及需要人工处理的错误仍保留暂停状态。
 
@@ -240,6 +240,8 @@ REST 持续兜底：每 2 秒检查各币对报价，行情连接健康时只补
 退避截止时间、级别及 HTTP 状态 / 错误码按币安域名保存到同一 SQLite 的 `exchange_cooldowns` 表，不按交易模式隔离。服务重启、连接测试及 WebSocket 握手在发送前恢复剩余退避；退避已到期但未满 30 分钟时仍保留升级级别。恢复时将 Unix 截止时间转换为单调时钟等待，最长 3 天。记录损坏或数据库读写失败时禁止发送；保存失败保留内存退避并在下一次请求前重试落库，不把未发送订单标记为结果未知。该表不包含密钥或响应原文。运行中的独立进程不会实时共享退避，同一数据库仍只允许运行一个服务实例；滚动权重与监控计数在重启后重新开始。
 
 请求预算按当前使用的 [USD-M 行情](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data)、[账户](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/account)和[交易接口](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade)的权重计算，区分单币 / 全市场查询和 K 线 `limit` 档位。默认一分钟权重上限 2400，成功读取 `exchangeInfo` 时用有效的 `REQUEST_WEIGHT / MINUTE / 1` 规则更新。普通请求最多使用上限的 90%；账户 / 持仓核对、订单查询、成交结算和撤单可使用剩余保留额度，标记 `reduceOnly=true` 的平仓按文档使用 0 IP 权重，但仍受请求间隔和服务端限流退避约束。额度不足立即返回「本次未发送」，不等待整个窗口，也不自动重发订单。
+
+降低重复读取的权重消耗：手续费率按当前客户端 / 账户及币对缓存 15 分钟，同币并发查询合并为一次；更换账户连接后重新读取，过期后查询失败不会回退使用旧费率。实际成交费用仍以成交明细核实。K 线缓存完整、已校验的回看历史，下一根信号只补取新增收盘数据；同一根收盘数据直接复用。增加回看长度、缓存不足或交易所时间倒退时重新预热，缺失或不连续的数据不发布。请求显式指定已收盘的 `endTime`，500 根预热分为 499 + 1，按官方档位权重从 5 降为 3；正常补取一根权重为 1。缓存只在内存保存，重启后重新预热。手续费读取在信号去重标记前完成，权重不足而未发送时，额度恢复后可在信号有效期内重试同一根 K 线。
 
 预算使用单调时钟维护最近 60 秒的本地请求权重，并合并有效的 `X-MBX-USED-WEIGHT-1M` 响应头；服务端报告也保留 60 秒，较低或乱序的报告不能清除本地在途请求与尚未过期的高报告。该估计比服务端按分钟清零更保守，分钟切换后可能延后恢复；bookTicker 的权重响应头按官方说明忽略。其他进程和共享出口的新增消耗只能在后续响应头中观察；账户订单次数配额继续依靠请求间隔和 429 / -1015 退避，未单独实现订单次数预算。
 

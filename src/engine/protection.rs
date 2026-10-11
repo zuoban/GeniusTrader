@@ -323,10 +323,17 @@ impl Engine {
                 "止损保护与当前持仓不属于同一笔交易"
             );
             let current = i.book.stop_orders.get_mut(id).context("止损意图不存在")?;
+            let changed = current.algo_id != Some(remote.algo_id)
+                || current.actual_order_id != remote.actual_order_id
+                || current.order.status != remote.algo_status
+                || current.order.settlement_issue.is_some();
             current.algo_id = Some(remote.algo_id);
             current.actual_order_id = remote.actual_order_id;
             current.order.status = remote.algo_status.clone();
             current.order.settlement_issue = None;
+            if changed {
+                i.order_revision = i.order_revision.saturating_add(1);
+            }
             self.save(&mut i)?;
         }
         if let Some(actual_id) = remote.actual_order_id {
