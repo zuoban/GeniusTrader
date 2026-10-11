@@ -1680,13 +1680,18 @@ impl Engine {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let mut reports = stream::iter(pending)
+        let reports: Vec<_> = stream::iter(pending)
             .map(|order| async move {
                 let result = self.query_pending_order(&order).await;
                 (order, result)
             })
-            .buffered(4);
-        while let Some((o, result)) = reports.next().await {
+            .buffered(4)
+            .collect()
+            .await;
+        // Drain reads before applying reports: an unpolled buffered query can
+        // own the dispatch lock while sleeping for admission. Applying a fill
+        // report needs that same lock for userTrades and would deadlock forever.
+        for (o, result) in reports {
             // Only reads overlap. Apply reports and any cancellation in the original
             // order so partial fills cannot race settlement or order replacement.
             match result {
@@ -5349,6 +5354,109 @@ mod tests {
         // Binance responses may omit price fields. Full fills are the price proof.
         json!({"symbol":"WLDUSDC","clientOrderId":"gt-e-1791657599999-9","orderId":42,
             "status":status,"executedQty":executed,"origQty":"1775.8"})
+    }
+    #[tokio::test]
+    async fn startup_management_settles_first_order_while_other_queries_wait_for_admission() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        let app = Router::new()
+            .route(
+                "/fapi/v1/time",
+                get(|| async { Json(json!({"serverTime":now_ms()})) }),
+            )
+            .route(
+                "/fapi/v1/positionSide/dual",
+                get(|| async { Json(json!({"dualSidePosition":false})) }),
+            )
+            .route(
+                "/fapi/v3/balance",
+                get(|| async { Json(json!([{"asset":"USDT","availableBalance":"1000"}])) }),
+            )
+            .route(
+                "/fapi/v1/order",
+                get(|Query(query): Query<BTreeMap<String, String>>| async move {
+                    Json(if query["symbol"] == "WLDUSDC" {
+                        split_report("FILLED", "1775.8")
+                    } else {
+                        let index = match query["symbol"].as_str() {
+                            "BTCUSDC" => 0,
+                            "ETHUSDC" => 1,
+                            "ENAUSDC" => 2,
+                            _ => unreachable!(),
+                        };
+                        json!({"symbol":query["symbol"],"clientOrderId":format!("gt-t-{index}"),
+                        "orderId":43+index,"status":"NEW","executedQty":"0","origQty":"1"})
+                    })
+                }),
+            )
+            .route(
+                "/fapi/v1/userTrades",
+                get(|| async { Json(split_fills(true)) }),
+            )
+            .route(
+                "/fapi/v3/positionRisk",
+                get(|| async {
+                    Json(json!([{"symbol":"WLDUSDC",
+                "positionAmt":"1775.8","entryPrice":"0.5632","positionSide":"BOTH"}]))
+                }),
+            )
+            .route("/fapi/v1/openOrders", get(|| async { Json(json!([])) }))
+            .route(
+                "/fapi/v2/account",
+                get(|| async {
+                    Json(json!({"multiAssetsMargin":false,
+                "availableBalance":"1000","assets":[{"asset":"USDC","availableBalance":"1000"}]}))
+                }),
+            )
+            .route("/fapi/v1/income", get(|| async { Json(json!([])) }));
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let (config, mut book) = legacy_split_book("987.3", "987.3").await;
+        for (index, symbol) in ["BTCUSDC", "ETHUSDC", "ENAUSDC"].into_iter().enumerate() {
+            let mut order = entry(Action::Long);
+            order.client_id = format!("gt-t-{index}");
+            order.symbol = symbol.into();
+            order.role = OrderRole::TakeProfit;
+            order.status = "NEW".into();
+            book.pending.insert(order.client_id.clone(), order);
+        }
+        let store = Store::open(":memory:", Mode::Live).unwrap();
+        store.save(Mode::Live, &config, &book).unwrap();
+        let e = Engine::new(
+            Mode::Live,
+            store,
+            config,
+            Binance::mock(base.clone()),
+            Jev::mock(base),
+        )
+        .unwrap();
+        // The first report needs another REST read for fills. Later buffered
+        // queries must keep polling until they release the shared dispatch lock.
+        tokio::time::timeout(Duration::from_secs(5), e.manage_positions())
+            .await
+            .expect("首轮持仓管理卡住，成交查询与排队订单查询互相等待")
+            .unwrap();
+        let snapshot = e.snapshot().await;
+        assert_eq!(snapshot.runtime.position_management.runs, 1);
+        assert!(!snapshot.runtime.position_management.running);
+        assert!(snapshot.account_at > 0);
+        assert!(!snapshot.account_sync_failed);
+        assert_eq!(snapshot.pending.len(), 3);
+        assert!(snapshot.entry_blockers.is_empty());
+        assert_eq!(snapshot.positions[0].quantity, d("1775.8"));
+        assert_eq!(snapshot.positions[0].entry_fee, d("0.199"));
+        assert!(snapshot.positions[0].accounting_complete);
+        e.handle_user_event(UserEvent::Account).await.unwrap();
+        assert!(e.snapshot().await.account_update_pending);
+        tokio::time::timeout(Duration::from_secs(5), e.manage_positions())
+            .await
+            .expect("后续账户推送对账卡住")
+            .unwrap();
+        let snapshot = e.snapshot().await;
+        assert_eq!(snapshot.runtime.position_management.runs, 2);
+        assert!(!snapshot.account_update_pending);
+        assert_eq!(snapshot.positions[0].entry_fee, d("0.199"));
+        e.inner.lock().await.market_at = now_ms();
+        e.set_running(true).await.unwrap();
+        server.abort();
     }
     #[tokio::test]
     async fn legacy_settlement_recovers_when_client_order_lookup_is_unavailable() {

@@ -69,6 +69,9 @@ def main(image):
         assert b'id="watchlist"' in page and b'id="decisions-body"' in page
         assert b'id="monitor-title"' in page and b'id="monitor-stream"' in page
         dashboard = json.loads(request(base, "/api/dashboard"))
+        assert dashboard["version"] == state["version"]
+        assert ("v" + state["version"] + "</span>").encode() in page
+        assert b"{{APP_VERSION}}" not in page
         assert dashboard["mode"] == "paper" and dashboard["paused"] is True
         assert dashboard["market_stream"]["subscriptions"] == 0
         assert dashboard["user_stream"]["enabled"] is False

@@ -16,6 +16,8 @@
 .header-status{display:flex;align-items:center;gap:16px}.access-label{border-left:1px solid var(--line);padding-left:16px;color:var(--muted);font:10px var(--body);letter-spacing:0}.access-label.admin{color:var(--accent)}.setup-banner{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:20px 24px;margin-top:24px;border:1px solid #4c5939;background:#20281c}.setup-banner b{font-weight:500;color:var(--accent)}.setup-banner p{color:var(--muted);font-size:11px;line-height:1.8;margin:8px 0 0}.auth-dialog{max-width:480px}.auth-note{font-size:12px;line-height:1.9;color:#b9c4b9;margin:0 0 24px}.auth-fields{display:grid;gap:20px}.auth-fields label{display:flex;flex-direction:column;gap:10px;font-size:11px;color:var(--muted)}.auth-error{border-left:2px solid var(--red);padding:8px 12px;color:var(--red);font-size:12px;line-height:1.8}.auth-dialog .dialog-footer{gap:20px}.auth-dialog .primary{flex:1}
 @media(max-width:720px){.header-status{gap:8px;flex-wrap:wrap;justify-content:flex-end}.access-label{padding-left:8px;font-size:9px}.header-status .text-btn{font-size:9px}header>span{max-width:100px}.setup-banner{padding:16px;align-items:flex-start;flex-direction:column}.settings-tabs button{padding:14px 10px;font-size:11px}.settings-tabs>span{display:none}#system-panel .form-grid{grid-template-columns:1fr}}
 
+.version-label{padding:4px 7px;border:1px solid var(--line);border-radius:4px;font:10px var(--mono);color:var(--text);letter-spacing:0;white-space:nowrap}
+
 /* Trading desk: watchlist cards are the primary workspace. */
 :root{--bg:#101412;--panel:#171c19;--muted:#99a69c;--line:#2d3830;--accent:#d5eda1;--surface:#1e2620}
 body{background:radial-gradient(ellipse at 80% 0,#202a2040,transparent 48%),var(--bg)}

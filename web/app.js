@@ -110,6 +110,7 @@ function renderMonitoring(){
 }
 function render(){
   const s=state,c=s.config;
+  if(s.version)$('version-label').textContent='v'+s.version;
   auth=s.auth;renderAccess();
   if(!auth.initialized&&!setupPrompted){setupPrompted=true;showAuth();}
   $('mode').textContent={paper:'PAPER · 模拟交易',testnet:'TESTNET · 币安测试网',live:'LIVE · 币安实盘'}[s.mode];

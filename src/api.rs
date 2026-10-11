@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{net::Ipv4Addr, sync::Arc};
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub struct ApiError(anyhow::Error);
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
@@ -45,7 +47,9 @@ pub fn router_with_bind(app: Arc<Application>, bind: Ipv4Addr) -> Router {
     Router::new()
         .route(
             "/",
-            get(|| async { Html(include_str!("../web/index.html")) }),
+            get(|| async {
+                Html(include_str!("../web/index.html").replace("{{APP_VERSION}}", APP_VERSION))
+            }),
         )
         .route(
             "/app.css",
@@ -174,6 +178,7 @@ async fn request_guard(State(bind): State<Ipv4Addr>, req: Request, next: Next) -
 }
 #[derive(Serialize)]
 struct StateResponse {
+    version: &'static str,
     #[serde(flatten)]
     trading: Snapshot,
     background_modes: Vec<crate::application::BackgroundModeView>,
@@ -187,6 +192,7 @@ async fn state(
 ) -> Result<Json<StateResponse>, AuthError> {
     let e = app.engine.read().await;
     Ok(Json(StateResponse {
+        version: APP_VERSION,
         trading: e.snapshot().await,
         background_modes: app.background_modes(e.mode).await,
         settings: app.settings_view().await,
@@ -220,6 +226,7 @@ async fn dashboard(
     )?;
     Ok(Json(DashboardResponse {
         state: StateResponse {
+            version: APP_VERSION,
             background_modes: app.background_modes(trading.mode).await,
             trading,
             settings: app.settings_view().await,
@@ -449,6 +456,36 @@ mod tests {
         let cookie = response.headers()["set-cookie"].to_str().unwrap();
         assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
         cookie.split(';').next().unwrap().to_string()
+    }
+    #[tokio::test]
+    async fn page_and_public_state_show_the_running_binary_version() {
+        let router = app();
+        let response = router
+            .clone()
+            .oneshot(request("GET", "/", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let page = axum::body::to_bytes(response.into_body(), 100_000)
+            .await
+            .unwrap();
+        let page = std::str::from_utf8(&page).unwrap();
+        assert!(page.contains(&format!("title=\"当前服务运行版本\">v{APP_VERSION}</span>")));
+        assert!(!page.contains("{{APP_VERSION}}"));
+        for endpoint in ["/api/state", "/api/dashboard"] {
+            let response = router
+                .clone()
+                .oneshot(request("GET", endpoint, "", None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 100_000)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["version"], APP_VERSION);
+        }
     }
     #[tokio::test]
     async fn usdc_pool_routes_add_update_restore_and_remove_normalized_pairs() {
