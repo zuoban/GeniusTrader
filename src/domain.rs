@@ -194,6 +194,8 @@ pub enum OrderRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingOrder {
     pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange_order_id: Option<i64>,
     pub symbol: String,
     pub side: Action,
     pub role: OrderRole,

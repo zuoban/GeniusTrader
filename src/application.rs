@@ -375,6 +375,7 @@ mod tests {
     fn pending() -> PendingOrder {
         PendingOrder {
             client_id: "unknown".into(),
+            exchange_order_id: None,
             symbol: "BTCUSDT".into(),
             side: Action::Long,
             role: OrderRole::Entry,
@@ -945,6 +946,7 @@ mod tests {
                 "unknown".into(),
                 PendingOrder {
                     client_id: "unknown".into(),
+                    exchange_order_id: None,
                     symbol: "BTCUSDT".into(),
                     side: Action::Long,
                     role: OrderRole::Entry,
