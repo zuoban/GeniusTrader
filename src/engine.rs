@@ -1633,9 +1633,9 @@ impl Engine {
         // A legacy book stores exchange IDs on the position only. If lookup by
         // client ID cannot find the order, recover from those proven owned IDs.
         // Authentication, network and quota failures must not fan out requests.
-        if !error
+        if error
             .downcast_ref::<ExchangeError>()
-            .is_some_and(|e| e.code == -2013)
+            .is_none_or(|e| e.code != -2013)
         {
             return Err(error);
         }
