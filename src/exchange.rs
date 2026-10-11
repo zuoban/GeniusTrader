@@ -264,6 +264,10 @@ pub struct Fill {
     pub realized_pnl: Decimal,
     pub time: i64,
     pub side: String,
+    #[serde(default)]
+    pub symbol: String,
+    #[serde(default)]
+    pub position_side: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1197,6 +1201,41 @@ impl Binance {
             .await?,
         )?)
     }
+    pub async fn fills_between(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<Fill>> {
+        const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+        ensure!(
+            start > 0 && end >= start && end - start < 90 * 24 * 60 * 60 * 1000,
+            "持仓成交历史查询时间超出支持范围，需人工核对"
+        );
+        let mut cursor = start;
+        let mut fills = Vec::new();
+        while cursor <= end {
+            let until = (cursor + WEEK_MS - 1).min(end);
+            let page: Vec<Fill> = serde_json::from_value(
+                self.request(
+                    Method::GET,
+                    "/fapi/v1/userTrades",
+                    vec![
+                        ("symbol".into(), symbol.into()),
+                        ("startTime".into(), cursor.to_string()),
+                        ("endTime".into(), until.to_string()),
+                        ("limit".into(), "1000".into()),
+                    ],
+                    true,
+                )
+                .await?,
+            )?;
+            ensure!(page.len() < 1000, "持仓成交历史达到分页上限，需人工核对");
+            ensure!(
+                page.iter()
+                    .all(|fill| (cursor..=until).contains(&fill.time)),
+                "持仓成交历史返回了查询时间范围外的成交"
+            );
+            fills.extend(page);
+            cursor = until + 1;
+        }
+        Ok(fills)
+    }
     pub async fn funding(&self, start: i64) -> Result<Vec<Value>> {
         let v = self
             .request(
@@ -1216,6 +1255,61 @@ impl Binance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn lifetime_trade_queries_split_seven_day_windows_and_reject_truncated_history() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use serde_json::json;
+        let app = Router::new().route(
+            "/fapi/v1/userTrades",
+            get(|Query(q): Query<BTreeMap<String, String>>| async move {
+                assert!(!q.contains_key("orderId"));
+                assert!(!q.contains_key("fromId"));
+                assert_eq!(q["limit"], "1000");
+                let start: i64 = q["startTime"].parse().unwrap();
+                let end: i64 = q["endTime"].parse().unwrap();
+                assert!(end - start < 7 * 24 * 60 * 60 * 1000);
+                let fill = json!({"id":start,"orderId":42,"qty":"1","price":"0.5",
+                "commission":"0","commissionAsset":"USDC","realizedPnl":"0",
+                "time":if q["symbol"] == "OUTSIDEUSDC" {end+1} else {start},"side":"BUY"});
+                Json(if q["symbol"] == "FULLUSDC" {
+                    json!(vec![fill; 1000])
+                } else {
+                    json!([fill])
+                })
+            }),
+        );
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let exchange = Binance::mock(base);
+        let end = now_ms();
+        let start = end - 8 * 24 * 60 * 60 * 1000;
+        let fills = exchange.fills_between("WLDUSDC", start, end).await.unwrap();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].time, start);
+        assert_eq!(fills[1].time, start + 7 * 24 * 60 * 60 * 1000);
+        assert!(
+            exchange
+                .fills_between("FULLUSDC", start, end)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("分页上限")
+        );
+        assert!(
+            exchange
+                .fills_between("OUTSIDEUSDC", start, end)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("时间范围外")
+        );
+        assert!(
+            exchange
+                .fills_between("WLDUSDC", end - 91 * 24 * 60 * 60 * 1000, end)
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
     #[test]
     fn order_responses_allow_missing_price_fields_but_require_identity_and_quantities() {
         let response = serde_json::json!({"symbol":"ENAUSDC", "clientOrderId":"test", "orderId":42,

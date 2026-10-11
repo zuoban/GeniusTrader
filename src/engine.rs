@@ -57,6 +57,35 @@ struct EntryAccounting {
     trade_ids: BTreeSet<i64>,
     order_ids: BTreeSet<i64>,
 }
+#[derive(Clone, Serialize)]
+pub struct ExternalOrder {
+    pub symbol: String,
+    pub client_id: String,
+    pub order_id: i64,
+    pub status: String,
+    pub quantity: Decimal,
+    pub executed_quantity: Decimal,
+}
+impl From<&ExchangeOrder> for ExternalOrder {
+    fn from(order: &ExchangeOrder) -> Self {
+        Self {
+            symbol: order.symbol.clone(),
+            client_id: order.client_order_id.clone(),
+            order_id: order.order_id,
+            status: order.status.clone(),
+            quantity: order.orig_qty,
+            executed_quantity: order.executed_qty,
+        }
+    }
+}
+#[derive(Serialize)]
+pub struct AccountDifference {
+    pub symbol: String,
+    pub local_quantity: Option<Decimal>,
+    pub exchange_quantity: Option<Decimal>,
+    pub orders: Vec<ExternalOrder>,
+    pub reason: Option<String>,
+}
 #[derive(Debug)]
 struct IncompleteOrderHistory(String);
 impl std::fmt::Display for IncompleteOrderHistory {
@@ -93,6 +122,8 @@ pub struct Inner {
     pub account_assets_error: Option<String>,
     pub external_positions: BTreeMap<String, Decimal>,
     pub external_orders: Vec<String>,
+    external_order_details: Vec<ExternalOrder>,
+    account_reconciliation_errors: BTreeMap<String, String>,
     pub decisions: BTreeMap<String, Decision>,
     pub revision: u64,
     pub health: String,
@@ -126,6 +157,7 @@ pub struct Snapshot {
     pub closed_trades: Vec<ClosedTrade>,
     pub external_positions: BTreeMap<String, Decimal>,
     pub external_orders: Vec<String>,
+    pub account_differences: Vec<AccountDifference>,
     pub realized_net: Decimal,
     pub unrealized: Decimal,
     pub exposure_usdt: Decimal,
@@ -136,6 +168,82 @@ pub struct Snapshot {
     pub market_stream: MarketStreamStatus,
 }
 impl Inner {
+    fn order_matches(&self, remote: &ExchangeOrder) -> bool {
+        self.book
+            .pending
+            .get(&remote.client_order_id)
+            .is_some_and(|local| {
+                local.symbol == remote.symbol
+                    && local.quantity == remote.orig_qty
+                    && local.accounted_quantity == remote.executed_qty
+                    && local
+                        .exchange_order_id
+                        .is_none_or(|id| id == remote.order_id)
+                    && matches!(remote.status.as_str(), "NEW" | "PARTIALLY_FILLED")
+            })
+    }
+    fn account_differences(&self) -> Vec<AccountDifference> {
+        self.external_positions
+            .keys()
+            .chain(self.external_orders.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|symbol| AccountDifference {
+                local_quantity: self.book.positions.get(&symbol).map(|p| {
+                    if p.side == Action::Long {
+                        p.quantity
+                    } else {
+                        -p.quantity
+                    }
+                }),
+                exchange_quantity: self.external_positions.get(&symbol).copied(),
+                orders: self
+                    .external_order_details
+                    .iter()
+                    .filter(|order| order.symbol == symbol)
+                    .cloned()
+                    .collect(),
+                reason: self.account_reconciliation_errors.get(&symbol).cloned(),
+                symbol,
+            })
+            .collect()
+    }
+    fn account_difference_reason(&self, symbol: &str) -> String {
+        let mut details = Vec::new();
+        if let Some(actual) = self.external_positions.get(symbol) {
+            let local = self.book.positions.get(symbol).map_or(Decimal::ZERO, |p| {
+                if p.side == Action::Long {
+                    p.quantity
+                } else {
+                    -p.quantity
+                }
+            });
+            details.push(format!(
+                "{symbol} 本地数量 {local}，交易所数量 {actual}（正数为多仓，负数为空仓）"
+            ));
+        }
+        if self.external_orders.iter().any(|s| s == symbol) {
+            let ids: Vec<_> = self
+                .external_order_details
+                .iter()
+                .filter(|order| order.symbol == symbol)
+                .map(|order| format!("{} / {}", order.order_id, order.client_id))
+                .collect();
+            details.push(format!(
+                "未归属挂单：{}",
+                if ids.is_empty() {
+                    symbol.into()
+                } else {
+                    ids.join("、")
+                }
+            ));
+        }
+        if let Some(reason) = self.account_reconciliation_errors.get(symbol) {
+            details.push(reason.clone());
+        }
+        details.join("；")
+    }
     fn wants_market(&self, symbol: &str) -> bool {
         self.book.pool.contains_key(symbol)
             || self.book.positions.contains_key(symbol)
@@ -432,6 +540,8 @@ impl Engine {
                 account_assets_error: None,
                 external_positions: BTreeMap::new(),
                 external_orders: vec![],
+                external_order_details: vec![],
+                account_reconciliation_errors: BTreeMap::new(),
                 decisions: BTreeMap::new(),
                 revision: 0,
                 health,
@@ -535,6 +645,7 @@ impl Engine {
                 .collect(),
             external_positions: i.external_positions.clone(),
             external_orders: i.external_orders.clone(),
+            account_differences: i.account_differences(),
             realized_net: i.realized_net,
             unrealized,
             exposure_usdt: i.exposure(),
@@ -768,6 +879,10 @@ impl Engine {
                     }
                 } else if !order.report().terminal() {
                     let mut i = self.inner.lock().await;
+                    let detail = ExternalOrder::from(&order.report());
+                    i.external_order_details
+                        .retain(|o| o.order_id != detail.order_id || o.symbol != detail.symbol);
+                    i.external_order_details.push(detail);
                     if !i.external_orders.contains(&order.symbol) {
                         i.external_orders.push(order.symbol);
                     }
@@ -1254,65 +1369,8 @@ impl Engine {
                 !position.owned_order_ids.is_empty() || order.accounted_quantity > Decimal::ZERO,
                 "持仓缺少归属委托记录，无法重建成交数量"
             );
-            // Only reconstruct orders that are already recorded as ours. The
-            // account's total position may contain manual trades and is not proof.
-            for id in position
-                .owned_order_ids
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-            {
-                if id == remote.order_id {
-                    continue;
-                }
-                let report = self.exchange.order_by_id(&order.symbol, id).await?;
-                ensure!(
-                    report.order_id == id
-                        && report.symbol == order.symbol
-                        && report.executed_qty >= Decimal::ZERO
-                        && report.executed_qty <= report.orig_qty,
-                    "历史归属委托回报不一致（{id}）"
-                );
-                if let Some(pending) = self
-                    .inner
-                    .lock()
-                    .await
-                    .book
-                    .pending
-                    .get(&report.client_order_id)
-                {
-                    ensure!(
-                        pending.symbol == report.symbol && pending.quantity == report.orig_qty,
-                        "历史归属委托与持久化委托不一致（{id}）"
-                    );
-                    if pending.accounted_quantity != report.executed_qty {
-                        return Err(IncompleteOrderHistory(format!(
-                            "其他委托成交尚未入账，等待核对（{id}）"
-                        ))
-                        .into());
-                    }
-                } else {
-                    ensure!(report.terminal(), "历史归属委托状态尚未确认（{id}）");
-                }
-                let trades = self.exchange.fills(&order.symbol, id).await?;
-                if let (Some(issue), incomplete) = fill_settlement_issue(&trades, &report, order) {
-                    let reason = format!("历史归属委托尚未核实（{id}）：{issue}");
-                    if incomplete {
-                        return Err(IncompleteOrderHistory(reason).into());
-                    }
-                    anyhow::bail!(reason);
-                }
-                accounting.add(order.side, id, &trades)?;
-            }
-            if !position
-                .observed_trade_ids
-                .iter()
-                .all(|id| accounting.trade_ids.contains(id))
-            {
-                return Err(
-                    IncompleteOrderHistory("历史成交明细不完整，等待重新查询".into()).into(),
-                );
-            }
+            self.add_owned_orders(&mut accounting, position, Some(remote.order_id))
+                .await?;
         }
         ensure!(
             accounting.entry_quantity > Decimal::ZERO
@@ -1320,6 +1378,169 @@ impl Engine {
             "归属成交的开平仓数量不一致"
         );
         Ok(accounting)
+    }
+    async fn add_owned_orders(
+        &self,
+        accounting: &mut EntryAccounting,
+        position: &Position,
+        skip: Option<i64>,
+    ) -> Result<()> {
+        // Only reconstruct orders that are already recorded as ours. The
+        // account's total position may contain manual trades and is not proof.
+        for id in position
+            .owned_order_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            if Some(id) == skip {
+                continue;
+            }
+            let report = self.exchange.order_by_id(&position.symbol, id).await?;
+            ensure!(
+                report.order_id == id
+                    && report.symbol == position.symbol
+                    && report.orig_qty > Decimal::ZERO
+                    && report.executed_qty >= Decimal::ZERO
+                    && report.executed_qty <= report.orig_qty,
+                "历史归属委托回报不一致（{id}）"
+            );
+            if let Some(pending) = self
+                .inner
+                .lock()
+                .await
+                .book
+                .pending
+                .get(&report.client_order_id)
+            {
+                ensure!(
+                    pending.symbol == report.symbol && pending.quantity == report.orig_qty,
+                    "历史归属委托与持久化委托不一致（{id}）"
+                );
+                if pending.accounted_quantity != report.executed_qty
+                    || pending.settlement_issue.is_some()
+                    || matches!(
+                        pending.status.as_str(),
+                        "UNKNOWN" | "SUBMITTING" | "SETTLING"
+                    )
+                {
+                    return Err(IncompleteOrderHistory(format!(
+                        "其他委托成交尚未入账，等待核对（{id}）"
+                    ))
+                    .into());
+                }
+            } else {
+                ensure!(report.terminal(), "历史归属委托状态尚未确认（{id}）");
+            }
+            let trades = self.exchange.fills(&position.symbol, id).await?;
+            if let (Some(issue), incomplete) =
+                fill_settlement_issue(&trades, &report, &position.symbol)
+            {
+                let reason = format!("历史归属委托尚未核实（{id}）：{issue}");
+                if incomplete {
+                    return Err(IncompleteOrderHistory(reason).into());
+                }
+                anyhow::bail!(reason);
+            }
+            accounting.add(position.side, id, &trades)?;
+        }
+        if !position
+            .observed_trade_ids
+            .iter()
+            .all(|id| accounting.trade_ids.contains(id))
+        {
+            return Err(IncompleteOrderHistory("历史成交明细不完整，等待重新查询".into()).into());
+        }
+        Ok(())
+    }
+    async fn closed_position_accounting(&self, position: &Position) -> Result<EntryAccounting> {
+        ensure!(
+            !position.owned_order_ids.is_empty(),
+            "持仓缺少归属订单号，无法核实平仓成交"
+        );
+        let mut owned = EntryAccounting::default();
+        self.add_owned_orders(&mut owned, position, None).await?;
+        ensure!(
+            owned.entry_quantity > Decimal::ZERO && owned.exit_quantity <= owned.entry_quantity,
+            "归属成交的开平仓数量不一致"
+        );
+        // Re-read the entire lifetime of this position, including an exchange or
+        // manual close that was never one of our pending orders. Accept exits
+        // only when all entries are proven ours and the complete net is zero.
+        let fills = self
+            .exchange
+            .fills_between(&position.symbol, position.opened_at, now_ms())
+            .await?;
+        let mut groups = BTreeMap::<i64, Vec<Fill>>::new();
+        for fill in fills {
+            ensure!(
+                fill.symbol == position.symbol && fill.position_side == "BOTH",
+                "平仓成交的币对或持仓模式不一致"
+            );
+            groups.entry(fill.order_id).or_default().push(fill);
+        }
+        let mut historical_owned = EntryAccounting::default();
+        let mut complete = EntryAccounting::default();
+        for (id, trades) in groups {
+            let report = self.exchange.order_by_id(&position.symbol, id).await?;
+            ensure!(
+                id > 0
+                    && report.order_id == id
+                    && report.symbol == position.symbol
+                    && report.orig_qty > Decimal::ZERO
+                    && report.executed_qty >= Decimal::ZERO
+                    && report.executed_qty <= report.orig_qty
+                    && report.terminal(),
+                "平仓历史订单尚未确认（{id}）"
+            );
+            if let Some(pending) = self
+                .inner
+                .lock()
+                .await
+                .book
+                .pending
+                .get(&report.client_order_id)
+            {
+                ensure!(
+                    pending.symbol == report.symbol
+                        && pending.quantity == report.orig_qty
+                        && pending.accounted_quantity == report.executed_qty,
+                    "系统平仓订单尚未完成对账（{id}）"
+                );
+            }
+            if let (Some(issue), _) = fill_settlement_issue(&trades, &report, &position.symbol) {
+                anyhow::bail!("平仓成交费用尚未核实（{id}）：{issue}");
+            }
+            if owned.order_ids.contains(&id) {
+                historical_owned.add(position.side, id, &trades)?;
+            } else {
+                ensure!(
+                    trades
+                        .iter()
+                        .all(|fill| fill.side == position.side.exit_side()),
+                    "存在未归属的开仓成交，无法自动结清本地持仓（{id}）"
+                );
+            }
+            complete.add(position.side, id, &trades)?;
+        }
+        ensure!(
+            historical_owned.trade_ids == owned.trade_ids
+                && historical_owned.entry_quantity == owned.entry_quantity
+                && historical_owned.entry_quote == owned.entry_quote
+                && historical_owned.entry_fee == owned.entry_fee
+                && historical_owned.exit_quantity == owned.exit_quantity
+                && historical_owned.exit_fee == owned.exit_fee
+                && historical_owned.realized_gross == owned.realized_gross,
+            "持仓历史成交尚未完整，等待重新查询"
+        );
+        ensure!(
+            complete.entry_quantity > Decimal::ZERO
+                && complete.entry_quantity == complete.exit_quantity,
+            "交易所持仓为零，但平仓成交数量尚未匹配：开仓 {}，平仓 {}",
+            complete.entry_quantity,
+            complete.exit_quantity
+        );
+        Ok(complete)
     }
     async fn apply_order(&self, remote: ExchangeOrder) -> Result<()> {
         let (pending, position) = {
@@ -1357,7 +1578,7 @@ impl Engine {
             None
         };
         let (mut settlement_issue, mut incomplete_fills) = match &fills {
-            Some(Ok(fills)) => fill_settlement_issue(fills, &remote, &o),
+            Some(Ok(fills)) => fill_settlement_issue(fills, &remote, &o.symbol),
             Some(Err(error)) => (Some(format!("成交明细查询失败：{error}")), false),
             None => (None, false),
         };
@@ -1826,6 +2047,9 @@ impl Engine {
                 }
             }
         }
+        if self.mode != Mode::Paper {
+            self.cancel_closed_position_orders().await?;
+        }
         self.finalize_closed().await?;
         let positions = self
             .inner
@@ -1876,14 +2100,106 @@ impl Engine {
     }
     async fn sync_account(&self) -> Result<bool> {
         let generation = self.inner.lock().await.account_generation;
-        let (remote, orders, balances) = tokio::try_join!(
+        let (mut remote, mut orders, mut balances) = tokio::try_join!(
             self.exchange.positions(),
             self.exchange.open_orders(),
             self.exchange.margin_balances(),
         )?;
+        ensure!(
+            remote.iter().all(|p| p.position_side == "BOTH"),
+            "账户出现双向持仓"
+        );
+        let candidates = {
+            let i = self.inner.lock().await;
+            if generation != i.account_generation {
+                return Ok(false);
+            }
+            i.book
+                .positions
+                .values()
+                .filter(|p| {
+                    p.quantity > Decimal::ZERO
+                        && remote
+                            .iter()
+                            .all(|r| r.symbol != p.symbol || r.position_amt == Decimal::ZERO)
+                        && orders
+                            .iter()
+                            .filter(|o| o.symbol == p.symbol)
+                            .all(|o| i.order_matches(o))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let recheck = !candidates.is_empty();
+        let mut repairs = Vec::new();
+        let mut errors = BTreeMap::new();
+        for position in candidates {
+            let unresolved = self.inner.lock().await.book.pending.values().any(|o| {
+                o.symbol == position.symbol
+                    && (o.role != OrderRole::TakeProfit
+                        || o.settlement_issue.is_some()
+                        || !matches!(o.status.as_str(), "NEW" | "PARTIALLY_FILLED"))
+            });
+            let result = if unresolved {
+                Err(anyhow::anyhow!("系统仍有未确认委托或费用，等待订单对账"))
+            } else {
+                self.closed_position_accounting(&position).await
+            };
+            match result {
+                Ok(accounting) => repairs.push((position, accounting)),
+                Err(error) => {
+                    errors.insert(position.symbol, error.to_string());
+                }
+            }
+        }
+        if recheck {
+            // History reads can outlive the first account snapshot. Publish a
+            // repair only after a second complete read still proves flat, with
+            // no newer account push having invalidated either read.
+            (remote, orders, balances) = tokio::try_join!(
+                self.exchange.positions(),
+                self.exchange.open_orders(),
+                self.exchange.margin_balances(),
+            )?;
+        }
         let mut i = self.inner.lock().await;
         if generation != i.account_generation {
             return Ok(false);
+        }
+        ensure!(
+            remote.iter().all(|p| p.position_side == "BOTH"),
+            "账户出现双向持仓"
+        );
+        let mut repaired = Vec::new();
+        for (previous, accounting) in repairs {
+            if remote
+                .iter()
+                .any(|r| r.symbol == previous.symbol && r.position_amt != Decimal::ZERO)
+                || orders
+                    .iter()
+                    .any(|o| o.symbol == previous.symbol && !i.order_matches(o))
+            {
+                errors.insert(previous.symbol, "核对期间账户再次变化，等待完整对账".into());
+                continue;
+            }
+            if let Some(position) = i.book.positions.get_mut(&previous.symbol) {
+                position.quantity = Decimal::ZERO;
+                position.original_quantity = accounting.entry_quantity;
+                position.entry_price = accounting.entry_quote / accounting.entry_quantity;
+                position.entry_fee = accounting.entry_fee;
+                position.exit_fee = accounting.exit_fee;
+                position.realized_gross = accounting.realized_gross;
+                position.observed_trade_ids = accounting.trade_ids.iter().copied().collect();
+                position.owned_order_ids = accounting.order_ids.iter().copied().collect();
+                position.accounting_complete = true;
+                repaired.push((previous, accounting));
+            }
+        }
+        if !repaired.is_empty() {
+            i.paused = true;
+            i.revision += 1;
+            i.health = "已核实交易所平仓并结算，新增开仓已暂停".into();
+            self.save(&mut i)?;
         }
         let mut external = BTreeMap::new();
         let mut actual = BTreeMap::new();
@@ -1910,16 +2226,24 @@ impl Engine {
         }
         // External/manual changes are never silently adopted or canceled.
         for p in i.book.positions.values() {
-            if p.quantity > Decimal::ZERO && !actual.contains_key(&p.symbol) {
+            if p.quantity > Decimal::ZERO
+                && actual.get(&p.symbol).copied().unwrap_or_default() == Decimal::ZERO
+            {
                 external.insert(p.symbol.clone(), Decimal::ZERO);
             }
         }
+        i.external_order_details = orders
+            .iter()
+            .filter(|o| !i.book.pending.contains_key(&o.client_order_id))
+            .map(ExternalOrder::from)
+            .collect();
         i.external_orders = orders
             .iter()
             .filter(|o| !i.book.pending.contains_key(&o.client_order_id))
             .map(|o| o.symbol.clone())
             .collect();
         i.external_positions = external;
+        i.account_reconciliation_errors = errors;
         i.available = if balances.multi_assets_margin {
             balances.available_balance
         } else {
@@ -1938,7 +2262,61 @@ impl Engine {
             i.paused = true;
             i.health = "账户与系统记录不一致，暂停新开仓，保留订单".into();
         }
+        drop(i);
+        for (previous, accounting) in repaired {
+            self.event(
+                "trade",
+                Some(&previous.symbol),
+                "交易所持仓已归零，已核实平仓成交并结清本地记录",
+                json!({"previous_quantity":previous.quantity,"quantity":"0",
+                    "entry_fee":accounting.entry_fee,"exit_fee":accounting.exit_fee,
+                    "realized_gross":accounting.realized_gross,"order_ids":accounting.order_ids}),
+            );
+        }
         Ok(true)
+    }
+    async fn cancel_closed_position_orders(&self) -> Result<()> {
+        let pending = {
+            let i = self.inner.lock().await;
+            if i.account_sync_failed
+                || i.account_update_pending
+                || !(0..15_000).contains(&(now_ms() - i.account_at))
+            {
+                return Ok(());
+            }
+            i.book
+                .pending
+                .values()
+                .filter(|o| {
+                    o.role == OrderRole::TakeProfit
+                        && matches!(o.status.as_str(), "NEW" | "PARTIALLY_FILLED")
+                        && o.settlement_issue.is_none()
+                        && !i.external_positions.contains_key(&o.symbol)
+                        && !i.external_orders.contains(&o.symbol)
+                        && i.book
+                            .positions
+                            .get(&o.symbol)
+                            .is_some_and(|p| p.quantity == Decimal::ZERO && p.accounting_complete)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for order in pending {
+            match self.exchange.cancel(&order.symbol, &order.client_id).await {
+                Ok(report) => {
+                    if let Err(error) = self.apply_order(report).await {
+                        self.record_order_apply_error(&order, error).await?;
+                    }
+                }
+                Err(error) => self.event(
+                    "warn",
+                    Some(&order.symbol),
+                    "已平仓持仓的系统止盈单撤销等待",
+                    json!({"client_id":order.client_id,"error":error.to_string()}),
+                ),
+            }
+        }
+        Ok(())
     }
     async fn sync_funding(&self) -> Result<()> {
         let cursor = {
@@ -2362,7 +2740,8 @@ impl Engine {
         ensure!(
             !i.external_positions.contains_key(symbol)
                 && !i.external_orders.iter().any(|s| s == symbol),
-            "已发现外部持仓或订单，等待完整账户对账"
+            "已发现外部持仓或订单，等待完整账户对账：{}",
+            i.account_difference_reason(symbol)
         );
         let p = i.book.positions.get(symbol).context("持仓不存在")?;
         ensure!(positions.len() == 1, "止损持仓数量或持仓模式尚未确认");
@@ -2441,7 +2820,8 @@ impl Engine {
             ensure!(
                 !i.external_positions.contains_key(symbol)
                     && !i.external_orders.iter().any(|s| s == symbol),
-                "外部持仓或订单变更，等待完整账户对账"
+                "外部持仓或订单变更，等待完整账户对账：{}",
+                i.account_difference_reason(symbol)
             );
             let q = i.quotes.get(symbol).context("止损盘口缺失")?;
             q.validate()?;
@@ -2639,7 +3019,7 @@ impl EntryAccounting {
 fn fill_settlement_issue(
     fills: &[Fill],
     remote: &ExchangeOrder,
-    order: &PendingOrder,
+    symbol: &str,
 ) -> (Option<String>, bool) {
     let mut ids = BTreeSet::new();
     if fills.iter().any(|fill| {
@@ -2663,7 +3043,7 @@ fn fill_settlement_issue(
             quantity < remote.executed_qty,
         );
     }
-    let Some(asset) = settlement_asset(&order.symbol) else {
+    let Some(asset) = settlement_asset(symbol) else {
         return (Some("合约结算币种不支持".into()), false);
     };
     let foreign: BTreeSet<_> = fills
@@ -5705,6 +6085,284 @@ mod tests {
                 "commission":"0.088","commissionAsset":"USDC","realizedPnl":"0","time":2,"side":"BUY"}));
         }
         json!(fills)
+    }
+    struct FlatFixture {
+        scenario: &'static str,
+        side: Action,
+        opened_at: i64,
+        account_reads: std::sync::atomic::AtomicUsize,
+        order_reads: std::sync::atomic::AtomicUsize,
+        history_reads: std::sync::atomic::AtomicUsize,
+        submissions: std::sync::atomic::AtomicUsize,
+        cancellations: std::sync::atomic::AtomicUsize,
+        history_started: Notify,
+        history_release: Notify,
+    }
+    impl FlatFixture {
+        fn trades(&self) -> Vec<Value> {
+            let mut entries = split_fills(true).as_array().unwrap().clone();
+            for (index, fill) in entries.iter_mut().enumerate() {
+                fill["time"] = json!(self.opened_at + index as i64 + 1);
+                fill["symbol"] = json!("WLDUSDC");
+                fill["positionSide"] = json!("BOTH");
+                fill["side"] = json!(self.side.entry_side());
+            }
+            let quantity = match self.scenario {
+                "incomplete_close" => "987.3",
+                "unowned_entry" => "1785.8",
+                _ => "1775.8",
+            };
+            entries.push(json!({"id":3,"orderId":43,"qty":quantity,"price":"0.55",
+                "commission":"0.2","commissionAsset":if self.scenario == "foreign_fee" {"BNB"} else {"USDC"},
+                "realizedPnl":"-23.42","time":self.opened_at+3,"side":self.side.exit_side(),
+                "symbol":"WLDUSDC","positionSide":"BOTH"}));
+            if self.scenario == "unowned_entry" {
+                entries.push(json!({"id":4,"orderId":45,"qty":"10","price":"0.55",
+                    "commission":"0.01","commissionAsset":"USDC","realizedPnl":"0",
+                    "time":self.opened_at+2,"side":self.side.entry_side(),"symbol":"WLDUSDC","positionSide":"BOTH"}));
+            }
+            entries
+        }
+        fn report(&self, id: i64, canceled: bool) -> Value {
+            if id == 42 {
+                return split_report("FILLED", "1775.8");
+            }
+            let (client, qty, executed, status) = if id == 44 {
+                (
+                    "flat-tp",
+                    "987.3",
+                    "0",
+                    if canceled { "CANCELED" } else { "NEW" },
+                )
+            } else if id == 45 {
+                ("external-entry", "10", "10", "FILLED")
+            } else {
+                let qty = match self.scenario {
+                    "incomplete_close" => "987.3",
+                    "unowned_entry" => "1785.8",
+                    _ => "1775.8",
+                };
+                ("external-close", qty, qty, "FILLED")
+            };
+            json!({"symbol":"WLDUSDC","clientOrderId":client,"orderId":id,
+                "status":status,"origQty":qty,"executedQty":executed})
+        }
+    }
+    async fn flat_fixture(
+        scenario: &'static str,
+        side: Action,
+    ) -> (Arc<Engine>, Arc<FlatFixture>, tokio::task::JoinHandle<()>) {
+        use axum::{
+            Json, Router,
+            extract::{Query, State},
+            routing::get,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fixture = Arc::new(FlatFixture {
+            scenario,
+            side,
+            opened_at: now_ms() - 60_000,
+            account_reads: AtomicUsize::new(0),
+            order_reads: AtomicUsize::new(0),
+            history_reads: AtomicUsize::new(0),
+            submissions: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
+            history_started: Notify::new(),
+            history_release: Notify::new(),
+        });
+        let app = Router::new()
+            .route("/fapi/v3/positionRisk", get(|State(s):State<Arc<FlatFixture>>| async move {
+                let read = s.account_reads.fetch_add(1, Ordering::SeqCst);
+                Json(if s.scenario == "explicit_zero" || (s.scenario == "rebound" && read > 0) {
+                    json!([{"symbol":"WLDUSDC","positionAmt":if s.scenario == "rebound" {"10"} else {"0"},
+                        "entryPrice":"0.56","positionSide":"BOTH"}])
+                } else { json!([]) })
+            }))
+            .route("/fapi/v1/openOrders", get(|State(s):State<Arc<FlatFixture>>| async move {
+                let read=s.order_reads.fetch_add(1,Ordering::SeqCst);
+                Json(if s.scenario == "external_order" || (s.scenario == "late_external_order" && read > 0) {
+                    let mut order=s.report(45,false);
+                    order["status"]=json!("NEW");order["executedQty"]=json!("0");
+                    json!([order])
+                }
+                else if s.scenario == "tp" && s.cancellations.load(Ordering::SeqCst) == 0 { json!([s.report(44,false)]) }
+                else { json!([]) })
+            }))
+            .route("/fapi/v2/account", get(|| async {Json(json!({"multiAssetsMargin":true,"availableBalance":"1000","assets":[]}))}))
+            .route("/fapi/v1/order", get(|State(s):State<Arc<FlatFixture>>, Query(q):Query<BTreeMap<String,String>>| async move {
+                let id = q.get("orderId").map_or(44, |id| id.parse().unwrap());
+                Json(s.report(id,false))
+            }).delete(|State(s):State<Arc<FlatFixture>>, Query(q):Query<BTreeMap<String,String>>| async move {
+                assert_eq!(q["origClientOrderId"], "flat-tp");
+                s.cancellations.fetch_add(1, Ordering::SeqCst);
+                Json(s.report(44,true))
+            }).post(|State(s):State<Arc<FlatFixture>>| async move {
+                s.submissions.fetch_add(1,Ordering::SeqCst);
+                Json(json!({"code":-1000,"msg":"unexpected submission"}))
+            }))
+            .route("/fapi/v1/userTrades", get(|State(s):State<Arc<FlatFixture>>, Query(q):Query<BTreeMap<String,String>>| async move {
+                let trades = s.trades();
+                Json(if let Some(id) = q.get("orderId") {
+                    let id: i64 = id.parse().unwrap();
+                    json!(trades.into_iter().filter(|fill| fill["orderId"] == id).collect::<Vec<_>>())
+                } else {
+                    assert_eq!(q["startTime"], s.opened_at.to_string());
+                    s.history_reads.fetch_add(1,Ordering::SeqCst);
+                    if s.scenario == "push" { s.history_started.notify_one(); s.history_release.notified().await; }
+                    json!(trades)
+                })
+            })).with_state(fixture.clone());
+        let (base, server) = crate::test_support::mock_server(app).await;
+        let (config, mut book) = legacy_split_book("1775.8", "1775.8").await;
+        book.pending.clear();
+        book.funding_last_poll = now_ms();
+        let p = book.positions.get_mut("WLDUSDC").unwrap();
+        p.opened_at = fixture.opened_at;
+        p.side = side;
+        p.accounting_complete = true;
+        p.stop_loss_triggered = true;
+        if scenario == "owned_close" {
+            p.owned_order_ids.push(43);
+            p.observed_trade_ids.push(3);
+        }
+        if scenario == "tp" {
+            let mut tp = entry(side);
+            tp.client_id = "flat-tp".into();
+            tp.symbol = "WLDUSDC".into();
+            tp.role = OrderRole::TakeProfit;
+            tp.quantity = d("987.3");
+            tp.status = "NEW".into();
+            tp.exchange_order_id = Some(44);
+            p.tp_client_id = Some(tp.client_id.clone());
+            p.tp_price = Some(d("0.57"));
+            book.pending.insert(tp.client_id.clone(), tp);
+        }
+        let store = Store::open(":memory:", Mode::Live).unwrap();
+        store.save(Mode::Live, &config, &book).unwrap();
+        let e = Engine::new(
+            Mode::Live,
+            store,
+            config,
+            Binance::mock(base),
+            Jev::new().unwrap(),
+        )
+        .unwrap();
+        e.inner.lock().await.account_at = now_ms();
+        (e, fixture, server)
+    }
+    #[tokio::test]
+    async fn exchange_flat_recovery_settles_long_and_short_history_without_another_close() {
+        use std::sync::atomic::Ordering;
+        for (scenario, side) in [
+            ("external_close", Action::Long),
+            ("external_close", Action::Short),
+            ("owned_close", Action::Long),
+            ("explicit_zero", Action::Long),
+            ("tp", Action::Long),
+        ] {
+            let (e, fixture, server) = flat_fixture(scenario, side).await;
+            e.inner.lock().await.paused = false;
+            e.manage_positions().await.unwrap();
+            let s = e.snapshot().await;
+            assert!(s.positions.is_empty(), "{scenario}");
+            assert!(s.pending.is_empty(), "{scenario}");
+            assert!(s.external_positions.is_empty());
+            assert!(s.external_orders.is_empty());
+            assert!(!s.entry_data_pending);
+            assert!(s.paused);
+            assert_eq!(s.closed_trades.len(), 1);
+            assert_eq!(s.closed_trades[0].net_profit, d("-23.829"));
+            assert_eq!(fixture.submissions.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                fixture.cancellations.load(Ordering::SeqCst),
+                usize::from(scenario == "tp")
+            );
+            assert_eq!(fixture.account_reads.load(Ordering::SeqCst), 2);
+            e.manage_positions().await.unwrap();
+            assert_eq!(e.snapshot().await.closed_trades.len(), 1);
+            assert_eq!(fixture.history_reads.load(Ordering::SeqCst), 1);
+            let restored = Engine::new(
+                Mode::Live,
+                e.store.clone(),
+                config(),
+                Binance::mock(e.exchange.base.clone()),
+                Jev::new().unwrap(),
+            )
+            .unwrap();
+            assert!(restored.snapshot().await.positions.is_empty());
+            assert_eq!(restored.snapshot().await.closed_trades.len(), 1);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn exchange_flat_recovery_preserves_incomplete_fees_and_unowned_entries() {
+        use std::sync::atomic::Ordering;
+        for (scenario, reason) in [
+            ("incomplete_close", "平仓成交数量尚未匹配"),
+            ("foreign_fee", "非零手续费币种"),
+            ("unowned_entry", "未归属的开仓成交"),
+            ("rebound", "账户再次变化"),
+            ("late_external_order", "账户再次变化"),
+        ] {
+            let (e, fixture, server) = flat_fixture(scenario, Action::Long).await;
+            assert!(e.sync_account().await.unwrap());
+            let s = e.snapshot().await;
+            assert_eq!(s.positions[0].quantity, d("987.3"), "{scenario}");
+            assert!(s.positions[0].stop_loss_triggered);
+            assert!(s.closed_trades.is_empty());
+            assert_eq!(s.account_differences.len(), 1);
+            assert!(
+                s.account_differences[0]
+                    .reason
+                    .as_ref()
+                    .unwrap()
+                    .contains(reason),
+                "{scenario}: {:?}",
+                s.account_differences[0].reason
+            );
+            assert_eq!(fixture.submissions.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.cancellations.load(Ordering::SeqCst), 0);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn exchange_flat_recovery_does_not_clear_or_cancel_external_orders() {
+        use std::sync::atomic::Ordering;
+        let (e, fixture, server) = flat_fixture("external_order", Action::Long).await;
+        assert!(e.sync_account().await.unwrap());
+        let s = e.snapshot().await;
+        assert_eq!(s.positions[0].quantity, d("987.3"));
+        assert_eq!(
+            s.account_differences[0].exchange_quantity,
+            Some(Decimal::ZERO)
+        );
+        assert_eq!(s.account_differences[0].local_quantity, Some(d("987.3")));
+        assert_eq!(s.account_differences[0].orders[0].order_id, 45);
+        assert_eq!(fixture.history_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.cancellations.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn account_push_invalidates_exchange_flat_recovery_before_any_book_change() {
+        let (e, fixture, server) = flat_fixture("push", Action::Long).await;
+        let running = e.clone();
+        let task = tokio::spawn(async move { running.sync_account().await });
+        tokio::time::timeout(Duration::from_secs(3), fixture.history_started.notified())
+            .await
+            .unwrap();
+        e.mark_account_pending().await;
+        fixture.history_release.notify_one();
+        assert!(!task.await.unwrap().unwrap());
+        let s = e.snapshot().await;
+        assert!(s.account_update_pending);
+        assert_eq!(s.positions[0].quantity, d("987.3"));
+        assert_eq!(s.positions[0].entry_fee, d("0.111"));
+        assert!(s.closed_trades.is_empty());
+        assert_eq!(
+            e.store.load().unwrap().unwrap().1.positions["WLDUSDC"].quantity,
+            d("987.3")
+        );
+        server.abort();
     }
     async fn legacy_split_book(accounted: &str, original: &str) -> (Config, Book) {
         let old = paper();

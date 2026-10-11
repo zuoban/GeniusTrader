@@ -7,6 +7,29 @@ const {test}=require('node:test');
 const source=fs.readFileSync(path.join(__dirname,'../web/app.js'),'utf8');
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 
+test('flat exchange differences show local quantity and settlement reason instead of an external zero position',async()=>{
+  const h=await dashboard();
+  h.run(`state={mode:'live',paused:true,market_at:Date.now(),account_at:Date.now(),external_positions:{WLDUSDC:'0'},external_orders:[],account_differences:[{symbol:'WLDUSDC',local_quantity:'987.3',exchange_quantity:'0',orders:[],reason:'平仓成交数量尚未匹配'}]};renderReconciliation();renderMonitoring();`);
+  assert.equal(h.element('reconciliation-note').hidden,false);
+  assert.match(h.element('reconciliation-note').textContent,/本地 做多 987.3，交易所 已无持仓/);
+  assert.match(h.element('reconciliation-note').textContent,/平仓成交数量尚未匹配/);
+  assert.doesNotMatch(h.element('reconciliation-note').textContent,/外部持仓.*0/);
+  assert.equal(h.element('monitor-state').textContent,'账户差异待核对');
+  h.run(`state.position_views=[{symbol:'WLDUSDC',side:'LONG',quantity:'987.3',opened_at:Date.now(),leverage:10,stop_loss_triggered:true,accounting_complete:true}];renderPositions();`);
+  assert.match(h.element('positions-body').innerHTML,/止损等待核对/);
+  assert.doesNotMatch(h.element('positions-body').innerHTML,/止损处理中/);
+  h.run('state.account_differences=[];state.external_positions={};renderReconciliation();');
+  assert.equal(h.element('reconciliation-note').hidden,true);
+});
+
+test('account differences identify untracked order IDs and retain older API compatibility',async()=>{
+  const h=await dashboard();
+  h.run(`state={external_positions:{},external_orders:['WLDUSDC'],account_differences:[{symbol:'WLDUSDC',orders:[{order_id:43,client_id:'manual-close',status:'NEW',quantity:'10',executed_quantity:'3'}]}]};renderReconciliation();`);
+  assert.match(h.element('reconciliation-note').textContent,/#43 \/ manual-close（已挂单，剩余 7）/);
+  h.run(`state={external_positions:{WLDUSDC:'0'},external_orders:[],positions:[{symbol:'WLDUSDC',side:'SHORT',quantity:'987.3'}]};renderReconciliation();`);
+  assert.match(h.element('reconciliation-note').textContent,/本地 做空 987.3，交易所 已无持仓/);
+});
+
 async function dashboard(){
   const elements=new Map(),timers=new Map(),intervals=new Map(),listeners=new Map();
   let timerId=0;

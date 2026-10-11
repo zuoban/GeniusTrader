@@ -1,6 +1,6 @@
 [package]
 name = "genius-trader"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 rust-version = "1.89"
 description = "Configurable Binance USD-M futures trading service with Jev decisions"

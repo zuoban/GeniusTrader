@@ -103,9 +103,10 @@ function renderMonitoring(){
   replaceRegion('monitor-stream','<label>账户事件连接</label><strong class="'+(stream?.enabled&&!stream.connected?'uncertain':'')+'">'+streamLabel+'</strong><dl><div><dt>推送 / 重连次数</dt><dd>'+count(stream?.events)+' / '+count(stream?.reconnects)+'</dd></div><div><dt>最近账户事件</dt><dd>'+timestamp(stream?.last_event_at)+'</dd></div></dl><p>'+esc(s.mode==='paper'?'止盈与止损在本机轮询':stream?.last_error||'REST 对账持续运行')+'</p><p class="'+(market?.last_error?'uncertain':'')+'">'+esc(marketLabel)+'</p>');
   const age=(at)=>!at?'尚未同步':now<Number(at)?'时间异常':duration(now-Number(at))+' 前';
   const stale=!s.market_at||now-Number(s.market_at)>=15000||now<Number(s.market_at)||s.mode!=='paper'&&(!s.account_at||now-Number(s.account_at)>=15000||now<Number(s.account_at));
-  const status=s.account_sync_failed?'账户同步异常':s.account_update_pending?'账户对账中':s.funding_sync_pending?'资金费核对中':s.entry_data_pending?'成交费用核对中':stale?'数据待更新':s.paused?'新增开仓已暂停':'运行中';
+  const differences=Object.keys(s.external_positions||{}).length+(s.external_orders||[]).length;
+  const status=s.account_sync_failed?'账户同步异常':s.account_update_pending?'账户对账中':differences?'账户差异待核对':s.funding_sync_pending?'资金费核对中':s.entry_data_pending?'成交费用核对中':stale?'数据待更新':s.paused?'新增开仓已暂停':'运行中';
   $('monitor-state').textContent=limit?.cooldown_persistence_pending?'退避状态待保存':cooldown>0?'限流退避':status;
-  $('monitor-state').className='monitor-state'+(limit?.cooldown_persistence_pending||cooldown>0||s.account_sync_failed||s.entry_data_pending||stale?' uncertain':'');
+  $('monitor-state').className='monitor-state'+(limit?.cooldown_persistence_pending||cooldown>0||s.account_sync_failed||differences||s.entry_data_pending||stale?' uncertain':'');
   $('monitor-freshness').textContent='行情 '+age(s.market_at)+' · '+(s.mode==='paper'?'模拟账户': '完整账户 '+age(s.account_at))+' · 异常轮次包含风控等待，累计次数在引擎重启后重置';
 }
 function render(){
@@ -125,12 +126,26 @@ function render(){
   $('strategy-label').textContent='JEV';
   $('notional-label').textContent=price(c.notional_usdt)+' 计价币';$('profit-label').textContent=price(c.profit_usdt)+' 计价币';$('stop-loss-label').textContent=stopLossLabel(c.stop_loss_usdt,'计价币');
   renderPositions();renderOrders();renderWatchlist();renderDecisions();
-  const externalPositions=Object.entries(s.external_positions).map(([symbol,quantity])=>symbol+' ('+price(quantity)+')');
-  const externalOrders=s.external_orders;
-  $('reconciliation-note').hidden=!externalPositions.length&&!externalOrders.length;
-  $('reconciliation-note').textContent='账户差异待核对 · '+[externalPositions.length?'外部持仓：'+externalPositions.join('、'):'',externalOrders.length?'外部挂单：'+externalOrders.join('、'):''].filter(Boolean).join('；')+'。新增开仓暂停，请核对账户。';
+  renderReconciliation();
   renderBackgroundModes();
   $('update-time').textContent='SYNC '+new Date(s.updated_at).toLocaleTimeString('zh-CN',{hour12:false});
+}
+function renderReconciliation(){
+  const s=state,positions=s.external_positions||{},orders=s.external_orders||[];
+  const details=s.account_differences||[...new Set([...Object.keys(positions),...orders])].map(symbol=>{
+    const local=s.positions?.find(p=>p.symbol===symbol);
+    return {symbol,local_quantity:local?(local.side==='LONG'?1:-1)*Number(local.quantity):null,exchange_quantity:positions[symbol],orders:[]};
+  });
+  const quantity=value=>value==null?'未记录':Number(value)===0?'已无持仓':(Number(value)>0?'做多 ':'做空 ')+price(Math.abs(Number(value)));
+  $('reconciliation-note').hidden=!details.length;
+  $('reconciliation-note').textContent='账户差异待核对 · '+details.map(d=>{
+    const parts=[d.symbol];
+    if(d.exchange_quantity!=null)parts.push('本地 '+quantity(d.local_quantity)+'，交易所 '+quantity(d.exchange_quantity));
+    if(d.orders?.length)parts.push('未归属挂单 '+d.orders.map(o=>'#'+o.order_id+' / '+o.client_id+'（'+statusLabel(o.status)+'，剩余 '+price(Number(o.quantity)-Number(o.executed_quantity))+'）').join('、'));
+    else if(orders.includes(d.symbol))parts.push('存在未归属挂单');
+    if(d.reason)parts.push(d.reason);
+    return parts.join('：');
+  }).join('；')+'。新增开仓暂停，请核对账户。';
 }
 function renderBackgroundModes(){
   const modes=state.background_modes||[];
@@ -164,7 +179,8 @@ function replaceRegion(id,html){
 function renderPositions(){
   const positions=state.position_views;
   $('position-count').textContent=positions.length;$('positions-empty').hidden=positions.length>0;
-  replaceRegion('positions-body',positions.map(p=>'<tr><td><b>'+esc(p.symbol)+'</b><small>'+actionBadge(p.side)+' '+p.leverage+'× · '+Math.max(0,Math.floor((Date.now()-p.opened_at)/60000))+' 分钟</small></td><td>'+price(p.quantity)+'<small>@ '+price(p.entry_price)+'</small></td><td class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' '+quoteAsset(p.symbol)+'<small>'+(p.quote_stale?'报价待更新':'目标净赚 '+price(p.target_profit)+' '+quoteAsset(p.symbol))+'</small></td><td>'+price(p.tp_price)+'<small>'+(p.tp_client_id?'GTX · 只减仓':'等待挂单')+'</small><small>止损：'+stopLossLabel(p.stop_loss_usdt,quoteAsset(p.symbol))+'</small></td><td class="status">'+(p.stop_loss_triggered?'止损处理中':Number(p.quantity)===0?'结算中':p.accounting_complete?'管理中':'费用核对中')+'</td><td><button class="text-btn" data-action="close" data-symbol="'+esc(p.symbol)+'" data-focus-key="close:'+esc(p.symbol)+'">平仓</button></td></tr>').join(''));
+  const status=p=>Object.hasOwn(state.external_positions||{},p.symbol)||state.external_orders?.includes(p.symbol)?(p.stop_loss_triggered?'止损等待核对':'账户差异待核对'):p.stop_loss_triggered?'止损处理中':Number(p.quantity)===0?'结算中':p.accounting_complete?'管理中':'费用核对中';
+  replaceRegion('positions-body',positions.map(p=>'<tr><td><b>'+esc(p.symbol)+'</b><small>'+actionBadge(p.side)+' '+p.leverage+'× · '+Math.max(0,Math.floor((Date.now()-p.opened_at)/60000))+' 分钟</small></td><td>'+price(p.quantity)+'<small>@ '+price(p.entry_price)+'</small></td><td class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' '+quoteAsset(p.symbol)+'<small>'+(p.quote_stale?'报价待更新':'目标净赚 '+price(p.target_profit)+' '+quoteAsset(p.symbol))+'</small></td><td>'+price(p.tp_price)+'<small>'+(p.tp_client_id?'GTX · 只减仓':'等待挂单')+'</small><small>止损：'+stopLossLabel(p.stop_loss_usdt,quoteAsset(p.symbol))+'</small></td><td class="status">'+status(p)+'</td><td><button class="text-btn" data-action="close" data-symbol="'+esc(p.symbol)+'" data-focus-key="close:'+esc(p.symbol)+'">平仓</button></td></tr>').join(''));
 }
 function renderOrders(){
   const orders=state.open_orders;
@@ -185,7 +201,7 @@ function renderWatchlist(){
     const position=p?'<div class="card-position"><div class="card-section-label"><span>持仓 '+actionBadge(p.side)+' <b>'+p.leverage+'×</b></span><strong class="'+(p.unrealized==null?'':color(p.unrealized))+'">'+(p.unrealized==null?'—':num(p.unrealized))+' <small>'+asset+'</small></strong></div><div class="card-stats"><span>数量<b>'+price(p.quantity)+'</b></span><span>开仓均价<b>'+price(p.entry_price)+'</b></span><span>止盈价<b>'+price(p.tp_price)+'</b></span></div><div class="card-stop-loss">止损：'+stopLossLabel(p.stop_loss_usdt,asset)+'</div></div>':'<div class="card-flat"><span>当前空仓</span><span>单币 '+price(coin.notional_usdt)+' / 止盈 '+price(coin.profit_usdt)+' '+asset+'</span><span>止损：'+stopLossLabel(coin.stop_loss_usdt,asset)+'</span></div>';
     const orders=coin.orders.length?coin.orders.map(o=>'<div class="card-order"><span>'+esc(roleLabel(o.role))+' · '+(o.order_side==='BUY'?'买':'卖')+'</span><b>'+(o.price==null?'市价':price(o.price))+'</b><small>'+esc(statusLabel(o.status))+' · 剩余 '+price(o.remaining_quantity)+'</small></div>').join(''):'<div class="card-no-order">暂无挂单</div>';
     const decision=d?'<div class="card-decision-heading"><span>最近决策</span><time>'+timestamp(d.time)+'</time></div><div class="card-decision-result">'+actionBadge(d.action)+'<span>'+confidence(d.confidence)+'</span><small title="'+esc(d.model||d.source)+'">'+esc(d.model||'JEV')+'</small></div><p class="card-decision-source" title="'+esc(decisionReason(d))+'">'+esc(decisionReason(d))+'</p>':'<div class="card-decision-heading"><span>最近决策</span><span>尚未评估</span></div><p class="card-decision-source">等待启用扫描与新的收盘信号</p>';
-    return '<article class="watch-card'+(!coin.enabled?' disabled':'')+'"><div class="watch-card-head"><div class="symbol-identity"><span class="coin-code">'+esc(base.slice(0,3))+'</span><div><h3>'+esc(base)+'<span> / '+asset+'</span></h3><small class="coin-state'+(hasExternal?' uncertain':'')+'"><i class="state-dot'+(!coin.enabled?' off':'')+'"></i>'+status+'</small></div></div><div class="coin-actions">'+btn('toggle',coin.enabled?'停用扫描':'启用扫描',coin.enabled?'Ⅱ':'▷')+btn('edit','单币配置','⚙')+btn('remove','移出自选','×')+'</div></div><div class="card-quote"><strong>'+price(coin.price)+'</strong><span class="quote-state'+(coin.quote_stale?' delayed':'')+'">'+(coin.quote_stale?'报价待更新':coin.quote?'点差 '+num((Number(coin.quote.ask)-Number(coin.quote.bid))/Number(coin.price)*10000,2)+' bps':'暂无报价')+'</span></div>'+position+'<div class="card-orders"><div class="card-section-label">挂单 <span>'+coin.orders.length+'</span></div>'+orders+'</div><div class="card-decision">'+decision+'</div>'+(hasExternal?'<p class="card-external">'+(coin.external_position!=null?'外部持仓 '+price(coin.external_position)+' ':'')+(coin.external_order?'存在外部挂单':'')+' · 待核对</p>':'')+'</article>';
+    return '<article class="watch-card'+(!coin.enabled?' disabled':'')+'"><div class="watch-card-head"><div class="symbol-identity"><span class="coin-code">'+esc(base.slice(0,3))+'</span><div><h3>'+esc(base)+'<span> / '+asset+'</span></h3><small class="coin-state'+(hasExternal?' uncertain':'')+'"><i class="state-dot'+(!coin.enabled?' off':'')+'"></i>'+status+'</small></div></div><div class="coin-actions">'+btn('toggle',coin.enabled?'停用扫描':'启用扫描',coin.enabled?'Ⅱ':'▷')+btn('edit','单币配置','⚙')+btn('remove','移出自选','×')+'</div></div><div class="card-quote"><strong>'+price(coin.price)+'</strong><span class="quote-state'+(coin.quote_stale?' delayed':'')+'">'+(coin.quote_stale?'报价待更新':coin.quote?'点差 '+num((Number(coin.quote.ask)-Number(coin.quote.bid))/Number(coin.price)*10000,2)+' bps':'暂无报价')+'</span></div>'+position+'<div class="card-orders"><div class="card-section-label">挂单 <span>'+coin.orders.length+'</span></div>'+orders+'</div><div class="card-decision">'+decision+'</div>'+(hasExternal?'<p class="card-external">'+(coin.external_position!=null?(Number(coin.external_position)===0?'交易所已无持仓 ':'交易所持仓 '+price(coin.external_position)+' '):'')+(coin.external_order?'存在未归属挂单':'')+' · 待核对</p>':'')+'</article>';
   }).join(''));
 }
 function renderDecisions(){
